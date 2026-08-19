@@ -19,6 +19,7 @@ import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk } from './attach-cmd.js';
 import { runDetach } from './detach-cmd.js';
 import { getStatus, formatStatus } from './status-cmd.js';
+import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
@@ -40,12 +41,14 @@ function printHelp(): void {
       '  login                  Device-authorization login against auth-service.',
       '  attach <workspaceId>   Attach this machine to a workspace and hold the daemon loop open.',
       '    [--label <name>]     Operator-facing host label (reported to the workspace).',
+      '    [--agent <binary>]   Local coding-agent binary to spawn (default: $YOLOBRIDGE_AGENT_BIN or "claude").',
       '  detach                 Detach the current workspace attachment.',
       '  status                 Print local login/attach state.',
       '  --help                 Print this help.',
       '',
-      `API base:  ${apiUrl()} (override: YOLOBRIDGE_API_URL)`,
-      `Auth base: ${authUrl()} (override: YOLOBRIDGE_AUTH_URL)`,
+      `API base:   ${apiUrl()} (override: YOLOBRIDGE_API_URL)`,
+      `Auth base:  ${authUrl()} (override: YOLOBRIDGE_AUTH_URL)`,
+      `Agent bin:  ${DEFAULT_AGENT_BIN} (override: --agent or YOLOBRIDGE_AGENT_BIN)`,
       '',
     ].join('\n'),
   );
@@ -61,16 +64,19 @@ async function cmdLogin(): Promise<number> {
 async function cmdAttach(args: string[]): Promise<number> {
   const workspaceId = args.find((a) => !a.startsWith('--'));
   let hostLabel: string | undefined;
+  let agentBin: string | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--label') hostLabel = args[++i];
+    if (args[i] === '--agent') agentBin = args[++i];
   }
   if (!workspaceId) {
     process.stderr.write('yolo-bridge attach: a workspaceId is required\n');
-    process.stderr.write('Usage: yolo-bridge attach <workspaceId> [--label <name>]\n');
+    process.stderr.write('Usage: yolo-bridge attach <workspaceId> [--label <name>] [--agent <binary>]\n');
     return 64;
   }
 
   let stopRequested = false;
+  let localAgentExited = false;
   const onSignal = () => {
     if (stopRequested) return;
     stopRequested = true;
@@ -78,6 +84,30 @@ async function cmdAttach(args: string[]): Promise<number> {
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
+
+  // Spawns the local coding agent under a real PTY right away — this
+  // command is what launches the user's local session (see
+  // docs/YOLOBRIDGE_PLAN.md's "⚠ Not yet functional" section). The PTY's
+  // output streams live to this process's own stdout and this process's
+  // stdin is piped into the PTY, so the terminal running `attach` is a
+  // live view onto the exact session remote prompts land in.
+  startLocalAgent({
+    agentBin,
+    onExit: ({ exitCode, signal }) => {
+      localAgentExited = true;
+      stopRequested = true;
+      process.stdout.write(
+        `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
+      );
+      // Fire-and-forget: don't wait on the SSE loop to unwind on its own
+      // (it only re-checks shouldStop() at loop boundaries) to report the
+      // status change — tell the server immediately so the tile flips to
+      // `stopped` right away instead of riding out the heartbeat
+      // staleness window (~90s, Decision Q2). The daemon loop below still
+      // exits promptly too, via `shouldStop`.
+      runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+    },
+  });
 
   const result = await runAttachFromDisk({
     workspaceId,
@@ -89,6 +119,11 @@ async function cmdAttach(args: string[]): Promise<number> {
   process.removeListener('SIGINT', onSignal);
   process.removeListener('SIGTERM', onSignal);
 
+  // Whatever ended the attach loop — local Ctrl+C, a server-initiated
+  // `detached` frame, or the agent process exiting on its own — also ends
+  // the PTY session `attach` spawned. Safe no-op if it already exited.
+  stopLocalAgent();
+
   if (!result.ok) {
     if (result.reason === 'not-logged-in') {
       process.stderr.write('yolo-bridge attach: not logged in — run `yolo-bridge login` first.\n');
@@ -98,10 +133,11 @@ async function cmdAttach(args: string[]): Promise<number> {
     return 1;
   }
 
-  if (stopRequested) {
-    // Local Ctrl+C stop: best-effort tell the server we're leaving too, so
-    // the tile flips to stopped promptly instead of waiting out the
-    // heartbeat staleness window.
+  if (stopRequested && !localAgentExited) {
+    // Local Ctrl+C stop (the agent-exit path above already detached):
+    // best-effort tell the server we're leaving too, so the tile flips to
+    // stopped promptly instead of waiting out the heartbeat staleness
+    // window.
     await runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
   }
 

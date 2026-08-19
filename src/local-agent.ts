@@ -1,62 +1,323 @@
 /**
- * STUBS — deliberately not wired to a real local coding-agent session.
+ * Real local prompt-delivery and output-capture for `yolo-bridge attach`.
  *
- * docs/YOLOBRIDGE_PLAN.md's Architecture section says a received prompt
- * frame should be delivered "to the user's already-running local
- * coding-agent session the way the user's own terminal would" — but does
- * NOT prescribe a mechanism, and the underspecification is real: there
- * are several plausible approaches with very different failure modes,
- * and picking wrong here is the kind of mistake that's hard to detect
- * later (a "delivery" that silently goes nowhere looks identical to a
- * successful one from the server's point of view once `publishPrompt`
- * resolves).
+ * docs/YOLOBRIDGE_PLAN.md's "⚠ Not yet functional" section settled the
+ * mechanism (2026-08-19): `node-pty` spawns a genuine PTY running the
+ * user's local coding agent (zero external binary dependency — already a
+ * proven pattern in this codebase, `containers/services/terminal-mux/server.js`
+ * depends on it too, just as an outer viewer around tmux rather than the
+ * core mechanism here). `@xterm/headless` mirrors the PTY's raw byte
+ * stream into a real screen-buffer model (the same engine xterm.js uses
+ * for rendering, without a DOM), giving `captureLocalAgentOutput` direct
+ * structured buffer access instead of text-scraping.
  *
- * OPEN IMPLEMENTATION QUESTION — candidates considered, none implemented:
- *   1. Terminal injection — locate the user's actual Claude Code/Codex
- *      terminal (which one, if several are open?) and synthesize
- *      keystrokes/paste into it. Fragile across terminal emulators, OS
- *      accessibility permissions required on macOS.
- *   2. A well-known named pipe / Unix socket that a running Claude Code
- *      session reads from — requires that session to opt in to listening
- *      (a companion hook/plugin on the agent side that doesn't exist yet).
- *   3. Clipboard + notification — copy the prompt, notify the user to
- *      paste it themselves. Loses the "no new consent/approval layer"
- *      property the plan explicitly wants (Trust model section) since it
- *      reintroduces a manual step, but is the only option requiring zero
- *      cooperation from the local agent.
- *   4. Spawn the agent directly as a subprocess YoloBridge owns (closer to
- *      the superseded Step-Run-dispatch draft) — rejected by the current
- *      plan's own Non-goals ("not a capability/consent envelope … the
- *      local agent should be already-running, not launched by YoloBridge").
+ * Ownership model (this is the load-bearing change from the original
+ * "reach into an already-running session" framing): `startLocalAgent`
+ * SPAWNS the agent — yolo-bridge owns the PTY. The real process's stdin
+ * is piped into the PTY and the PTY's raw output is piped to the real
+ * process's stdout, so the human running `yolo-bridge attach` sees and
+ * can drive the exact same session that remote prompts land in — not a
+ * separate shadow copy.
  *
- * This function's contract is deliberately narrow so wiring in a real
- * mechanism later doesn't require touching any caller: it receives the
- * raw prompt string and returns once "delivery" (whatever that ends up
- * meaning) is attempted.
+ * Module-level singleton: Decision Q3 in the plan is "one tile per
+ * attach" — there is only ever one local agent PTY per daemon process, so
+ * a singleton (rather than threading a handle through every call site) is
+ * a faithful match for that decision, and it's what keeps
+ * `deliverPromptToLocalAgent(prompt)` / `captureLocalAgentOutput()`
+ * exactly the same two free functions with the same signatures that
+ * attach-cmd.ts (and its test suite) already depend on and inject spies
+ * over — see attach-cmd.ts's `AttachDaemonDeps.deliverPrompt` /
+ * `.captureOutput`, defaulted to these two exports. Callers that already
+ * inject fakes for those two hooks (attach-cmd.test.ts) never touch this
+ * module at all, so nothing there needed to change.
  */
-export async function deliverPromptToLocalAgent(prompt: string): Promise<void> {
-  const banner = '─'.repeat(60);
-  process.stdout.write(
-    `\n${banner}\n[yolobridge] PROMPT RECEIVED (delivery mechanism not yet implemented — see local-agent.ts)\n${banner}\n${prompt}\n${banner}\n\n`,
-  );
-  // STUB: no actual delivery into a running local agent session happens
-  // here. See the open-question block above.
+
+import { createRequire } from 'node:module';
+import * as pty from 'node-pty';
+import type { IPty } from 'node-pty';
+import type { Terminal as TerminalType } from '@xterm/headless';
+
+// `@xterm/headless`'s published CJS bundle is a heavily minified/webpacked
+// single file — `cjs-module-lexer` (Node ESM's static CJS-named-export
+// detector) can't find `Terminal` on it, so a plain
+// `import { Terminal } from '@xterm/headless'` fails at runtime with
+// "Named export 'Terminal' not found" even though it type-checks fine
+// (the package's .d.ts declares named exports). `createRequire` sidesteps
+// static detection entirely and reads the real `module.exports` at
+// runtime, which does have `Terminal` on it.
+const require = createRequire(import.meta.url);
+const { Terminal } = require('@xterm/headless') as typeof import('@xterm/headless');
+
+/** Default agent binary: overridable via `--agent` (cli.ts) or this env var. */
+export const DEFAULT_AGENT_BIN = process.env.YOLOBRIDGE_AGENT_BIN || 'claude';
+
+const DEFAULT_COLS = 120;
+const DEFAULT_ROWS = 40;
+
+/** How recently the PTY must have produced output to be considered "busy". */
+const DEFAULT_BUSY_WINDOW_MS = 2_000;
+
+export interface LocalAgentExitInfo {
+  exitCode: number;
+  signal?: number;
+}
+
+/** Minimal surface of node-pty's spawn() this module relies on — narrowed so tests can inject a fake. */
+export type PtySpawnImpl = (
+  file: string,
+  args: string[],
+  opts: {
+    name: string;
+    cols: number;
+    rows: number;
+    cwd: string;
+    env: { [key: string]: string };
+  },
+) => IPty;
+
+/** A minimal writable-stream surface (matches `process.stdout`, and test doubles). */
+export interface AgentOutputSink {
+  write(data: string): unknown;
+}
+
+/** A minimal readable-stream surface (matches `process.stdin`, and test doubles). */
+export interface AgentInputSource {
+  on(event: 'data', listener: (data: Buffer | string) => void): unknown;
+  removeListener?(event: 'data', listener: (data: Buffer | string) => void): unknown;
+  resume?(): unknown;
+  setEncoding?(encoding: string): unknown;
+  isTTY?: boolean;
+  setRawMode?(mode: boolean): unknown;
+}
+
+export interface StartLocalAgentOptions {
+  /** Binary to spawn, e.g. `claude`, `codex`. Defaults to `DEFAULT_AGENT_BIN`. */
+  agentBin?: string;
+  agentArgs?: string[];
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  /** Terminal size. Defaults to the real terminal's size when interactive, else 120x40. */
+  cols?: number;
+  rows?: number;
+  /** Real process stdio to wire the PTY into. Defaults to `process.stdout` / `process.stdin`. */
+  stdout?: AgentOutputSink;
+  stdin?: AgentInputSource;
+  /** Called once when the spawned agent process exits, however it exits. */
+  onExit?: (info: LocalAgentExitInfo) => void;
+  /** How recently PTY output must have arrived for `captureLocalAgentOutput` to report `busy: true`. */
+  busyWindowMs?: number;
+  /** Test injection point — swap the real `node-pty` spawn for a fake IPty. */
+  spawnImpl?: PtySpawnImpl;
+}
+
+export interface LocalAgentHandle {
+  /** Kills the PTY process and tears down stdio wiring. Safe to call more than once. */
+  stop(): void;
+}
+
+interface LocalAgentState {
+  ptyProcess: IPty;
+  term: TerminalType;
+  lastOutputAt: number;
+  busyWindowMs: number;
+  writeChain: Promise<void>;
+  stdin?: AgentInputSource;
+  stdinListener?: (data: Buffer | string) => void;
+  rawModeEnabled: boolean;
+}
+
+let current: LocalAgentState | undefined;
+
+function sanitizeEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
+  const out: { [key: string]: string } = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v === 'string') out[k] = v;
+  }
+  return out;
 }
 
 /**
- * STUB — same honesty as `deliverPromptToLocalAgent` above: there is no
- * real "read the local agent's current output" implementation yet, for
- * the same reason (no defined channel into an already-running local
- * session). What IS real: the round-trip protocol this feeds — the
- * caller posts this stub's return value back to common-api via
- * `POST /events {type:'read-output-reply', requestId, output, busy}`, so
- * the correlation plumbing (`requestReadOutput` on the server side) is
- * exercisable end-to-end today; only the content of `output` is a
- * placeholder.
+ * Explicit `cols`/`rows` win. Otherwise, when wiring to the real
+ * `process.stdout` (no injected sink — i.e. an actual interactive
+ * `attach` run, not a test double), inherit the real terminal's size if
+ * it reports one (a non-TTY stdout, e.g. piped/redirected, reports
+ * `undefined`). Falls back to the fixed default otherwise.
+ */
+function resolveCols(opts: StartLocalAgentOptions): number {
+  if (opts.cols) return opts.cols;
+  if (opts.stdout !== undefined) return DEFAULT_COLS;
+  return (process.stdout as unknown as { columns?: number }).columns || DEFAULT_COLS;
+}
+
+function resolveRows(opts: StartLocalAgentOptions): number {
+  if (opts.rows) return opts.rows;
+  if (opts.stdout !== undefined) return DEFAULT_ROWS;
+  return (process.stdout as unknown as { rows?: number }).rows || DEFAULT_ROWS;
+}
+
+/**
+ * Serializes the terminal's current buffer (scrollback + viewport) to
+ * plain text — no ANSI/SGR escape codes. Deliberately not using
+ * `@xterm/addon-serialize`: that addon's `serialize()` reconstructs a
+ * VT100-replayable stream (colors, cursor moves included) for re-feeding
+ * into another terminal, which is the wrong shape for `read_tile_output`
+ * — the consumer on the other end (an orchestrator tile, possibly an
+ * LLM) wants clean text, not escape sequences. Walking `buffer.active`
+ * directly and calling `translateToString` per line gives exactly that.
+ */
+export function serializeTerminalBuffer(term: TerminalType): string {
+  const buffer = term.buffer.active;
+  const lines: string[] = [];
+  for (let i = 0; i < buffer.length; i++) {
+    const line = buffer.getLine(i);
+    lines.push(line ? line.translateToString(true) : '');
+  }
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n');
+}
+
+/**
+ * Spawns the local coding agent under a real PTY and wires it up:
+ *   - PTY output -> headless Terminal (structured buffer for capture)
+ *   - PTY output -> the real process's stdout (live view for the human)
+ *   - the real process's stdin -> PTY (human keystrokes reach the agent)
+ *
+ * Idempotent in the sense that calling this while a previous session is
+ * still running stops it first — Decision Q3 (one tile per attach) means
+ * there is only ever one local agent per daemon process.
+ */
+export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHandle {
+  if (current) stopLocalAgent();
+
+  const agentBin = opts.agentBin ?? DEFAULT_AGENT_BIN;
+  const agentArgs = opts.agentArgs ?? [];
+  const cols = resolveCols(opts);
+  const rows = resolveRows(opts);
+  const spawnImpl = opts.spawnImpl ?? (pty.spawn as unknown as PtySpawnImpl);
+  const busyWindowMs = opts.busyWindowMs ?? DEFAULT_BUSY_WINDOW_MS;
+
+  const outStream: AgentOutputSink = opts.stdout ?? process.stdout;
+  // `'stdin' in opts` (not `opts.stdin ??`) so a test can pass `stdin: undefined`
+  // explicitly to disable stdin piping entirely, distinct from omitting the
+  // field (which defaults to wiring up the real `process.stdin`).
+  const inStream: AgentInputSource | undefined = 'stdin' in opts ? opts.stdin : (process.stdin as unknown as AgentInputSource);
+
+  const ptyProcess = spawnImpl(agentBin, agentArgs, {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd: opts.cwd ?? process.cwd(),
+    env: sanitizeEnv(opts.env ?? process.env),
+  });
+
+  const term = new Terminal({ cols, rows, allowProposedApi: true });
+
+  const state: LocalAgentState = {
+    ptyProcess,
+    term,
+    lastOutputAt: Date.now(),
+    busyWindowMs,
+    writeChain: Promise.resolve(),
+    stdin: inStream,
+    rawModeEnabled: false,
+  };
+  current = state;
+
+  ptyProcess.onData((data: string) => {
+    state.lastOutputAt = Date.now();
+    outStream.write(data);
+    state.writeChain = state.writeChain.then(
+      () => new Promise<void>((resolve) => term.write(data, () => resolve())),
+    );
+  });
+
+  if (inStream && typeof inStream.on === 'function') {
+    const stdinListener = (data: Buffer | string) => {
+      ptyProcess.write(typeof data === 'string' ? data : data.toString('utf-8'));
+    };
+    if (inStream.isTTY && typeof inStream.setRawMode === 'function') {
+      inStream.setRawMode(true);
+      state.rawModeEnabled = true;
+    }
+    inStream.resume?.();
+    inStream.setEncoding?.('utf-8');
+    inStream.on('data', stdinListener);
+    state.stdinListener = stdinListener;
+  }
+
+  ptyProcess.onExit(({ exitCode, signal }) => {
+    teardownStdio(state);
+    if (current === state) current = undefined;
+    opts.onExit?.({ exitCode, signal });
+  });
+
+  return { stop: stopLocalAgent };
+}
+
+function teardownStdio(state: LocalAgentState): void {
+  const { stdin, stdinListener } = state;
+  if (stdin && stdinListener && typeof stdin.removeListener === 'function') {
+    stdin.removeListener('data', stdinListener);
+  }
+  if (state.rawModeEnabled && stdin?.isTTY && typeof stdin.setRawMode === 'function') {
+    stdin.setRawMode(false);
+  }
+}
+
+/**
+ * Stops the local agent session. Kills the PTY process (SIGTERM via
+ * node-pty's default `kill()`) and unwires stdio.
+ *
+ * Decision on detach lifecycle: `yolo-bridge attach` is what SPAWNED this
+ * process (see module header), so whatever ends the attach loop — local
+ * Ctrl+C, or a server-initiated `detached` frame — also ends the PTY
+ * session it owns. Nothing is left "running detached with no owner":
+ * cli.ts calls this unconditionally after `runAttachFromDisk` resolves,
+ * regardless of which of those two paths triggered the stop. If the
+ * agent process already exited on its own, this is a safe no-op (`current`
+ * is already cleared by the `onExit` handler above).
+ */
+export function stopLocalAgent(): void {
+  if (!current) return;
+  const state = current;
+  current = undefined;
+  teardownStdio(state);
+  try {
+    state.ptyProcess.kill();
+  } catch {
+    // already dead
+  }
+}
+
+/**
+ * Writes `prompt` into the owned PTY the same way the user's own
+ * keystrokes would land, followed by a carriage return so the target CLI
+ * actually submits it. `\r` (not `\n`) matches what a real terminal sends
+ * on Enter — verified empirically against `bash` in a PTY (the shell's
+ * line discipline treats `\r` as submit, same as an interactive
+ * readline-based CLI would), see local-agent.test.ts.
+ *
+ * If no session has been started yet (misuse, or a test that didn't call
+ * `startLocalAgent` first), lazily starts one with defaults rather than
+ * throwing — keeps this function's contract matching the original stub's
+ * "always succeeds, delivery is attempted" shape.
+ */
+export async function deliverPromptToLocalAgent(prompt: string): Promise<void> {
+  if (!current) startLocalAgent();
+  current!.ptyProcess.write(`${prompt}\r`);
+}
+
+/**
+ * Serializes the current headless-terminal buffer to plain text and
+ * reports a `busy` heuristic: has the PTY produced output within the
+ * last `busyWindowMs` (default 2s)? Mirrors the spirit of the pod side's
+ * own busy-detection (recent-activity-based) without depending on any
+ * pod-only primitive.
  */
 export async function captureLocalAgentOutput(): Promise<{ output: string; busy: boolean }> {
-  return {
-    output: '[yolobridge] captureLocalAgentOutput is a stub — no local-agent output channel wired up yet.',
-    busy: false,
-  };
+  if (!current) return { output: '', busy: false };
+  await current.writeChain;
+  const output = serializeTerminalBuffer(current.term);
+  const busy = Date.now() - current.lastOutputAt < current.busyWindowMs;
+  return { output, busy };
 }
