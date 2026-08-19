@@ -48,6 +48,19 @@ export type PollResult =
   | { status: 'authorized'; tokens: DeviceTokens }
   | { status: 'error'; message: string };
 
+export interface RefreshedTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresInSec: number;
+  /** Epoch ms — computed as `Date.now() + expires_in * 1000` (the /refresh
+   * response, unlike device/token, carries no absolute expiry field). */
+  expiresAtMs: number;
+}
+
+export type RefreshTokenResult =
+  | { status: 'ok'; tokens: RefreshedTokens }
+  | { status: 'failed'; message: string };
+
 export type FetchImpl = typeof fetch;
 
 export class DeviceAuthError extends Error {}
@@ -124,6 +137,58 @@ export async function pollDeviceToken(
   if (message === 'access_denied') return { status: 'denied' };
   if (message === 'expired_token') return { status: 'expired' };
   return { status: 'error', message: message || `device/token failed: ${res.status}` };
+}
+
+/**
+ * `POST /api/v1/auth/refresh` — used to proactively rotate the daemon's
+ * access token before it expires (see attach-cmd.ts). Field names read
+ * directly off `auth/src/controllers/AuthController.ts:995` (`refreshToken`)
+ * and `auth/src/services/TokenService.ts`'s `TokenPair` interface — NOTE
+ * this is a *different* shape from the device-flow endpoints above:
+ *
+ *   request  body { refresh_token }                              (snake_case)
+ *   response 200  { tokens: { accessToken, refreshToken,
+ *                             expiresIn } }                       (camelCase,
+ *     no token_type, no absolute expiry — this route hands back the same
+ *     `TokenPair` shape `res.json({ tokens })` serializes with no
+ *     case-conversion middleware in front of it)
+ *   4xx  { error: { message, statusCode } } — same errorHandler as the
+ *     device-flow routes, so `extractErrorMessage` below is reused as-is.
+ *
+ * Unauthenticated (no `authenticate` middleware on this route) — the
+ * refresh token in the body is the credential.
+ */
+export async function refreshAccessToken(
+  authBaseUrl: string,
+  refreshToken: string,
+  fetchImpl: FetchImpl = fetch,
+): Promise<RefreshTokenResult> {
+  const res = await fetchImpl(`${normalizeBase(authBaseUrl)}/api/v1/auth/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+  const body = await safeJson(res);
+  if (!res.ok) {
+    return { status: 'failed', message: extractErrorMessage(body) || `refresh failed: ${res.status}` };
+  }
+  const tokens = body?.tokens;
+  if (
+    typeof tokens?.accessToken !== 'string' ||
+    typeof tokens?.refreshToken !== 'string' ||
+    typeof tokens?.expiresIn !== 'number'
+  ) {
+    return { status: 'failed', message: 'refresh returned an unexpected shape (missing tokens.accessToken/refreshToken/expiresIn)' };
+  }
+  return {
+    status: 'ok',
+    tokens: {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      expiresInSec: tokens.expiresIn,
+      expiresAtMs: Date.now() + tokens.expiresIn * 1000,
+    },
+  };
 }
 
 async function safeJson(res: Response): Promise<any> {

@@ -20,11 +20,33 @@ import { Readable } from 'node:stream';
 import * as readline from 'node:readline';
 import { SseFrameParser } from './sse-frame-parser.js';
 import { actionForFrame } from './frame-actions.js';
-import { startHeartbeat, type HeartbeatScheduler, type TimerImpl } from './heartbeat.js';
+import { startHeartbeat, defaultTimers, type HeartbeatScheduler, type TimerImpl } from './heartbeat.js';
 import { nextBackoffMs, type BackoffOptions } from './reconnect.js';
 import { deliverPromptToLocalAgent, captureLocalAgentOutput } from './local-agent.js';
 import * as apiClient from './api-client.js';
-import { loadAuth, saveAttachment, clearAttachment, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import { refreshAccessToken as refreshAccessTokenApi, type RefreshTokenResult } from './device-auth.js';
+import { loadAuth, saveAuth, saveAttachment, clearAttachment, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+
+/** Same shape as device-auth.ts's `refreshAccessToken` — injectable so tests
+ * don't hit the network. Defaults to the real auth-service call. */
+export type RefreshTokenFn = (
+  authBaseUrl: string,
+  refreshToken: string,
+  fetchImpl?: apiClient.FetchImpl,
+) => Promise<RefreshTokenResult>;
+
+const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
+/** Refresh once the access token has less than this much validity left.
+ * Production access tokens live 24h; 5min gives ample margin against a
+ * slow/retried refresh call before the old token actually 401s. */
+const DEFAULT_REFRESH_BUFFER_MS = 5 * 60_000;
+/** How often to re-check `shouldStop()`/a failed-refresh flag while an SSE
+ * stream is open and blocked on `for await`. The server holds the stream
+ * open indefinitely (keepalive pings only), so without an active poll here
+ * a stop signal would never be noticed until the stream happened to end on
+ * its own — which, by design, it doesn't. Small enough to be prompt,
+ * cheap enough to not matter (a no-op comparison on every tick). */
+const STOP_POLL_INTERVAL_MS = 250;
 
 export interface AttachDaemonDeps {
   workspaceId: string;
@@ -42,11 +64,23 @@ export interface AttachDaemonDeps {
   log?: (line: string) => void;
   deliverPrompt?: (prompt: string) => Promise<void>;
   captureOutput?: () => Promise<{ output: string; busy: boolean }>;
+  /** auth-service base URL for token refresh. Defaults to
+   * `YOLOBRIDGE_AUTH_URL` (same env var cli.ts's `authUrl()` reads) or the
+   * production auth-service host. */
+  authBaseUrl?: string;
+  /** Injectable clock so expiry-proximity checks are testable without a
+   * real wait. Defaults to `Date.now`. */
+  now?: () => number;
+  /** Refresh when less than this many ms of access-token validity remain. */
+  refreshBufferMs?: number;
+  /** Injectable auth-service refresh call. Defaults to device-auth.ts's
+   * `refreshAccessToken` (the real `POST /api/v1/auth/refresh`). */
+  refreshAccessToken?: RefreshTokenFn;
 }
 
 export type AttachDaemonResult =
   | { ok: true; reason: 'detached-by-server' | 'stopped' }
-  | { ok: false; reason: 'attach-failed'; message: string };
+  | { ok: false; reason: 'attach-failed' | 'refresh-failed'; message: string };
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -65,8 +99,52 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
   const deliverPrompt = deps.deliverPrompt ?? deliverPromptToLocalAgent;
   const captureOutput = deps.captureOutput ?? captureLocalAgentOutput;
+  const timers = deps.timers ?? defaultTimers;
+  const now = deps.now ?? Date.now;
+  const refreshBufferMs = deps.refreshBufferMs ?? DEFAULT_REFRESH_BUFFER_MS;
+  const authBaseUrl = deps.authBaseUrl ?? process.env.YOLOBRIDGE_AUTH_URL ?? DEFAULT_AUTH_URL;
+  const doRefresh = deps.refreshAccessToken ?? refreshAccessTokenApi;
 
   const cfg: apiClient.ApiClientConfig = { commonApiBaseUrl, accessToken: auth.accessToken, fetchImpl };
+  let currentAuth: StoredAuth = auth;
+
+  /**
+   * Proactive refresh (Bug 2 fix): checked before opening/reopening the
+   * stream and on every heartbeat tick while connected, so the daemon
+   * rotates its access token well before the 24h production expiry
+   * instead of degrading into a silent zombie that just starts 401ing.
+   * Updates both the in-memory `cfg`/`currentAuth` used by every
+   * subsequent API call in this process AND the on-disk auth.json (via
+   * `saveAuth`) so a later `status`/restart also sees the fresh token.
+   */
+  async function ensureFreshToken(): Promise<{ ok: true } | { ok: false; message: string }> {
+    if (now() < currentAuth.expiresAtMs - refreshBufferMs) return { ok: true };
+    const result = await doRefresh(authBaseUrl, currentAuth.refreshToken, fetchImpl);
+    if (result.status !== 'ok') {
+      return { ok: false, message: result.message };
+    }
+    currentAuth = {
+      accessToken: result.tokens.accessToken,
+      refreshToken: result.tokens.refreshToken,
+      tokenType: currentAuth.tokenType,
+      expiresAtMs: result.tokens.expiresAtMs,
+    };
+    cfg.accessToken = currentAuth.accessToken;
+    saveAuth(currentAuth, env, io);
+    log('Access token refreshed.');
+    return { ok: true };
+  }
+
+  // Cover the case where the daemon is (re)started against a token that's
+  // already within the refresh buffer of expiry (e.g. `attach` run right
+  // after a long-down period) — refresh before the very first network
+  // call, not just before subsequent reconnects.
+  const initialRefresh = await ensureFreshToken();
+  if (!initialRefresh.ok) {
+    log(`Token refresh failed: ${initialRefresh.message}`);
+    log('Run `yolo-bridge login` again.');
+    return { ok: false, reason: 'refresh-failed', message: initialRefresh.message };
+  }
 
   let attachmentId: string;
   let tileId: string;
@@ -83,9 +161,20 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   let heartbeat: HeartbeatScheduler | undefined;
   let attempt = 0;
+  /** Set when a proactive refresh (see ensureFreshToken) fails while a
+   * stream is open — picked up right after the current for-await unwinds
+   * (forced via the stop-poll below) so the daemon stops instead of
+   * looping forever reconnecting with a dead token. */
+  let refreshFailed: { message: string } | undefined;
 
   try {
     while (!shouldStop()) {
+      const preStreamRefresh = await ensureFreshToken();
+      if (!preStreamRefresh.ok) {
+        refreshFailed = preStreamRefresh;
+        break;
+      }
+
       let sawDetached = false;
       try {
         const res = await apiClient.openStream(cfg, workspaceId, attachmentId);
@@ -94,48 +183,75 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         const parser = new SseFrameParser();
         const nodeStream = Readable.fromWeb(res.body as any);
 
-        for await (const chunk of nodeStream) {
-          const text = Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk);
-          for (const frame of parser.push(text)) {
-            const action = actionForFrame(frame);
-            switch (action.kind) {
-              case 'connected':
-                log('Stream connected.');
-                heartbeat?.stop();
-                heartbeat = startHeartbeat(
-                  () => apiClient.postHeartbeat(cfg, workspaceId, attachmentId).then(() => undefined),
-                  (err) => log(`heartbeat error: ${err instanceof Error ? err.message : String(err)}`),
-                  undefined,
-                  deps.timers,
-                );
-                // Send one immediately so status isn't stale for the first ~10s.
-                apiClient.postHeartbeat(cfg, workspaceId, attachmentId).catch((err) =>
-                  log(`initial heartbeat error: ${err instanceof Error ? err.message : String(err)}`),
-                );
-                break;
-              case 'ping':
-                break;
-              case 'prompt':
-                await deliverPrompt(action.prompt);
-                break;
-              case 'read-output': {
-                const captured = await captureOutput();
-                await apiClient
-                  .postReadOutputReply(cfg, workspaceId, attachmentId, action.requestId, captured.output, captured.busy)
-                  .catch((err) => log(`read-output reply failed: ${err instanceof Error ? err.message : String(err)}`));
-                break;
+        // Bug 1 fix: the server holds this stream open indefinitely
+        // (keepalive pings only), so `for await` below never completes on
+        // its own — `shouldStop()` being poll-based (not push-based; see
+        // cli.ts's SIGINT/SIGTERM handler) means it must be actively
+        // polled independent of whether/when the next chunk arrives, and
+        // acted on by tearing the stream down, or a signal during an
+        // active stream is never actually noticed. Same mechanism also
+        // unblocks a mid-stream proactive-refresh failure (`refreshFailed`
+        // above) instead of riding out the connection to its next natural
+        // event.
+        const stopPollHandle = timers.setInterval(() => {
+          if (shouldStop() || refreshFailed) {
+            nodeStream.destroy();
+          }
+        }, STOP_POLL_INTERVAL_MS);
+
+        try {
+          for await (const chunk of nodeStream) {
+            const text = Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk);
+            for (const frame of parser.push(text)) {
+              const action = actionForFrame(frame);
+              switch (action.kind) {
+                case 'connected':
+                  log('Stream connected.');
+                  heartbeat?.stop();
+                  heartbeat = startHeartbeat(
+                    async () => {
+                      const refreshCheck = await ensureFreshToken();
+                      if (!refreshCheck.ok) {
+                        refreshFailed = refreshCheck;
+                        return;
+                      }
+                      await apiClient.postHeartbeat(cfg, workspaceId, attachmentId);
+                    },
+                    (err) => log(`heartbeat error: ${err instanceof Error ? err.message : String(err)}`),
+                    undefined,
+                    deps.timers,
+                  );
+                  // Send one immediately so status isn't stale for the first ~10s.
+                  apiClient.postHeartbeat(cfg, workspaceId, attachmentId).catch((err) =>
+                    log(`initial heartbeat error: ${err instanceof Error ? err.message : String(err)}`),
+                  );
+                  break;
+                case 'ping':
+                  break;
+                case 'prompt':
+                  await deliverPrompt(action.prompt);
+                  break;
+                case 'read-output': {
+                  const captured = await captureOutput();
+                  await apiClient
+                    .postReadOutputReply(cfg, workspaceId, attachmentId, action.requestId, captured.output, captured.busy)
+                    .catch((err) => log(`read-output reply failed: ${err instanceof Error ? err.message : String(err)}`));
+                  break;
+                }
+                case 'detached':
+                  log('Detached by server.');
+                  sawDetached = true;
+                  break;
+                case 'unknown':
+                  log(`Unrecognized frame type: ${action.event}`);
+                  break;
               }
-              case 'detached':
-                log('Detached by server.');
-                sawDetached = true;
-                break;
-              case 'unknown':
-                log(`Unrecognized frame type: ${action.event}`);
-                break;
+              if (sawDetached) break;
             }
             if (sawDetached) break;
           }
-          if (sawDetached) break;
+        } finally {
+          timers.clearInterval(stopPollHandle);
         }
       } catch (err) {
         log(`Stream error: ${err instanceof Error ? err.message : String(err)}`);
@@ -148,6 +264,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         clearAttachment(env, io);
         return { ok: true, reason: 'detached-by-server' };
       }
+      if (refreshFailed) break;
       if (shouldStop()) break;
 
       attempt += 1;
@@ -157,6 +274,12 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     }
   } finally {
     heartbeat?.stop();
+  }
+
+  if (refreshFailed) {
+    log(`Token refresh failed: ${refreshFailed.message}`);
+    log('Run `yolo-bridge login` again.');
+    return { ok: false, reason: 'refresh-failed', message: refreshFailed.message };
   }
 
   return { ok: true, reason: 'stopped' };

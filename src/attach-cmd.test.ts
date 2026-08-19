@@ -1,8 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { runAttachDaemon, pickWorkspaceFromDisk } from './attach-cmd.js';
-import { loadAttachment, saveAuth, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import { runAttachDaemon, pickWorkspaceFromDisk, type RefreshTokenFn } from './attach-cmd.js';
+import { loadAttachment, loadAuth, saveAuth, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import type { TimerImpl } from './heartbeat.js';
 
 const ENV = { HOME: '/home/yolo' };
 const AUTH: StoredAuth = { accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: Date.now() + 3600_000 };
@@ -27,8 +28,66 @@ function sseStreamResponse(text: string): Response {
   return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
 }
 
+/** Like sseStreamResponse but deliberately never closes — mimics the real
+ * server, which holds the SSE connection open indefinitely (keepalive
+ * pings only). Used to prove the daemon doesn't rely on the stream ending
+ * on its own to notice a stop signal / refresh failure. */
+function neverEndingSseStreamResponse(text: string): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(text));
+      // no close() — stream stays open forever, like the real one does.
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Fake TimerImpl that captures interval callbacks so tests can invoke
+ * them synchronously instead of waiting on a real clock (same pattern as
+ * heartbeat.test.ts's fakeTimers — attach-cmd.ts's stop-poll interval and
+ * heartbeat both take this same injected TimerImpl). */
+function fakeTimers(): TimerImpl & { tick(times?: number): void; intervals: Array<{ fn: () => void; ms: number }> } {
+  const intervals: Array<{ fn: () => void; ms: number }> = [];
+  return {
+    intervals,
+    setInterval(fn, ms) {
+      const entry = { fn, ms };
+      intervals.push(entry);
+      return entry;
+    },
+    clearInterval(handle) {
+      const idx = intervals.indexOf(handle as { fn: () => void; ms: number });
+      if (idx >= 0) intervals.splice(idx, 1);
+    },
+    tick(times = 1) {
+      for (let i = 0; i < times; i++) {
+        for (const entry of [...intervals]) entry.fn();
+      }
+    },
+  };
+}
+
+/** Polls `cond` with short real waits (never a multi-second sleep) purely
+ * to let already-scheduled microtasks/I/O callbacks in the daemon under
+ * test settle before the test drives its next step — not exercising any
+ * of the daemon's own sleep/backoff/reconnect timing. */
+async function waitUntil(cond: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitUntil: timed out');
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label}: timed out after ${ms}ms`)), ms)),
+  ]);
 }
 
 describe('runAttachDaemon', () => {
@@ -129,6 +188,249 @@ describe('runAttachDaemon', () => {
 
     assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
     assert.deepEqual(replyBody, { attachmentId: 'a1', type: 'read-output-reply', requestId: 'req-1', output: 'stub output', busy: true });
+  });
+
+  it('a stop signal during an active never-ending stream forces prompt exit instead of hanging forever (Bug 1)', async () => {
+    const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    let stop = false;
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      shouldStop: () => stop,
+      timers,
+    });
+
+    // Let the daemon reach the 'connected' frame — that's when both the
+    // heartbeat interval and the stop-poll interval (Bug 1's fix) get
+    // registered on the fake timer. The stream itself never closes, so
+    // without the fix nothing below would ever unblock the daemon.
+    await waitUntil(() => timers.intervals.length >= 2);
+
+    stop = true;
+    timers.tick(1); // fires the stop-poll callback, which must destroy() the stream
+
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after stop signal');
+    assert.deepEqual(result, { ok: true, reason: 'stopped' });
+  });
+});
+
+describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
+  it('proactively refreshes before expiry, updating both the in-memory client and the persisted auth.json', async () => {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+
+    const authHeadersSeen: string[] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      if (auth) authHeadersSeen.push(auth);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const almostExpiredAuth: StoredAuth = {
+      accessToken: 'stale-at',
+      refreshToken: 'rt-1',
+      tokenType: 'Bearer',
+      expiresAtMs: 1_000_000, // way in the "past" relative to the fixed clock below
+    };
+    const io = fakeIO();
+    saveAuth(almostExpiredAuth, ENV, io);
+
+    let refreshCalls = 0;
+    const refreshAccessToken: RefreshTokenFn = async (authBaseUrl, refreshToken) => {
+      refreshCalls++;
+      assert.equal(authBaseUrl, 'https://auth.example.com');
+      assert.equal(refreshToken, 'rt-1');
+      return {
+        status: 'ok',
+        tokens: { accessToken: 'fresh-at', refreshToken: 'rt-2', expiresInSec: 3600, expiresAtMs: 1_000_000 + 3600_000 },
+      };
+    };
+
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      authBaseUrl: 'https://auth.example.com',
+      auth: almostExpiredAuth,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      now: () => 1_000_000,
+      refreshAccessToken,
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(refreshCalls, 1, 'refresh should fire once before the stream was opened');
+    assert.ok(
+      authHeadersSeen.every((h) => h === 'Bearer fresh-at'),
+      `every API call after refresh should use the new access token, saw: ${authHeadersSeen.join(', ')}`,
+    );
+    assert.deepEqual(loadAuth(ENV, io), {
+      accessToken: 'fresh-at',
+      refreshToken: 'rt-2',
+      tokenType: 'Bearer',
+      expiresAtMs: 1_000_000 + 3600_000,
+    });
+  });
+
+  it('does not refresh when the access token still has plenty of validity left', async () => {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    let refreshCalls = 0;
+    const refreshAccessToken: RefreshTokenFn = async () => {
+      refreshCalls++;
+      return { status: 'ok', tokens: { accessToken: 'x', refreshToken: 'y', expiresInSec: 3600, expiresAtMs: 0 } };
+    };
+
+    const freshAuth: StoredAuth = { accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 1_000_000 };
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: freshAuth,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      now: () => 1_000_000 - 3600_000, // an hour of validity left, buffer is 5 min
+      refreshAccessToken,
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(refreshCalls, 0);
+  });
+
+  it('when the refresh itself fails, stops cleanly with an actionable message instead of looping on a dead token', async () => {
+    const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    const logs: string[] = [];
+    const refreshAccessToken: RefreshTokenFn = async () => ({
+      status: 'failed',
+      message: 'refresh_token_expired',
+    });
+
+    const almostExpiredAuth: StoredAuth = {
+      accessToken: 'stale-at',
+      refreshToken: 'dead-rt',
+      tokenType: 'Bearer',
+      expiresAtMs: 1_000_000,
+    };
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: almostExpiredAuth,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => logs.push(line),
+      now: () => 1_000_000,
+      refreshAccessToken,
+      timers,
+    });
+
+    // The pre-stream refresh check fails immediately here (token is
+    // already past the buffer at the fixed clock value), before any
+    // stream is even opened, so no stop-poll ticking is needed for this
+    // path — but the test still bounds the wait so a regression that
+    // makes it spin/hang fails loudly instead of hanging the suite.
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after refresh failure');
+
+    assert.deepEqual(result, { ok: false, reason: 'refresh-failed', message: 'refresh_token_expired' });
+    assert.ok(
+      logs.some((l) => l.includes('refresh_token_expired')),
+      `expected a log line surfacing the refresh failure, got: ${JSON.stringify(logs)}`,
+    );
+    assert.ok(
+      logs.some((l) => l.includes('yolo-bridge login')),
+      `expected an actionable "run yolo-bridge login again" log line, got: ${JSON.stringify(logs)}`,
+    );
+  });
+
+  it('a refresh failure mid-stream (not just pre-connect) also stops the daemon instead of looping', async () => {
+    const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    // Connect with plenty of validity left (so the PRE-stream check
+    // passes), then simulate the clock advancing past the refresh buffer
+    // once we're already inside the stream — mirroring a real long-lived
+    // connection outliving the token.
+    let clock = 1_000_000;
+    const freshAuth: StoredAuth = { accessToken: 'at-1', refreshToken: 'rt-1', tokenType: 'Bearer', expiresAtMs: clock + 3600_000 };
+    const refreshAccessToken: RefreshTokenFn = async () => ({ status: 'failed', message: 'invalid_grant' });
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: freshAuth,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      now: () => clock,
+      refreshAccessToken,
+      timers,
+    });
+
+    await waitUntil(() => timers.intervals.length >= 2); // connected: heartbeat + stop-poll both registered
+
+    clock += 3600_000; // now within the refresh buffer of expiry
+    // The heartbeat tick's ensureFreshToken() call is async (goes through
+    // the injected fetchImpl), so it doesn't resolve within the same
+    // synchronous tick() pass the stop-poll interval also fires in. Ticking
+    // repeatedly with a real (short) yield between each tick gives that
+    // promise chain room to resolve and set `refreshFailed` before the
+    // next stop-poll check reads it and destroy()s the stream.
+    for (let i = 0; i < 20; i++) {
+      timers.tick(1);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after mid-stream refresh failure');
+    assert.deepEqual(result, { ok: false, reason: 'refresh-failed', message: 'invalid_grant' });
   });
 });
 
