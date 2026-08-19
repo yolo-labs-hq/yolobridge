@@ -57,6 +57,19 @@ const DEFAULT_ROWS = 40;
 /** How recently the PTY must have produced output to be considered "busy". */
 const DEFAULT_BUSY_WINDOW_MS = 2_000;
 
+/**
+ * Delay between writing the prompt text and writing the Enter keystroke in
+ * `deliverPromptToLocalAgent` — see that function's doc comment. 150ms was
+ * enough to fix `codex` in manual testing with no observable added latency;
+ * not exposed as an option since it's a workaround for target-CLI input
+ * handling, not a tunable a caller should need to reason about.
+ */
+const PASTE_TO_ENTER_DELAY_MS = 150;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export interface LocalAgentExitInfo {
   exitCode: number;
   signal?: number;
@@ -293,9 +306,20 @@ export function stopLocalAgent(): void {
  * Writes `prompt` into the owned PTY the same way the user's own
  * keystrokes would land, followed by a carriage return so the target CLI
  * actually submits it. `\r` (not `\n`) matches what a real terminal sends
- * on Enter — verified empirically against `bash` in a PTY (the shell's
- * line discipline treats `\r` as submit, same as an interactive
- * readline-based CLI would), see local-agent.test.ts.
+ * on Enter.
+ *
+ * **The text and the Enter are two SEPARATE writes, with a short delay
+ * between them — not one combined `${prompt}\r` write.** Verified
+ * empirically against real CLIs (2026-08-20, manual smoke test): a single
+ * combined write works for `bash` and `claude`, but silently fails to
+ * submit against `codex` — the text lands in its input box but Enter is
+ * never registered, so nothing is ever sent. Splitting into two writes
+ * with `PASTE_TO_ENTER_DELAY_MS` between them fixed `codex` with no
+ * regression on `claude`/`bash`. This mirrors the pod side's own proven
+ * two-step pattern (`containers/services/terminal-mux/server.js`:
+ * `tmux paste-buffer` followed by a SEPARATE `tmux send-keys Enter`, not
+ * one combined operation) — the same shape turned out to matter here too,
+ * not just there.
  *
  * If no session has been started yet (misuse, or a test that didn't call
  * `startLocalAgent` first), lazily starts one with defaults rather than
@@ -304,7 +328,10 @@ export function stopLocalAgent(): void {
  */
 export async function deliverPromptToLocalAgent(prompt: string): Promise<void> {
   if (!current) startLocalAgent();
-  current!.ptyProcess.write(`${prompt}\r`);
+  const ptyProcess = current!.ptyProcess;
+  ptyProcess.write(prompt);
+  await sleep(PASTE_TO_ENTER_DELAY_MS);
+  ptyProcess.write('\r');
 }
 
 /**

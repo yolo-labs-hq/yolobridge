@@ -93,13 +93,18 @@ describe('serializeTerminalBuffer', () => {
 });
 
 describe('startLocalAgent / deliverPromptToLocalAgent / captureLocalAgentOutput (fake PTY)', () => {
-  it('writes the prompt followed by a carriage return, matching a real Enter keypress', async () => {
+  it('writes the prompt text and the carriage return as two SEPARATE writes, matching a real Enter keypress', async () => {
+    // Regression guard for a real bug found in manual smoke testing
+    // (2026-08-20): a single combined `${prompt}\r` write silently fails
+    // to submit against codex's input widget (text lands, Enter never
+    // registers) even though it works fine against bash/claude. See
+    // deliverPromptToLocalAgent's doc comment.
     const fake = fakePty();
     startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl });
 
     await deliverPromptToLocalAgent('do the thing');
 
-    assert.deepEqual(fake.writes, ['do the thing\r']);
+    assert.deepEqual(fake.writes, ['do the thing', '\r']);
   });
 
   it('mirrors PTY output into both the headless terminal and the injected stdout sink', async () => {
