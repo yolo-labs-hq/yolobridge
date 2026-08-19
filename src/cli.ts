@@ -17,6 +17,8 @@
  * YOLOBRIDGE_AUTH_URL for local dev against a different environment.
  */
 
+import { fileURLToPath } from 'node:url';
+
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runDetach } from './detach-cmd.js';
@@ -66,14 +68,61 @@ async function cmdLogin(): Promise<number> {
   return 1;
 }
 
-async function cmdAttach(args: string[]): Promise<number> {
-  let workspaceId = args.find((a) => !a.startsWith('--'));
+export interface AttachArgs {
+  workspaceId?: string;
+  hostLabel?: string;
+  agentBin?: string;
+}
+
+export interface AttachArgsError {
+  error: string;
+}
+
+/**
+ * Parses `attach`'s argv into its recognized `--label <name>` / `--agent
+ * <binary>` flag pairs plus a leftover positional workspaceId — consuming
+ * each flag's value together with the flag itself *before* deciding what's
+ * left over for the positional, so e.g. `attach --label laptop` doesn't
+ * mistake "laptop" for a workspace id (it should still fall through to the
+ * interactive picker). An unrecognized `--something` is a hard error rather
+ * than being silently swallowed as some other flag's value.
+ */
+export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
+  let workspaceId: string | undefined;
   let hostLabel: string | undefined;
   let agentBin: string | undefined;
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--label') hostLabel = args[++i];
-    if (args[i] === '--agent') agentBin = args[++i];
+    const a = args[i];
+    if (a === '--label' || a === '--agent') {
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return { error: `${a} requires a value` };
+      }
+      if (a === '--label') hostLabel = value;
+      else agentBin = value;
+      i++;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      return { error: `unrecognized option '${a}'` };
+    }
+    if (workspaceId === undefined) {
+      workspaceId = a;
+    }
   }
+  return { workspaceId, hostLabel, agentBin };
+}
+
+async function cmdAttach(args: string[]): Promise<number> {
+  const parsed = parseAttachArgs(args);
+  if ('error' in parsed) {
+    process.stderr.write(`yolo-bridge attach: ${parsed.error}\n`);
+    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>]\n');
+    return 64;
+  }
+  let workspaceId = parsed.workspaceId;
+  const hostLabel = parsed.hostLabel;
+  const agentBin = parsed.agentBin;
   if (!workspaceId) {
     // No positional id — fall back to an interactive picker over the
     // caller's own `GET .../workspaces/selectable` list instead of just
@@ -224,11 +273,18 @@ async function main(): Promise<number> {
   }
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((err) => {
-    process.stderr.write(`yolo-bridge: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}\n`);
-    process.exitCode = 1;
-  });
+// Guard direct execution vs. being imported (e.g. by cli.test.ts to reach
+// `parseAttachArgs`) — without this, importing this module would run `main`
+// against whatever process's argv happened to be doing the importing.
+const isMainModule = process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isMainModule) {
+  main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((err) => {
+      process.stderr.write(`yolo-bridge: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}\n`);
+      process.exitCode = 1;
+    });
+}
