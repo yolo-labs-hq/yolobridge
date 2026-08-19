@@ -17,6 +17,7 @@
  */
 
 import { Readable } from 'node:stream';
+import * as readline from 'node:readline';
 import { SseFrameParser } from './sse-frame-parser.js';
 import { actionForFrame } from './frame-actions.js';
 import { startHeartbeat, type HeartbeatScheduler, type TimerImpl } from './heartbeat.js';
@@ -168,4 +169,75 @@ export async function runAttachFromDisk(
   const auth = loadAuth(opts.env, opts.io);
   if (!auth) return { ok: false, reason: 'not-logged-in' };
   return runAttachDaemon({ ...opts, auth });
+}
+
+/**
+ * Interactive workspace picker for `yolo-bridge attach` when it's run with
+ * no positional workspaceId (--help previously documented it as required;
+ * this is an ADDED path, the explicit-ID call site is unchanged). Fetches
+ * the caller's own `GET .../workspaces/selectable` list, prints a numbered
+ * menu, and reads one line of input for the selection.
+ *
+ * `prompt` is the injection point that keeps this testable without a real
+ * TTY: it defaults to a real `node:readline` prompt over process
+ * stdin/stdout, but tests pass a fake that returns a canned answer —
+ * same shape as this file's other injected IO (`fetchImpl`, `log`, `io`).
+ */
+export interface PickWorkspaceDeps {
+  commonApiBaseUrl: string;
+  env?: Record<string, string | undefined>;
+  io?: ConfigStoreIO;
+  fetchImpl?: apiClient.FetchImpl;
+  log?: (line: string) => void;
+  prompt?: (question: string) => Promise<string>;
+}
+
+export type PickWorkspaceResult =
+  | { ok: true; workspaceId: string }
+  | { ok: false; reason: 'not-logged-in' }
+  | { ok: false; reason: 'list-failed'; message: string }
+  | { ok: false; reason: 'no-workspaces' }
+  | { ok: false; reason: 'no-selection' };
+
+function defaultPrompt(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+export async function pickWorkspaceFromDisk(deps: PickWorkspaceDeps): Promise<PickWorkspaceResult> {
+  const auth = loadAuth(deps.env, deps.io);
+  if (!auth) return { ok: false, reason: 'not-logged-in' };
+
+  const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const prompt = deps.prompt ?? defaultPrompt;
+  const cfg: apiClient.ApiClientConfig = {
+    commonApiBaseUrl: deps.commonApiBaseUrl,
+    accessToken: auth.accessToken,
+    fetchImpl: deps.fetchImpl,
+  };
+
+  let workspaces: apiClient.SelectableWorkspace[];
+  try {
+    workspaces = await apiClient.listSelectableWorkspaces(cfg);
+  } catch (err) {
+    return { ok: false, reason: 'list-failed', message: err instanceof Error ? err.message : String(err) };
+  }
+  if (workspaces.length === 0) return { ok: false, reason: 'no-workspaces' };
+
+  log('Select a workspace to attach:');
+  workspaces.forEach((ws, i) => {
+    log(`  ${i + 1}. ${ws.name || '(unnamed)'} [${ws.status}]  ${ws.id}`);
+  });
+
+  const answer = (await prompt('Enter a number: ')).trim();
+  const index = Number.parseInt(answer, 10);
+  if (!Number.isInteger(index) || index < 1 || index > workspaces.length) {
+    return { ok: false, reason: 'no-selection' };
+  }
+  return { ok: true, workspaceId: workspaces[index - 1].id };
 }

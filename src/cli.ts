@@ -5,7 +5,9 @@
  *
  * Subcommands:
  *   yolo-bridge login                 — device-authorization flow (login-cmd.ts)
- *   yolo-bridge attach <workspaceId>  — attach + hold the SSE stream (attach-cmd.ts)
+ *   yolo-bridge workspaces            — list selectable workspaces (workspaces-cmd.ts)
+ *   yolo-bridge attach [workspaceId]  — attach + hold the SSE stream (attach-cmd.ts)
+ *                                        (omit the id for an interactive picker)
  *   yolo-bridge detach                — DELETE the current attachment (detach-cmd.ts)
  *   yolo-bridge status                — print local login/attach state (status-cmd.ts)
  *
@@ -16,10 +18,11 @@
  */
 
 import { runLogin } from './login-cmd.js';
-import { runAttachFromDisk } from './attach-cmd.js';
+import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runDetach } from './detach-cmd.js';
 import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
+import { runListWorkspaces, formatWorkspacesTable } from './workspaces-cmd.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
@@ -39,7 +42,9 @@ function printHelp(): void {
       '',
       'Commands:',
       '  login                  Device-authorization login against auth-service.',
-      '  attach <workspaceId>   Attach this machine to a workspace and hold the daemon loop open.',
+      '  workspaces             List your own workspaces (id, name, status) that can be attached to.',
+      '  attach [workspaceId]   Attach this machine to a workspace and hold the daemon loop open.',
+      '                         Omit workspaceId to pick interactively from `yolo-bridge workspaces`.',
       '    [--label <name>]     Operator-facing host label (reported to the workspace).',
       '    [--agent <binary>]   Local coding-agent binary to spawn (default: $YOLOBRIDGE_AGENT_BIN or "claude").',
       '  detach                 Detach the current workspace attachment.',
@@ -62,7 +67,7 @@ async function cmdLogin(): Promise<number> {
 }
 
 async function cmdAttach(args: string[]): Promise<number> {
-  const workspaceId = args.find((a) => !a.startsWith('--'));
+  let workspaceId = args.find((a) => !a.startsWith('--'));
   let hostLabel: string | undefined;
   let agentBin: string | undefined;
   for (let i = 0; i < args.length; i++) {
@@ -70,9 +75,29 @@ async function cmdAttach(args: string[]): Promise<number> {
     if (args[i] === '--agent') agentBin = args[++i];
   }
   if (!workspaceId) {
-    process.stderr.write('yolo-bridge attach: a workspaceId is required\n');
-    process.stderr.write('Usage: yolo-bridge attach <workspaceId> [--label <name>] [--agent <binary>]\n');
-    return 64;
+    // No positional id — fall back to an interactive picker over the
+    // caller's own `GET .../workspaces/selectable` list instead of just
+    // failing (nobody has a raw workspace ObjectId memorized).
+    const pick = await pickWorkspaceFromDisk({ commonApiBaseUrl: apiUrl() });
+    if (!pick.ok) {
+      switch (pick.reason) {
+        case 'not-logged-in':
+          process.stderr.write('yolo-bridge attach: not logged in — run `yolo-bridge login` first.\n');
+          break;
+        case 'no-workspaces':
+          process.stderr.write('yolo-bridge attach: no workspaces found for your account.\n');
+          break;
+        case 'no-selection':
+          process.stderr.write('yolo-bridge attach: no workspace selected.\n');
+          break;
+        case 'list-failed':
+          process.stderr.write(`yolo-bridge attach: ${pick.message}\n`);
+          break;
+      }
+      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>]\n');
+      return 64;
+    }
+    workspaceId = pick.workspaceId;
   }
 
   let stopRequested = false;
@@ -160,11 +185,27 @@ function cmdStatus(): number {
   return 0;
 }
 
+async function cmdWorkspaces(): Promise<number> {
+  const result = await runListWorkspaces({ commonApiBaseUrl: apiUrl() });
+  if (!result.ok) {
+    if (result.reason === 'not-logged-in') {
+      process.stderr.write('yolo-bridge workspaces: not logged in — run `yolo-bridge login` first.\n');
+    } else {
+      process.stderr.write(`yolo-bridge workspaces: ${result.message}\n`);
+    }
+    return 1;
+  }
+  process.stdout.write(`${formatWorkspacesTable(result.workspaces)}\n`);
+  return 0;
+}
+
 async function main(): Promise<number> {
   const [, , cmd, ...rest] = process.argv;
   switch (cmd) {
     case 'login':
       return cmdLogin();
+    case 'workspaces':
+      return cmdWorkspaces();
     case 'attach':
       return cmdAttach(rest);
     case 'detach':

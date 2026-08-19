@@ -1,8 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { runAttachDaemon } from './attach-cmd.js';
-import { loadAttachment, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import { runAttachDaemon, pickWorkspaceFromDisk } from './attach-cmd.js';
+import { loadAttachment, saveAuth, type ConfigStoreIO, type StoredAuth } from './config-store.js';
 
 const ENV = { HOME: '/home/yolo' };
 const AUTH: StoredAuth = { accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: Date.now() + 3600_000 };
@@ -129,5 +129,107 @@ describe('runAttachDaemon', () => {
 
     assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
     assert.deepEqual(replyBody, { attachmentId: 'a1', type: 'read-output-reply', requestId: 'req-1', output: 'stub output', busy: true });
+  });
+});
+
+describe('pickWorkspaceFromDisk', () => {
+  it('fails fast when not logged in, without ever calling the fake prompt', async () => {
+    const io = fakeIO();
+    let promptCalled = false;
+    const result = await pickWorkspaceFromDisk({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      prompt: async () => { promptCalled = true; return '1'; },
+    });
+    assert.deepEqual(result, { ok: false, reason: 'not-logged-in' });
+    assert.equal(promptCalled, false);
+  });
+
+  it('lists selectable workspaces, prompts, and resolves the chosen index to a workspaceId', async () => {
+    const io = fakeIO();
+    saveAuth(AUTH, ENV, io);
+    const fetchImpl = (async (url: any) => {
+      assert.equal(String(url), 'https://api.example.com/v1/workspaces/selectable');
+      return jsonResponse(200, {
+        workspaces: [
+          { id: 'w1', name: 'Alpha', status: 'running' },
+          { id: 'w2', name: 'Beta', status: 'paused' },
+        ],
+      });
+    }) as any;
+
+    const logs: string[] = [];
+    const questions: string[] = [];
+    const result = await pickWorkspaceFromDisk({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      fetchImpl,
+      log: (line) => logs.push(line),
+      prompt: async (q) => { questions.push(q); return '2'; },
+    });
+
+    assert.deepEqual(result, { ok: true, workspaceId: 'w2' });
+    assert.equal(questions.length, 1);
+    assert.ok(logs.some((l) => l.includes('Alpha') && l.includes('running') && l.includes('w1')));
+    assert.ok(logs.some((l) => l.includes('Beta') && l.includes('paused') && l.includes('w2')));
+  });
+
+  it('reports no-workspaces without prompting when the list is empty', async () => {
+    const io = fakeIO();
+    saveAuth(AUTH, ENV, io);
+    const fetchImpl = (async () => jsonResponse(200, { workspaces: [] })) as any;
+    let promptCalled = false;
+
+    const result = await pickWorkspaceFromDisk({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      prompt: async () => { promptCalled = true; return '1'; },
+    });
+
+    assert.deepEqual(result, { ok: false, reason: 'no-workspaces' });
+    assert.equal(promptCalled, false);
+  });
+
+  it('rejects an out-of-range or non-numeric selection as no-selection', async () => {
+    const io = fakeIO();
+    saveAuth(AUTH, ENV, io);
+    const fetchImpl = (async () => jsonResponse(200, { workspaces: [{ id: 'w1', name: 'Alpha', status: 'running' }] })) as any;
+
+    const result = await pickWorkspaceFromDisk({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      prompt: async () => 'not-a-number',
+    });
+
+    assert.deepEqual(result, { ok: false, reason: 'no-selection' });
+  });
+
+  it('surfaces a list failure as list-failed with the underlying message', async () => {
+    const io = fakeIO();
+    saveAuth(AUTH, ENV, io);
+    const fetchImpl = (async () => jsonResponse(500, { error: 'boom' })) as any;
+
+    const result = await pickWorkspaceFromDisk({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      prompt: async () => '1',
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.reason, 'list-failed');
+      assert.match((result as any).message, /boom/);
+    }
   });
 });

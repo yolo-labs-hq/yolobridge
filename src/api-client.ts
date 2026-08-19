@@ -63,6 +63,45 @@ export async function attach(
   return { tileId: body.tileId, attachmentId: body.attachmentId };
 }
 
+export interface SelectableWorkspace {
+  id: string;
+  name: string;
+  status: string;
+}
+
+/**
+ * `GET /v1/workspaces/selectable` — slim `{id,name,status}` list of the
+ * caller's own non-terminated, non-ephemeral workspaces (capped at 500
+ * server-side), authenticated the same `flexibleAuth` tier as every other
+ * call in this file. There's no membership/role model in this codebase —
+ * a user's workspaces are strictly `{ userId: <them> }` — so this is a
+ * single owner-scoped list, not a "workspaces I can see" query.
+ * (`common-api/src/routes/workspaces.ts`, `WorkspaceService.listSelectable`.)
+ */
+export async function listSelectableWorkspaces(cfg: ApiClientConfig): Promise<SelectableWorkspace[]> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(`${base(cfg)}/v1/workspaces/selectable`, {
+    method: 'GET',
+    headers: authHeaders(cfg),
+  });
+  if (!res.ok) {
+    const { message, code } = await parseErrorBody(res);
+    throw new YoloBridgeApiError(`list workspaces failed: ${message}`, res.status, code);
+  }
+  const body = (await res.json()) as any;
+  if (!Array.isArray(body?.workspaces)) {
+    throw new YoloBridgeApiError('list workspaces returned an unexpected shape', res.status);
+  }
+  const workspaces: SelectableWorkspace[] = [];
+  for (const w of body.workspaces) {
+    if (typeof w?.id !== 'string' || typeof w?.status !== 'string') {
+      throw new YoloBridgeApiError('list workspaces returned an unexpected shape', res.status);
+    }
+    workspaces.push({ id: w.id, name: typeof w.name === 'string' ? w.name : '', status: w.status });
+  }
+  return workspaces;
+}
+
 export async function detach(cfg: ApiClientConfig, workspaceId: string, attachmentId: string): Promise<void> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const res = await fetchImpl(`${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}`, {
