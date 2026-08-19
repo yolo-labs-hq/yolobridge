@@ -1,0 +1,30 @@
+{
+  "name": "@yololabs/yolobridge",
+  "version": "0.1.0",
+  "description": "YoloBridge — local coding-agent daemon that attaches a user's own Claude Code/Codex session to a YOLO Studio workspace as a first-class tile (docs/YOLOBRIDGE_PLAN.md, build-order Phase 5).",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "yolo-bridge": "dist/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist/**/*.js",
+    "!dist/**/*.test.js",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-reporter=spec dist/*.test.js",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}
