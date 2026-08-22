@@ -107,6 +107,27 @@ describe('startLocalAgent / deliverPromptToLocalAgent / captureLocalAgentOutput 
     assert.deepEqual(fake.writes, ['do the thing', '\r']);
   });
 
+  it('wraps a MULTILINE prompt in bracketed-paste markers and waits the longer multiline delay before Enter (docs/YOLOBRIDGE_PLAN.md "[P1] Send multiline prompts as a bracketed paste")', async () => {
+    // Regression guard for a real bug found via real interop testing
+    // (2026-08-22, spawning actual claude/codex/bash under node-pty): at
+    // the single-line PASTE_TO_ENTER_DELAY_MS, a multiline prompt was left
+    // sitting UNSENT in claude's composer indefinitely — not a premature
+    // split, a silent never-submits. See deliverPromptToLocalAgent's doc
+    // comment for the full before/after evidence; this test only pins the
+    // resulting write shape and that it takes meaningfully longer than the
+    // single-line path above (which stays completely unchanged).
+    const fake = fakePty();
+    startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl });
+
+    const prompt = 'line one\nline two\nline three';
+    const start = Date.now();
+    await deliverPromptToLocalAgent(prompt);
+    const elapsedMs = Date.now() - start;
+
+    assert.deepEqual(fake.writes, [`\x1b[200~${prompt}\x1b[201~`, '\r']);
+    assert.ok(elapsedMs >= 900, `expected the multiline delay (~1000ms) to elapse, got ${elapsedMs}ms`);
+  });
+
   it('mirrors PTY output into both the headless terminal and the injected stdout sink', async () => {
     const fake = fakePty();
     const sunk: string[] = [];

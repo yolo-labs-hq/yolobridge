@@ -86,6 +86,22 @@ const DEFAULT_READINESS_POLL_MS = 100;
  */
 const PASTE_TO_ENTER_DELAY_MS = 150;
 
+/**
+ * Delay before Enter for a MULTILINE prompt specifically — see the
+ * "multiline delivery" section of `deliverPromptToLocalAgent`'s doc comment.
+ * Verified empirically (2026-08-22) against real `claude` (v2.1.240): 150ms
+ * and 300ms both left a 3-line prompt sitting unsent in the composer
+ * indefinitely (not a premature-split, a SILENT NEVER-SUBMITS); 800ms
+ * reliably submitted it. 1000ms is that empirical floor plus headroom, not a
+ * tuned-to-the-millisecond value — this only affects the already-rare
+ * multiline path, so the extra ~200ms over the verified-working 800ms is
+ * immaterial to UX. `codex` and `bash` submit correctly at the original
+ * 150ms already; using the longer delay for them too is harmless (just
+ * slower), so this applies unconditionally to every multiline delivery
+ * rather than trying to detect which target needs it.
+ */
+const MULTILINE_PASTE_TO_ENTER_DELAY_MS = 1_000;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -448,14 +464,41 @@ async function waitForReadiness(state: LocalAgentState): Promise<boolean> {
  * `startLocalAgent` first), lazily starts one with defaults rather than
  * throwing — keeps this function's contract matching the original stub's
  * "always succeeds, delivery is attempted" shape.
+ *
+ * **Multiline delivery (docs/YOLOBRIDGE_PLAN.md's "[P1] Send multiline
+ * prompts as a bracketed paste" Codex finding, fixed 2026-08-22).** A
+ * prompt containing embedded `\n` is wrapped in bracketed-paste markers
+ * (`\x1b[200~`/`\x1b[201~`) and waits `MULTILINE_PASTE_TO_ENTER_DELAY_MS`
+ * (not `PASTE_TO_ENTER_DELAY_MS`) before the Enter write. **The bracketed
+ * markers turned out NOT to be the load-bearing part of this fix** — real
+ * interop testing (spawning actual `claude`/`codex`/`bash` under `node-pty`,
+ * the same rigor as the codex-write-timing fix above) showed `codex`
+ * already correctly composes and submits a multiline prompt as ONE message
+ * at the original 150ms delay, no markers needed; `bash` is unaffected by
+ * markers either way (a multi-statement shell script legitimately runs each
+ * line once submitted — that's normal shell semantics, not a delivery bug,
+ * and `bash` is only this module's sanity-check fallback, not a primary
+ * agent target). The REAL bug was `claude` (v2.1.240): at the original
+ * 150ms delay, a multiline prompt was left sitting UNSENT in the composer
+ * indefinitely — not a premature partial-submit, a silent no-op that
+ * `send_to_tile` would have reported as `delivered: true` while the agent
+ * never saw it. Confirmed via the headless-buffer screen capture this
+ * module already uses for `read_tile_output`: 150ms/300ms (bracketed or
+ * not) left the 3-line prompt in the composer with no response ever
+ * starting; 800ms reliably submitted it and the model began responding.
+ * Bracketed-paste markers are kept anyway as cheap defense-in-depth (every
+ * target tested renders them correctly with no visible artifacts) for
+ * whatever agent binary is named next via `--agent` that wasn't tested
+ * here — but the delay is what actually closes the finding.
  */
 export async function deliverPromptToLocalAgent(prompt: string): Promise<void> {
   if (!current) startLocalAgent();
   const state = current!;
   await waitForReadiness(state);
   const ptyProcess = state.ptyProcess;
-  ptyProcess.write(prompt);
-  await sleep(PASTE_TO_ENTER_DELAY_MS);
+  const isMultiline = prompt.includes('\n');
+  ptyProcess.write(isMultiline ? `\x1b[200~${prompt}\x1b[201~` : prompt);
+  await sleep(isMultiline ? MULTILINE_PASTE_TO_ENTER_DELAY_MS : PASTE_TO_ENTER_DELAY_MS);
   ptyProcess.write('\r');
 }
 
