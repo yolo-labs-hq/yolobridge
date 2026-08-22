@@ -159,6 +159,26 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   saveAttachment({ workspaceId, tileId, attachmentId, attachedAt: new Date().toISOString() }, env, io);
   log(`Attached. tileId=${tileId} attachmentId=${attachmentId}`);
 
+  // Codex-found race: if something already asked us to stop WHILE the
+  // initial refresh/attach network round trip above was in flight (e.g. the
+  // local agent process this daemon spawns exits almost immediately), the
+  // caller's own onExit-triggered best-effort detach ran too early — before
+  // this attachment existed anywhere — and found nothing to clean up. The
+  // `while (!shouldStop())` loop below would otherwise exit on its very
+  // first check having never opened a stream, returning `{ ok: true,
+  // reason: 'stopped' }` with the attachment just created above left as a
+  // permanent orphan (the CLI's own post-return cleanup skips it too, since
+  // it believes the onExit path already handled detaching). Catch it here,
+  // right after this call is the one that created it, so there's exactly
+  // one place responsible for cleaning up what it made.
+  if (shouldStop()) {
+    await apiClient.detach(cfg, workspaceId, attachmentId).catch((err) => {
+      log(`Cleanup detach failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    clearAttachment(env, io);
+    return { ok: true, reason: 'stopped' };
+  }
+
   let heartbeat: HeartbeatScheduler | undefined;
   let attempt = 0;
   /** Set when a proactive refresh (see ensureFreshToken) fails while a

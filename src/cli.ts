@@ -204,6 +204,24 @@ async function cmdAttach(args: string[]): Promise<number> {
     } else {
       process.stderr.write(`yolo-bridge attach: ${result.message}\n`);
     }
+    // Codex-found gap: `refresh-failed` can fire on a RECONNECT cycle, well
+    // after the initial `apiClient.attach` created the server-side
+    // attachment and saved attachment.json — this early return used to skip
+    // the runDetach() cleanup below (guarded on `result.ok`), leaving a
+    // permanent stale attachment behind (the tile never flips to `stopped`,
+    // and a later `attach` piles on a second one instead of replacing it).
+    // Best-effort and safe even when `refresh-failed` happened on the VERY
+    // FIRST refresh (before any attach ever succeeded, so nothing is
+    // attached): runDetach() reads local attachment.json first and returns
+    // a harmless `not-attached` when there's nothing to clean up. The
+    // refresh-buffer window (proactive refresh starts 5min before expiry —
+    // see DEFAULT_REFRESH_BUFFER_MS in attach-cmd.ts) means the token used
+    // to reach that point is usually still valid for one more request, so
+    // this detach call has a real chance of succeeding rather than just
+    // failing the same way the refresh did.
+    if (result.reason === 'refresh-failed') {
+      await runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+    }
     return 1;
   }
 

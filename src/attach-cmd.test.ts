@@ -156,6 +156,46 @@ describe('runAttachDaemon', () => {
     }
   });
 
+  it('cleans up (server detach + local attachment.json) if a stop was already requested by the time attach succeeds, without ever opening a stream (Codex-found race)', async () => {
+    // Reproduces: the local agent process this daemon spawns exits almost
+    // immediately (or Ctrl+C lands) WHILE the initial refresh/attach network
+    // round trip is still in flight. The caller's own onExit-triggered
+    // detach runs too early — before this attachment exists anywhere — and
+    // finds nothing to clean up. Without the fix, `apiClient.attach` still
+    // creates the server-side attachment + tile, the `while
+    // (!shouldStop())` loop exits on its first check having never opened a
+    // stream, and the attachment just created is a permanent orphan.
+    const requests: string[] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      requests.push(`${method} ${u}`);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return jsonResponse(204, {});
+      if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      shouldStop: () => true, // already asked to stop before attach even started
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'stopped' });
+    assert.ok(
+      requests.some((r) => r.startsWith('DELETE') && r.includes('/yolobridge/attach/a1')),
+      'must call server-side detach for the attachment it just created',
+    );
+    assert.equal(loadAttachment(ENV, io), undefined, 'local attachment.json must be cleared, not left orphaned');
+  });
+
   it('answers a read-output frame by posting a read-output-reply with the stub capture', async () => {
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
