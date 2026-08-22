@@ -210,6 +210,112 @@ describe('startLocalAgent / deliverPromptToLocalAgent / captureLocalAgentOutput 
   });
 });
 
+describe('deliverPromptToLocalAgent readiness gate (docs/YOLOBRIDGE_PLAN.md "[P1] Blind prompt delivery")', () => {
+  it('delivers immediately once quiet, with no content yet (a fresh session — cursor position is not a meaningful signal on an empty screen)', async () => {
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake',
+      cols: 40,
+      rows: 10,
+      stdout: { write: () => true },
+      stdin: undefined,
+      spawnImpl: fake.spawnImpl,
+      readinessQuietMs: 30,
+      readinessPollMs: 10,
+    });
+
+    await deliverPromptToLocalAgent('hello');
+
+    assert.deepEqual(fake.writes, ['hello', '\r']);
+  });
+
+  it('waits while the terminal is still producing output, then delivers once it settles', async () => {
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake',
+      cols: 40,
+      rows: 10,
+      stdout: { write: () => true },
+      stdin: undefined,
+      spawnImpl: fake.spawnImpl,
+      readinessQuietMs: 80,
+      readinessPollMs: 10,
+    });
+
+    fake.emitData('agent is thinking...');
+    const pending = deliverPromptToLocalAgent('do the thing');
+
+    // Synchronously right after the call — before any await inside
+    // deliverPromptToLocalAgent has had a chance to resolve — nothing
+    // should have been written yet: the terminal just produced output, so
+    // it's well inside the readinessQuietMs window.
+    assert.deepEqual(fake.writes, []);
+
+    await pending;
+    assert.deepEqual(fake.writes, ['do the thing', '\r']);
+  });
+
+  it('proceeds anyway after readinessTimeoutMs if the terminal never settles (bounded wait, not an indefinite hang or a silent refusal)', async () => {
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake',
+      cols: 40,
+      rows: 10,
+      stdout: { write: () => true },
+      stdin: undefined,
+      spawnImpl: fake.spawnImpl,
+      // A quiet window longer than the timeout means isReadyToReceiveInput
+      // can never return true within the bound — every poll still sees
+      // "too recent" relative to a window that outlives the whole wait.
+      readinessQuietMs: 10_000,
+      readinessTimeoutMs: 100,
+      readinessPollMs: 10,
+    });
+
+    fake.emitData('still busy');
+    const start = Date.now();
+    await deliverPromptToLocalAgent('urgent');
+    const elapsedMs = Date.now() - start;
+
+    assert.deepEqual(fake.writes, ['urgent', '\r']);
+    assert.ok(elapsedMs >= 100, `expected the bounded wait to elapse (~100ms), got ${elapsedMs}ms`);
+    assert.ok(elapsedMs < 2000, `expected the wait to be BOUNDED, not runaway — got ${elapsedMs}ms`);
+  });
+
+  it('waits for the cursor to reach the input line once the terminal has scrolled, not just for output to go quiet', async () => {
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake',
+      cols: 20,
+      rows: 5,
+      stdout: { write: () => true },
+      stdin: undefined,
+      spawnImpl: fake.spawnImpl,
+      readinessQuietMs: 20,
+      cursorBottomSlack: 1,
+      readinessTimeoutMs: 300,
+      readinessPollMs: 20,
+    });
+
+    // Push well past 5 rows so the buffer has genuinely scrolled (baseY > 0),
+    // then park the cursor near the TOP of the viewport via an explicit
+    // cursor-position escape — simulating a dialog/pager holding the cursor
+    // away from the live input line while the screen itself is quiet.
+    fake.emitData('line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8\r\n');
+    fake.emitData('\x1b[1;1H'); // CSI cursor position: row 1, col 1 (top)
+
+    await new Promise((resolve) => setTimeout(resolve, 25)); // clear readinessQuietMs
+    const start = Date.now();
+    await deliverPromptToLocalAgent('are you there');
+    const elapsedMs = Date.now() - start;
+
+    // Never became ready (cursor stuck at the top of a scrolled buffer) —
+    // must have ridden out the full bounded timeout, not delivered early.
+    assert.ok(elapsedMs >= 250, `expected the readiness wait to run out (~300ms), got ${elapsedMs}ms`);
+    assert.deepEqual(fake.writes, ['are you there', '\r']);
+  });
+});
+
 describe('startLocalAgent (real node-pty spawn)', () => {
   it('delivers a prompt into a real bash PTY and captures the shell-computed result back out', async () => {
     const sunk: string[] = [];

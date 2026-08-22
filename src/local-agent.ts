@@ -58,6 +58,26 @@ const DEFAULT_ROWS = 40;
 const DEFAULT_BUSY_WINDOW_MS = 2_000;
 
 /**
+ * Readiness gate defaults — see `isReadyToReceiveInput`'s doc comment below
+ * for the reasoning (docs/YOLOBRIDGE_PLAN.md's "[P1] Blind prompt delivery"
+ * Codex finding). Distinct from `DEFAULT_BUSY_WINDOW_MS`: that one gates a
+ * UX-facing `busy` signal read_tile_output reports to callers (2s, tuned
+ * for "does this look like it's still thinking"); this one gates WRITE
+ * safety and only needs to rule out active mid-render, so it can be much
+ * shorter.
+ */
+const DEFAULT_READINESS_QUIET_MS = 200;
+/** Rows from the bottom of the viewport the cursor must sit within to
+ * count as "at the input line", once the terminal has scrolled at least
+ * once (see isReadyToReceiveInput). */
+const DEFAULT_CURSOR_BOTTOM_SLACK = 2;
+/** Bounded wait for readiness before proceeding anyway — see
+ * deliverPromptToLocalAgent's doc comment on why this doesn't refuse or
+ * hang indefinitely instead. */
+const DEFAULT_READINESS_TIMEOUT_MS = 5_000;
+const DEFAULT_READINESS_POLL_MS = 100;
+
+/**
  * Delay between writing the prompt text and writing the Enter keystroke in
  * `deliverPromptToLocalAgent` — see that function's doc comment. 150ms was
  * enough to fix `codex` in manual testing with no observable added latency;
@@ -119,6 +139,15 @@ export interface StartLocalAgentOptions {
   onExit?: (info: LocalAgentExitInfo) => void;
   /** How recently PTY output must have arrived for `captureLocalAgentOutput` to report `busy: true`. */
   busyWindowMs?: number;
+  /** How long the terminal must be quiet before `deliverPromptToLocalAgent`
+   * considers a write safe (see `isReadyToReceiveInput`). */
+  readinessQuietMs?: number;
+  /** Rows from the bottom of the viewport the cursor must sit within,
+   * once the terminal has scrolled at least once. */
+  cursorBottomSlack?: number;
+  /** Bounded wait for readiness before `deliverPromptToLocalAgent` proceeds anyway. */
+  readinessTimeoutMs?: number;
+  readinessPollMs?: number;
   /** Test injection point — swap the real `node-pty` spawn for a fake IPty. */
   spawnImpl?: PtySpawnImpl;
 }
@@ -133,6 +162,10 @@ interface LocalAgentState {
   term: TerminalType;
   lastOutputAt: number;
   busyWindowMs: number;
+  readinessQuietMs: number;
+  cursorBottomSlack: number;
+  readinessTimeoutMs: number;
+  readinessPollMs: number;
   writeChain: Promise<void>;
   stdin?: AgentInputSource;
   stdinListener?: (data: Buffer | string) => void;
@@ -208,6 +241,10 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
   const rows = resolveRows(opts);
   const spawnImpl = opts.spawnImpl ?? (pty.spawn as unknown as PtySpawnImpl);
   const busyWindowMs = opts.busyWindowMs ?? DEFAULT_BUSY_WINDOW_MS;
+  const readinessQuietMs = opts.readinessQuietMs ?? DEFAULT_READINESS_QUIET_MS;
+  const cursorBottomSlack = opts.cursorBottomSlack ?? DEFAULT_CURSOR_BOTTOM_SLACK;
+  const readinessTimeoutMs = opts.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+  const readinessPollMs = opts.readinessPollMs ?? DEFAULT_READINESS_POLL_MS;
 
   const outStream: AgentOutputSink = opts.stdout ?? process.stdout;
   // `'stdin' in opts` (not `opts.stdin ??`) so a test can pass `stdin: undefined`
@@ -230,6 +267,10 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
     term,
     lastOutputAt: Date.now(),
     busyWindowMs,
+    readinessQuietMs,
+    cursorBottomSlack,
+    readinessTimeoutMs,
+    readinessPollMs,
     writeChain: Promise.resolve(),
     stdin: inStream,
     rawModeEnabled: false,
@@ -303,10 +344,92 @@ export function stopLocalAgent(): void {
 }
 
 /**
+ * Best-effort readiness check before `deliverPromptToLocalAgent` writes
+ * into the PTY — docs/YOLOBRIDGE_PLAN.md's "[P1] Blind prompt delivery can
+ * hit a permission dialog or partial input" Codex finding. Writing
+ * text+Enter with no regard for what's on screen could accidentally
+ * confirm a highlighted permission-dialog choice, or concatenate onto
+ * something the user was mid-typing.
+ *
+ * Mirrors the SHAPE of the pod side's own confidence-scored injection gate
+ * (`containers/services/terminal-mux/server.js`'s "marker + stability +
+ * cursor"), adapted to what this module actually has: direct structured
+ * `@xterm/headless` buffer access (no capture-pane text-scraping needed),
+ * but no per-agent marker set — building an equivalent of that file's
+ * `readiness-markers.js` for arbitrary local CLIs (claude, codex, and
+ * whatever `--agent` names) is out of scope for this fix, an acknowledged
+ * scope cut, not an oversight. No verify-after-inject retry either (the pod
+ * side's second defense layer, comparing before/after screen state once the
+ * text is written) — this check only gates BEFORE the write.
+ *
+ * Two signals:
+ *   - STABLE: no PTY output for `readinessQuietMs`. Rules out writing into
+ *     a screen that's still actively repainting — a streaming response, a
+ *     busy spinner, a dialog mid-animation. This is the primary signal and
+ *     directly addresses both halves of the finding: an active permission
+ *     dialog is normally still rendering (its highlight/spinner), and
+ *     "partial input" concern is really "is something being typed right
+ *     now" — both are "was there recent activity" questions.
+ *   - CURSOR AT THE INPUT LINE, but ONLY once the terminal has scrolled at
+ *     least once (`buffer.baseY > 0`): the cursor sits within
+ *     `cursorBottomSlack` rows of the viewport bottom. JUDGMENT CALL: this
+ *     is gated on `baseY` rather than being an unconditional requirement —
+ *     a short session whose content still fits in one screen (baseY === 0,
+ *     e.g. a freshly-spawned agent's first prompt, or the real-bash test
+ *     below) legitimately has its cursor wherever the last line landed,
+ *     which is often nowhere near the physical bottom row; requiring the
+ *     bonus signal there would stall every delivery to a short/compact
+ *     session for no real safety benefit. Once the terminal HAS scrolled,
+ *     though, a cursor that isn't near the bottom is a real signal we're
+ *     looking at scrolled-away history or a fixed-position dialog/pager
+ *     rather than the live input line — the pod side's own cursor check
+ *     has this exact same "assumes bottom" property, it just doesn't need
+ *     the `baseY` guard because tmux's `cursor_y`/`pane_height` are already
+ *     relative to the live pane, not a headless buffer that can start at
+ *     row 0 with nothing rendered yet.
+ */
+function isReadyToReceiveInput(state: LocalAgentState): boolean {
+  const quietForMs = Date.now() - state.lastOutputAt;
+  if (quietForMs < state.readinessQuietMs) return false;
+  const buffer = state.term.buffer.active;
+  if (buffer.baseY === 0) return true;
+  const rows = state.term.rows;
+  return rows - 1 - buffer.cursorY <= state.cursorBottomSlack;
+}
+
+/**
+ * Polls `isReadyToReceiveInput` until it's true or `readinessTimeoutMs`
+ * elapses. Never rejects — a timeout just means the caller proceeds
+ * without the extra confidence (see `deliverPromptToLocalAgent`).
+ */
+async function waitForReadiness(state: LocalAgentState): Promise<boolean> {
+  const deadline = Date.now() + state.readinessTimeoutMs;
+  while (!isReadyToReceiveInput(state)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await sleep(Math.min(state.readinessPollMs, remaining));
+  }
+  return true;
+}
+
+/**
  * Writes `prompt` into the owned PTY the same way the user's own
  * keystrokes would land, followed by a carriage return so the target CLI
  * actually submits it. `\r` (not `\n`) matches what a real terminal sends
  * on Enter.
+ *
+ * **Waits (bounded) for `isReadyToReceiveInput` before writing anything.**
+ * JUDGMENT CALL on what happens if the terminal never settles within
+ * `readinessTimeoutMs`: this proceeds and writes anyway, rather than
+ * hanging indefinitely or silently refusing. A hard refusal would have no
+ * safe fallback — `yolobridge-service.ts`'s `publishPrompt` has a
+ * retry-on-RECONNECT loop (Decision Q5) for an OFFLINE daemon, but no
+ * retry-on-BUSY loop for a target that's merely slow to settle, so a
+ * refusal here would silently drop the prompt with no path to ever resend
+ * it. A timeout is therefore "proceed with reduced confidence, own the
+ * risk", not "give up" — the readiness check reduces the odds of a bad
+ * write, it does not (and, without the pod side's verify-after-inject
+ * layer, cannot) guarantee one never happens.
  *
  * **The text and the Enter are two SEPARATE writes, with a short delay
  * between them — not one combined `${prompt}\r` write.** Verified
@@ -328,7 +451,9 @@ export function stopLocalAgent(): void {
  */
 export async function deliverPromptToLocalAgent(prompt: string): Promise<void> {
   if (!current) startLocalAgent();
-  const ptyProcess = current!.ptyProcess;
+  const state = current!;
+  await waitForReadiness(state);
+  const ptyProcess = state.ptyProcess;
   ptyProcess.write(prompt);
   await sleep(PASTE_TO_ENTER_DELAY_MS);
   ptyProcess.write('\r');
