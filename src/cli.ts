@@ -18,6 +18,7 @@
  */
 
 import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
@@ -294,7 +295,28 @@ async function main(): Promise<number> {
 // Guard direct execution vs. being imported (e.g. by cli.test.ts to reach
 // `parseAttachArgs`) — without this, importing this module would run `main`
 // against whatever process's argv happened to be doing the importing.
-const isMainModule = process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+//
+// `process.argv[1]` is the RAW path used to invoke node — for a bin entry
+// invoked via a symlink (exactly how `npm link` and every real
+// `npm install -g` set up a package's bin — never a plain copy), that's the
+// symlink's own path, unresolved. `import.meta.url`, on the other hand, is
+// resolved by Node's ESM loader THROUGH any symlink to the real underlying
+// file. Comparing the two directly therefore NEVER matches under a symlinked
+// invocation — this shipped broken: `yolo-bridge` on PATH (via `npm link` or
+// a real global install) silently did nothing, exit 0, no output, because
+// `main()` never ran. Only `node dist/cli.js <path-to-the-real-file>` (never
+// how an installed CLI is actually invoked) happened to pass. Fixed by
+// realpath-resolving argv[1] before comparing, so both sides refer to the
+// same underlying file regardless of how many symlinks sit in between.
+function resolveRealpath(p: string | undefined): string | undefined {
+  if (!p) return undefined;
+  try {
+    return realpathSync(p);
+  } catch {
+    return p; // argv[1] should always exist as a real file when actually running; fall back rather than throw
+  }
+}
+const isMainModule = fileURLToPath(import.meta.url) === resolveRealpath(process.argv[1]);
 
 if (isMainModule) {
   main()
