@@ -184,6 +184,49 @@ describe('startLocalAgent / deliverPromptToLocalAgent / captureLocalAgentOutput 
     assert.deepEqual(fake.writes, ['the user typed this\n']);
   });
 
+  it('pauses stdin on stop -- regression guard for a real hang (found 2026-08-23): a resumed stdin that is never paused keeps the process alive forever, no matter what exitCode is set', async () => {
+    // `attach` reported "detaching..." and then never actually exited --
+    // reproduced against a real pty (not a redirected /dev/null stdin,
+    // which reaches EOF on its own and masks this): the process hung until
+    // force-killed on every exit path (attach failure, the agent dying on
+    // its own, Ctrl+C), because teardownStdio removed the 'data' listener
+    // and restored raw mode but never called stdin.pause() -- a resumed
+    // stdin is a standing libuv handle that removing listeners alone does
+    // not release.
+    const fake = fakePty();
+    let paused = false;
+    let resumed = false;
+    const fakeStdin = {
+      on: () => {},
+      removeListener: () => {},
+      resume: () => { resumed = true; },
+      pause: () => { paused = true; },
+    };
+    startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: fakeStdin, spawnImpl: fake.spawnImpl });
+    assert.equal(resumed, true, 'sanity check: stdin was actually resumed on start');
+    assert.equal(paused, false);
+
+    stopLocalAgent();
+
+    assert.equal(paused, true, 'stdin must be paused on stop, or the process never exits on its own');
+  });
+
+  it('also pauses stdin when the PTY process exits on its own (not just on an explicit stopLocalAgent call)', async () => {
+    const fake = fakePty();
+    let paused = false;
+    const fakeStdin = {
+      on: () => {},
+      removeListener: () => {},
+      resume: () => {},
+      pause: () => { paused = true; },
+    };
+    startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: fakeStdin, spawnImpl: fake.spawnImpl });
+
+    fake.emitExit({ exitCode: 0, signal: undefined });
+
+    assert.equal(paused, true);
+  });
+
   it('clears the singleton and invokes onExit when the PTY process exits on its own', async () => {
     const fake = fakePty();
     let exitInfo: { exitCode: number; signal?: number } | undefined;

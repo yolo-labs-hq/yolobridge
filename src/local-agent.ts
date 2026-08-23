@@ -134,6 +134,7 @@ export interface AgentInputSource {
   on(event: 'data', listener: (data: Buffer | string) => void): unknown;
   removeListener?(event: 'data', listener: (data: Buffer | string) => void): unknown;
   resume?(): unknown;
+  pause?(): unknown;
   setEncoding?(encoding: string): unknown;
   isTTY?: boolean;
   setRawMode?(mode: boolean): unknown;
@@ -324,6 +325,23 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
   return { stop: stopLocalAgent };
 }
 
+/**
+ * Real bug (found 2026-08-23 chasing a report that `attach` never fully
+ * exits on its own — "detaching..." prints, then the process just hangs
+ * until force-killed): `startLocalAgent` calls `inStream.resume?.()` to put
+ * `process.stdin` into flowing mode so keystrokes reach the PTY. A resumed
+ * stdin is a standing libuv handle that keeps Node's event loop alive
+ * regardless of `process.exitCode` — removing the `'data'` listener alone
+ * does NOT release it; only an explicit `pause()` does. This was missing
+ * here, so EVERY `attach` exit path (attach failure, the local agent dying
+ * on its own, a server-initiated detach, even a clean Ctrl+C) left stdin
+ * resumed and the process wedged. Reproduced against a real pty (`script
+ * -qec ... `, not a plain redirected stdin — `/dev/null`-as-stdin reaches
+ * EOF on its own and masked this): the process printed its final messages
+ * within ~1s but had to be force-killed at a 10s timeout every time,
+ * exit code 124. With `stdin.pause()` added below, the same repro exits
+ * cleanly on its own well under a second — no timeout/kill needed.
+ */
 function teardownStdio(state: LocalAgentState): void {
   const { stdin, stdinListener } = state;
   if (stdin && stdinListener && typeof stdin.removeListener === 'function') {
@@ -331,6 +349,9 @@ function teardownStdio(state: LocalAgentState): void {
   }
   if (state.rawModeEnabled && stdin?.isTTY && typeof stdin.setRawMode === 'function') {
     stdin.setRawMode(false);
+  }
+  if (stdin && typeof stdin.pause === 'function') {
+    stdin.pause();
   }
 }
 
