@@ -25,7 +25,7 @@ import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runDetach } from './detach-cmd.js';
 import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
-import { runListWorkspaces, formatWorkspacesTable } from './workspaces-cmd.js';
+import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
@@ -38,6 +38,52 @@ function authUrl(): string {
   return process.env.YOLOBRIDGE_AUTH_URL || DEFAULT_AUTH_URL;
 }
 
+// Mongo ObjectId shape: 24 hex chars. A workspace name could theoretically
+// collide with this (unlikely, but possible), in which case the id-shaped
+// value wins — same tradeoff the rest of this codebase's id-or-slug lookups
+// make, and matches user expectation: someone who types a raw id wants that
+// exact workspace, not a name lookup that happens to match the same string.
+const OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
+
+/**
+ * Resolves an `attach` positional argument that may be a raw workspace id OR
+ * a workspace NAME. An id-shaped value is used as-is (no network round trip
+ * — unchanged behavior for every existing caller). Anything else is treated
+ * as a name and resolved via the same `GET .../workspaces/selectable` list
+ * `yolo-bridge workspaces` and the interactive picker already use — a
+ * case-insensitive exact match. Zero or multiple matches is a clear error
+ * (never a silent first-match guess); multiple matches lists the candidate
+ * ids so the caller can disambiguate with the id form instead.
+ */
+export async function resolveWorkspaceIdOrName(
+  value: string,
+  deps: { commonApiBaseUrl: string },
+  // Injectable for tests (same convention as attach-cmd.ts's RefreshTokenFn)
+  // — avoids mocking module-level network calls to exercise the pure
+  // matching/error logic below.
+  listWorkspacesFn: (deps: { commonApiBaseUrl: string }) => Promise<ListWorkspacesResult> = runListWorkspaces,
+): Promise<{ ok: true; workspaceId: string } | { ok: false; message: string }> {
+  if (OBJECT_ID_RE.test(value)) return { ok: true, workspaceId: value };
+
+  const listed = await listWorkspacesFn({ commonApiBaseUrl: deps.commonApiBaseUrl });
+  if (!listed.ok) {
+    return { ok: false, message: listed.message };
+  }
+  const needle = value.toLowerCase();
+  const matches = listed.workspaces.filter((w) => (w.name || '').toLowerCase() === needle);
+  if (matches.length === 0) {
+    return {
+      ok: false,
+      message: `no workspace named "${value}" found (run \`yolo-bridge workspaces\` to see your workspaces)`,
+    };
+  }
+  if (matches.length > 1) {
+    const candidates = matches.map((w) => `${w.id} [${w.status}]`).join(', ');
+    return { ok: false, message: `multiple workspaces are named "${value}" — attach by id instead: ${candidates}` };
+  }
+  return { ok: true, workspaceId: matches[0]!.id };
+}
+
 function printHelp(): void {
   process.stdout.write(
     [
@@ -46,8 +92,11 @@ function printHelp(): void {
       'Commands:',
       '  login                  Device-authorization login against auth-service.',
       '  workspaces             List your own workspaces (id, name, status) that can be attached to.',
-      '  attach [workspaceId]   Attach this machine to a workspace and hold the daemon loop open.',
-      '                         Omit workspaceId to pick interactively from `yolo-bridge workspaces`.',
+      '  attach [workspace]     Attach this machine to a workspace and hold the daemon loop open.',
+      '                         Accepts either a raw workspace id or its NAME (case-insensitive',
+      '                         exact match against `yolo-bridge workspaces`); an ambiguous or',
+      '                         unmatched name errors instead of guessing. Omit it entirely to pick',
+      '                         interactively from `yolo-bridge workspaces`.',
       '    [--label <name>]     Operator-facing host label (reported to the workspace).',
       '    [--agent <binary>]   Local coding-agent binary to spawn (default: $YOLOBRIDGE_AGENT_BIN or "claude").',
       '  detach                 Detach the current workspace attachment.',
@@ -124,6 +173,14 @@ async function cmdAttach(args: string[]): Promise<number> {
   let workspaceId = parsed.workspaceId;
   const hostLabel = parsed.hostLabel;
   const agentBin = parsed.agentBin;
+  if (workspaceId) {
+    const resolved = await resolveWorkspaceIdOrName(workspaceId, { commonApiBaseUrl: apiUrl() });
+    if (!resolved.ok) {
+      process.stderr.write(`yolo-bridge attach: ${resolved.message}\n`);
+      return 64;
+    }
+    workspaceId = resolved.workspaceId;
+  }
   if (!workspaceId) {
     // No positional id — fall back to an interactive picker over the
     // caller's own `GET .../workspaces/selectable` list instead of just
