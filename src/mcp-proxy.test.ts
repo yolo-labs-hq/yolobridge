@@ -11,7 +11,7 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { startMcpProxy, type McpProxyHandle } from './mcp-proxy.js';
+import { startMcpProxy, SECRET_HEADER, type McpProxyHandle } from './mcp-proxy.js';
 
 const ORIGINAL_MCP_URL = process.env.YOLOBRIDGE_MCP_URL;
 const FAKE_UPSTREAM = 'http://fake-upstream.test';
@@ -29,6 +29,14 @@ const ALL_SCOPES = [
 ];
 
 let handle: McpProxyHandle | undefined;
+
+/** Every real loopback call in this file must present the per-attach
+ *  secret (Codex review, 2026-08-24, round 10) or the proxy 401s before
+ *  ever reaching `handleRequest` -- see the "Require authentication..."
+ *  tests below for coverage of THAT gate itself. */
+function authedHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return { [SECRET_HEADER]: handle!.secret, ...extra };
+}
 
 afterEach(async () => {
   if (handle) await handle.stop();
@@ -121,7 +129,7 @@ describe('startMcpProxy', () => {
     // A real loopback call to the local proxy.
     const res = await fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
     });
     assert.equal(res.status, 200);
@@ -147,7 +155,7 @@ describe('startMcpProxy', () => {
     });
     await fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
     });
     assert.equal(forwardedBody._delegatedToken, undefined);
@@ -169,7 +177,7 @@ describe('startMcpProxy', () => {
     });
     await fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles' } }),
     });
     assert.equal(forwardedBody.params.arguments?._delegatedToken, 'tok-1');
@@ -199,7 +207,7 @@ describe('startMcpProxy', () => {
     });
     const res = await fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
     });
     assert.equal(res.status, 200);
@@ -245,7 +253,7 @@ describe('startMcpProxy', () => {
     });
     const res = await fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
     });
     assert.equal(res.status, 200);
@@ -279,7 +287,7 @@ describe('startMcpProxy', () => {
     });
     await fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remove_tile', arguments: {} } }),
     });
     assert.equal(mintCount, 1, 'no force-refresh for a FORBIDDEN error');
@@ -299,7 +307,7 @@ describe('startMcpProxy', () => {
     for (let i = 0; i < 3; i++) {
       await fetch(handle!.url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authedHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
       });
     }
@@ -389,7 +397,7 @@ describe('startMcpProxy', () => {
     // don't await the response yet.
     const callPromise = fetch(handle!.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
     });
     await waitUntil(() => forwardSignal !== undefined);
@@ -403,6 +411,64 @@ describe('startMcpProxy', () => {
     // The client-side fetch settles (with a transport error, since the
     // server tore down mid-request) rather than hanging forever either.
     await callPromise.catch(() => undefined);
+  });
+});
+
+describe('proxy authentication (Codex review, 2026-08-24, round 10)', () => {
+  // Loopback binding keeps this off the local NETWORK but does nothing
+  // against another process on the SAME host -- these tests prove the
+  // listener itself refuses an unauthenticated caller BEFORE any minting or
+  // upstream forwarding happens, not just that a legitimate caller with the
+  // secret still works (already covered above).
+  it('rejects a request with no secret header at all, without minting or forwarding', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({
+      mintToken: () => { mintCount++; return mintResponse('tok-1'); },
+      upstream: () => { forwardCount++; return new Response('{}', { status: 200 }); },
+    });
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const startupMintCount = mintCount;
+
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    assert.equal(res.status, 401);
+    assert.equal(mintCount, startupMintCount, 'no additional mint beyond the one at startup');
+    assert.equal(forwardCount, 0, 'must never reach the upstream without a valid secret');
+  });
+
+  it('rejects a request with the WRONG secret', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const fetchImpl = makeFetch({});
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', [SECRET_HEADER]: `${handle!.secret}-wrong` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it('issues a different secret on each proxy start', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl: makeFetch({}), log: () => {},
+    });
+    const firstSecret = handle!.secret;
+    await handle!.stop();
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl: makeFetch({}), log: () => {},
+    });
+    assert.notEqual(handle!.secret, firstSecret, 'a secret from a prior attach must not authenticate a new one');
   });
 });
 

@@ -42,10 +42,25 @@
  * (an expired token is reported as a normal 200 JSON-RPC tool result, not a
  * 401 — see `isUnauthorizedToolResult`'s doc comment for how this was found
  * and confirmed, not assumed).
+ *
+ * Requires a per-attach secret on every request (Codex review, 2026-08-24,
+ * round 10): binding to `127.0.0.1` only keeps this off the local NETWORK,
+ * but it does nothing against another process on the SAME host — a
+ * different OS user, or a sandboxed process sharing the host's network
+ * namespace, can still reach a loopback port and would otherwise get a
+ * full-workspace-scoped delegated token minted on its behalf with zero
+ * credential of its own. `startMcpProxy` generates a random secret and
+ * hands it back in `McpProxyHandle.secret`; the caller writes it into
+ * `.mcp.json`'s `headers` for this entry (the same field Claude Code's own
+ * http-transport config already supports — `mcp-config-writer.js`'s
+ * pod-side writer documents the identical shape), so only a process that
+ * can READ this project's `.mcp.json` — gated by normal filesystem
+ * permissions, unlike the loopback port itself — can authenticate.
  */
 
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 const DEFAULT_MCP_URL = 'https://services.yolo.studio';
 
@@ -97,8 +112,17 @@ export interface McpProxyOptions {
 export interface McpProxyHandle {
   /** http://127.0.0.1:<port>/mcp — what to put in .mcp.json. */
   url: string;
+  /** Per-attach random credential the caller (`.mcp.json`'s `headers`) must
+   *  present as `SECRET_HEADER` on every request — see this module's header
+   *  comment on why loopback binding alone isn't sufficient. */
+  secret: string;
   stop(): Promise<void>;
 }
+
+/** Header the local agent must echo back with the value from `.mcp.json`'s
+ *  `headers` for this server entry (Codex review, 2026-08-24, round 10).
+ *  Exported so `local-mcp-config.ts` writes the exact same key it checks. */
+export const SECRET_HEADER = 'x-yolobridge-proxy-secret';
 
 interface MintResult {
   token: string;
@@ -254,8 +278,14 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
   }
 
   const upstream = mcpUrl().replace(/\/+$/, '');
+  const secret = randomBytes(32).toString('hex');
 
   const server = http.createServer((req, res) => {
+    if (!hasValidSecret(req, secret)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing or invalid proxy credential' }));
+      return;
+    }
     handleRequest(req, res, upstream, tokenCache.getToken, tokenCache.forceRefresh, fetchImpl, tracker, log).catch((err) => {
       log(`yolo-bridge: local MCP proxy error: ${err instanceof Error ? err.message : String(err)}`);
       if (!res.headersSent) {
@@ -279,6 +309,7 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
 
   return {
     url,
+    secret,
     stop: () =>
       new Promise<void>((resolve) => {
         // Two separate reasons server.close() alone could hang (Codex
@@ -396,6 +427,19 @@ async function forwardOnce(
   const res = await tracker.fetch(fetchImpl, `${upstream}/mcp`, { method, headers, body });
   const text = await res.text();
   return { status: res.status, headers: res.headers, text };
+}
+
+/** Constant-time comparison against the request's `SECRET_HEADER` value —
+ *  missing, wrong-length, or mismatched all fail closed. `timingSafeEqual`
+ *  throws on a length mismatch rather than returning false, so length is
+ *  checked first. */
+function hasValidSecret(req: http.IncomingMessage, secret: string): boolean {
+  const provided = req.headers[SECRET_HEADER];
+  if (typeof provided !== 'string') return false;
+  const providedBuf = Buffer.from(provided, 'utf-8');
+  const secretBuf = Buffer.from(secret, 'utf-8');
+  if (providedBuf.length !== secretBuf.length) return false;
+  return timingSafeEqual(providedBuf, secretBuf);
 }
 
 async function handleRequest(

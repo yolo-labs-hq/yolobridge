@@ -19,6 +19,7 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { SECRET_HEADER } from './mcp-proxy.js';
 
 /** Matches the pod-side writer's own server name (agents.json's
  *  `mcp.servers.yolo-studio` key) — same identity, different transport. */
@@ -166,7 +167,7 @@ export interface McpConfigWriteResult {
  * here would otherwise brick local MCP access on every subsequent attach
  * until the operator manually edited the file.
  */
-export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWriteResult {
+export function writeLocalMcpConfig(cwd: string, proxyUrl: string, secret: string): McpConfigWriteResult {
   const path = mcpJsonPath(cwd);
   const createdFile = !existsSync(path);
   let config: Record<string, unknown>;
@@ -188,13 +189,37 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
   const recordedUrl = readSidecar(cwd).proxyUrl;
   if (SERVER_NAME in servers && !looksLikeOurOwnEntry(servers[SERVER_NAME], recordedUrl)) return { ok: false, createdFile: false };
+
+  // Sidecar written BEFORE the `.mcp.json` entry itself (Codex review,
+  // 2026-08-24, round 10): the original order wrote the entry first, so a
+  // sidecar-write failure (e.g. its path collides with a directory, or
+  // storage fills between the two writes) left a `yolo-studio` entry
+  // already persisted with nothing recording it as ours. The caller never
+  // sees `ok: true` in that case, so it never records `mcpConfigCleanup`
+  // and can't clean the entry up on detach — and no LATER attach could
+  // reclaim it either, since `looksLikeOurOwnEntry` requires a matching
+  // sidecar record that was never written. Permanently stranded. Writing
+  // the sidecar first means a failure here leaves `.mcp.json` completely
+  // untouched — nothing to roll back. The reverse failure (sidecar written,
+  // `.mcp.json` write then fails) is harmless: the next call just
+  // overwrites both with a fresh URL, since no `yolo-studio` entry exists
+  // yet for the stale sidecar record to gate.
+  try {
+    writeSidecar(cwd, proxyUrl);
+  } catch {
+    return { ok: false, createdFile: false };
+  }
   // Plain, spec-shaped entry — no ownership marker inside it (round 9): an
   // unknown field here is exactly what a strict-validating Claude Code
-  // release rejects the whole server entry over.
-  servers[SERVER_NAME] = { type: 'http', url: proxyUrl };
+  // release rejects the whole server entry over. `headers` IS a standard
+  // field for an http-type entry (Claude Code's own docs; this repo's
+  // pod-side writer emits the identical shape,
+  // containers/services/container-api/mcp-config-writer.js:191) carrying the
+  // per-attach secret the proxy requires on every request (Codex review,
+  // 2026-08-24, round 10 — see mcp-proxy.ts's header comment).
+  servers[SERVER_NAME] = { type: 'http', url: proxyUrl, headers: { [SECRET_HEADER]: secret } };
   config.mcpServers = servers;
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
-  writeSidecar(cwd, proxyUrl);
   return { ok: true, createdFile };
 }
 

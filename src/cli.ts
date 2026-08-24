@@ -311,7 +311,7 @@ async function cmdAttach(args: string[]): Promise<number> {
         if (mcpProxyHandle && resolvedAgentId !== 'claude') {
           process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
         } else if (mcpProxyHandle) {
-          const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
+          const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url, mcpProxyHandle.secret);
           if (!configResult.ok) {
             process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is unparseable or already has its own "yolo-studio" entry — leaving local MCP access unconfigured rather than overwrite it.\n`);
           } else {
