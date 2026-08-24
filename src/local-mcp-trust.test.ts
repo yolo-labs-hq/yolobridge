@@ -3,15 +3,38 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import { writeLocalMcpTrust, removeLocalMcpTrust } from './local-mcp-trust.js';
 
+/** Real `git init` in `dir` -- these tests prove the actual `git
+ *  check-ignore` behavior, not a mocked guess at it (Codex review,
+ *  2026-08-24, round 15's own finding was exactly this kind of assumption
+ *  going unverified). No identity config needed; `check-ignore` doesn't
+ *  require one. */
+function initGitRepo(): void {
+  spawnSync('git', ['init', '-q'], { cwd: dir });
+}
+
 let dir: string;
+let xdgConfigDir: string;
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'yolo-bridge-mcp-trust-test-'));
+  // Isolates `git check-ignore` from THIS machine's own global excludes
+  // (found empirically: a real developer machine commonly has
+  // `**/.claude/settings.local.json` in `~/.config/git/ignore`, which would
+  // make every "not ignored" test below silently pass for the wrong
+  // reason). `riskyToCommit` in production code inherits `process.env`
+  // (no explicit `env` override), so this flows straight through to it.
+  xdgConfigDir = mkdtempSync(join(tmpdir(), 'yolo-bridge-xdg-config-test-'));
+  process.env.XDG_CONFIG_HOME = xdgConfigDir;
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(xdgConfigDir, { recursive: true, force: true });
+  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
 });
 
 function settingsPath(): string {
@@ -35,6 +58,32 @@ function sharedSettingsPath(): string {
 }
 
 describe('writeLocalMcpTrust', () => {
+  it('refuses to write when settings.local.json would NOT be git-ignored inside a real repo (Codex review, 2026-08-24, round 15)', () => {
+    // Round 14 assumed settings.local.json is gitignored "by convention" --
+    // disproved by this repo's OWN root, which genuinely tracks that exact
+    // file. Verified with a REAL `git init` + `check-ignore`, not a mock:
+    // with no .gitignore at all, the path is definitively NOT ignored.
+    initGitRepo();
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false });
+    assert.equal(existsSync(settingsPath()), false, 'must not create the file at all when it would be unsafe to commit');
+  });
+
+  it('proceeds normally when settings.local.json IS confirmed git-ignored', () => {
+    initGitRepo();
+    writeFileSync(join(dir, '.gitignore'), '.claude/settings.local.json\n');
+    const result = writeLocalMcpTrust(dir);
+    assert.equal(result.ok, true);
+    assert.ok(existsSync(settingsPath()));
+  });
+
+  it('proceeds normally outside a git repo entirely (no commit risk exists)', () => {
+    // `dir` here is a plain mkdtemp directory, never git-init'd -- this is
+    // also what every OTHER test in this file relies on implicitly.
+    const result = writeLocalMcpTrust(dir);
+    assert.equal(result.ok, true);
+  });
+
   it('targets settings.local.json, never the SHARED settings.json (Codex review, 2026-08-24, round 14)', () => {
     // This ephemeral, per-attach grant must never land in a file meant to
     // be committed and shared across a team -- a spawned YOLO-mode agent

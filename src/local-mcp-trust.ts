@@ -36,8 +36,21 @@
  * the repo inherits, auto-trusting a future `yolo-studio` server
  * definition with no prompt. `settings.local.json` is Claude Code's own
  * sanctioned personal/machine-local settings layer (merged with
- * `settings.json`, conventionally git-ignored) — exactly the "ephemeral,
- * this-machine-only" semantics this grant actually has.
+ * `settings.json`), CONVENTIONALLY git-ignored.
+ *
+ * "Conventionally" is not "guaranteed" (Codex review, 2026-08-24, round 15):
+ * that assumption doesn't hold universally, and disproved itself in the one
+ * place it would matter most — this repo's OWN root ALREADY tracks
+ * `.claude/settings.local.json` (verified with `git ls-files`, not assumed).
+ * Trusting any specific filename's reputation is therefore the wrong check.
+ * `writeLocalMcpTrust` now asks git directly (`git check-ignore`) whether
+ * THIS path, in THIS `cwd`, is actually safe from being swept into a
+ * commit, and refuses to write anything (falling back to `ok: false`,
+ * the same degraded "manual approval required" path an unparseable file
+ * already takes) if it isn't — never writing INTO a tracked-or-trackable
+ * file is the only way to make the "never persisted where Git can see it"
+ * guarantee actually hold, regardless of which filename convention this
+ * particular checkout happens to follow.
  *
  * KNOWN GOTCHA, not fixable from here: project-scoped settings are ignored
  * in an UNTRUSTED folder until the user interactively trusts the workspace
@@ -53,6 +66,7 @@ import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { atomicWriteFileSync } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 /** Same identity as local-mcp-config.ts's SERVER_NAME -- kept as an
  *  independent constant (not imported) since these two modules are meant to
@@ -70,6 +84,22 @@ const TOOL_PATTERN = `mcp__${SERVER_NAME}__*`;
 
 function settingsPath(cwd: string): string {
   return join(cwd, '.claude', 'settings.local.json');
+}
+
+/**
+ * True only when `git check-ignore` DEFINITIVELY confirms `path` is NOT
+ * ignored inside a real git repo at `cwd` (exit code 1) — i.e. a `git add
+ * -A` could actually pick it up (Codex review, 2026-08-24, round 15).
+ * Empirically verified exit codes (not assumed): 0 = ignored (safe), 1 =
+ * not ignored (risky), 128 = `cwd` isn't a git repo at all (safe — nothing
+ * can ever commit it). Any OTHER outcome (git missing, a weird error) is
+ * also treated as safe: this function's only job is to catch a CONFIRMED
+ * risk, not to require positive proof of safety, matching this module's
+ * existing philosophy that MCP pre-trust is a best-effort enhancement.
+ */
+function riskyToCommit(cwd: string, path: string): boolean {
+  const result = spawnSync('git', ['check-ignore', '-q', path], { cwd });
+  return result.status === 1;
 }
 
 function readSettings(path: string): Record<string, unknown> {
@@ -156,7 +186,12 @@ export interface McpTrustWriteResult {
  * Adds the `yolo-studio` MCP-trust entries to `.claude/settings.local.json`.
  * Returns `ok: false` (does nothing further) if an existing settings file
  * can't be parsed, rather than overwriting a file the user hand-authored --
- * matches `writeLocalMcpConfig`'s own refusal behavior exactly.
+ * matches `writeLocalMcpConfig`'s own refusal behavior exactly. Also
+ * returns `ok: false` if `riskyToCommit` confirms this exact path is NOT
+ * git-ignored inside a real repo at `cwd` (Codex review, 2026-08-24,
+ * round 15) -- degrading to "every tool call needs manual approval" is
+ * strictly preferable to writing an auto-trust grant somewhere a commit
+ * could publish it.
  *
  * Tracks which entries it ACTUALLY inserted vs. which were already present
  * (Codex review, 2026-08-24): if the operator had already trusted this
@@ -168,6 +203,9 @@ export interface McpTrustWriteResult {
  */
 export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   const path = settingsPath(cwd);
+  if (riskyToCommit(cwd, path)) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
+  }
   const createdFile = !existsSync(path);
   let settings: Record<string, unknown>;
   try {

@@ -335,7 +335,7 @@ async function cmdAttach(args: string[]): Promise<number> {
             // approval prompts, so it's logged rather than fatal.
             const trustResult = writeLocalMcpTrust(spawnCwd);
             if (!trustResult.ok) {
-              process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.claude/settings.json is not valid JSON — MCP tool calls will need manual approval.\n`);
+              process.stdout.write(`yolo-bridge: could not pre-trust the local MCP server (${spawnCwd}/.claude/settings.local.json is unparseable, or would not be safe from a future commit) — MCP tool calls will need manual approval.\n`);
             } else {
               // Only remove on cleanup what THIS attach actually inserted —
               // an entry the operator already had (added_*Entry: false)
