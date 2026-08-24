@@ -247,12 +247,11 @@ async function cmdAttach(args: string[]): Promise<number> {
     // skipped, not fatal — MCP access is an enhancement on a tile that
     // already works without it (send_to_tile/read_tile_output are
     // unaffected either way).
-    onAttached: async ({ tileId, accessToken }) => {
+    onAttached: async ({ accessToken }) => {
       mcpProxyHandle = await startMcpProxy({
         apiUrl: apiUrl(),
         accessToken,
         workspaceId,
-        tileId,
         agentId: agentBin ?? DEFAULT_AGENT_BIN,
         log: (line) => process.stdout.write(`${line}\n`),
       });
