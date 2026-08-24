@@ -20,6 +20,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
+import { atomicWriteFileSync } from './atomic-write.js';
 
 /** The literal string written into `.mcp.json`'s `headers` value — a
  *  template, not the secret itself (Codex review, 2026-08-24, round 12).
@@ -193,14 +194,26 @@ const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
  * despite this module's own stated "only ever touch exactly what we wrote"
  * guarantee. Now compares the secret header too, so ANY edit to the parts of
  * the entry this module actually controls breaks the match.
+ *
+ * Round 13: comparing individual field VALUES still missed an ADDITION —
+ * an operator (or another config tool) augmenting the entry with an extra
+ * header or another standard transport field, while leaving `type`/`url`/
+ * the secret header exactly as this module wrote them, still matched every
+ * check above. A later attach would then silently drop that addition on
+ * reclaim, and detach would delete the whole (augmented) entry. Now
+ * requires the entry's own key set, AND its `headers`' key set, to be
+ * EXACTLY what this module ever writes — nothing more, nothing less.
  */
 function looksLikeOurOwnEntry(value: unknown, recorded: SidecarState): boolean {
   if (!recorded.proxyUrl || !OWN_ENTRY_URL_PATTERN.test(recorded.proxyUrl)) return false;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
+  if (Object.keys(v).sort().join(',') !== 'headers,type,url') return false;
   if (v.type !== 'http' || v.url !== recorded.proxyUrl) return false;
   const headers = v.headers;
   if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return false;
+  const headerKeys = Object.keys(headers as Record<string, unknown>);
+  if (headerKeys.length !== 1 || headerKeys[0] !== SECRET_HEADER) return false;
   return (headers as Record<string, unknown>)[SECRET_HEADER] === SECRET_HEADER_TEMPLATE;
 }
 
@@ -284,7 +297,13 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   servers[SERVER_NAME] = { type: 'http', url: proxyUrl, headers: { [SECRET_HEADER]: SECRET_HEADER_TEMPLATE } };
   config.mcpServers = servers;
   try {
-    writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+    // Atomic (temp file + rename), not a direct overwrite (Codex review,
+    // 2026-08-24, round 13): a direct `writeFileSync` on an EXISTING file
+    // truncates it before writing the new bytes, so ENOSPC or a crash
+    // mid-write can leave the OPERATOR's file half-written — unrecoverable,
+    // unlike every other failure mode this function already refuses to
+    // touch the file for.
+    atomicWriteFileSync(path, JSON.stringify(config, null, 2) + '\n');
   } catch {
     // The sidecar-write-first ordering above is only harmless in the "no
     // prior entry existed" case (round 10's own reasoning). When RECLAIMING
@@ -371,6 +390,10 @@ export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, crea
   }
 
   config.mcpServers = servers;
-  writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  // Atomic (temp file + rename) — see the doc comment on the equivalent
+  // write in `writeLocalMcpConfig` (Codex review, 2026-08-24, round 13): a
+  // direct overwrite could leave the operator's other, unrelated content
+  // in this file half-written on an ENOSPC or crash.
+  atomicWriteFileSync(path, JSON.stringify(config, null, 2) + '\n');
   if (recordedSidecar.proxyUrl === expectedProxyUrl) deleteSidecar(cwd);
 }

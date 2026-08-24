@@ -35,8 +35,9 @@
  * trust prompt before this takes effect.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { atomicWriteFileSync } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
 
 /** Same identity as local-mcp-config.ts's SERVER_NAME -- kept as an
@@ -200,7 +201,13 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   settings[OWNERSHIP_MARKER] = { attachId, enabledServerEntry: addedServerEntry, permissionEntry: addedPermissionEntry } satisfies OwnershipMarker;
 
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  // Atomic (temp file + rename), not a direct overwrite (Codex review,
+  // 2026-08-24, round 13): a direct `writeFileSync` on an EXISTING
+  // `.claude/settings.json` truncates it before writing the new bytes, so
+  // ENOSPC or a crash mid-write can leave the OPERATOR's settings
+  // half-written — unrecoverable, and settings.json can carry far more than
+  // just this module's own keys.
+  atomicWriteFileSync(path, JSON.stringify(settings, null, 2) + '\n');
   return { ok: true, addedServerEntry, addedPermissionEntry, createdFile, attachId };
 }
 
@@ -274,5 +281,7 @@ export function removeLocalMcpTrust(
     unlinkSync(path);
     return;
   }
-  writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  // Atomic — see the doc comment on the equivalent write in
+  // `writeLocalMcpTrust` (Codex review, 2026-08-24, round 13).
+  atomicWriteFileSync(path, JSON.stringify(settings, null, 2) + '\n');
 }

@@ -211,10 +211,14 @@ describe('writeLocalMcpConfig', () => {
     // failing the .mcp.json write would strand that valid record too,
     // permanently misclassifying the (unchanged) on-disk entry as foreign
     // on every later attach. Forces the failure with a chmod'd-read-only
-    // .mcp.json (real fs permission enforcement, not a mock).
+    // DIRECTORY (real fs permission enforcement, not a mock) -- round 13's
+    // atomic-write fix means a read-only .mcp.json itself no longer blocks
+    // the write (a fresh temp file is created alongside it, unaffected by
+    // the target's own permissions; only the rename touches the original
+    // path). A non-writable directory blocks creating that temp file at all.
     writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
     const beforeEntry = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    chmodSync(mcpJsonPath(), 0o444);
+    chmodSync(dir, 0o555);
     try {
       const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
       assert.equal(result.ok, false);
@@ -224,10 +228,10 @@ describe('writeLocalMcpConfig', () => {
         'sidecar must be rolled back to what it recorded before this failed call',
       );
     } finally {
-      chmodSync(mcpJsonPath(), 0o644); // restore writability so afterEach's rmSync can clean up
+      chmodSync(dir, 0o755); // restore writability so afterEach's rmSync can clean up
     }
     const afterEntry = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.deepEqual(afterEntry, beforeEntry, '.mcp.json itself was never actually written, since writeFileSync failed');
+    assert.deepEqual(afterEntry, beforeEntry, '.mcp.json itself was never actually written, since the temp-file write failed');
   });
 
   it('does NOT reclaim an entry whose secret header was tampered with, even though type/url still match the sidecar (Codex review, 2026-08-24, round 11)', () => {
@@ -244,6 +248,34 @@ describe('writeLocalMcpConfig', () => {
     assert.deepEqual(result, { ok: false, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.equal(parsed.mcpServers['yolo-studio'].headers['x-yolobridge-proxy-secret'], 'tampered', 'the tampered entry must be left exactly as it was');
+  });
+
+  it('does NOT reclaim an entry with an EXTRA header added, even though type/url/secret-header still match exactly (Codex review, 2026-08-24, round 13)', () => {
+    // Comparing individual field VALUES (rounds 9-11) missed an ADDITION --
+    // an operator augmenting the entry with an extra header while leaving
+    // type/url/the secret header untouched still passed every check. A
+    // later attach would then silently drop that addition on reclaim.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'].headers['x-my-own-header'] = 'kept-by-the-operator';
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].headers['x-my-own-header'], 'kept-by-the-operator', "the operator's addition must be left exactly as it was");
+  });
+
+  it('does NOT reclaim an entry with an EXTRA top-level field added (Codex review, 2026-08-24, round 13)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'].timeout = 5000;
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].timeout, 5000, "the operator's addition must be left exactly as it was");
   });
 });
 
@@ -365,5 +397,16 @@ describe('removeLocalMcpConfig', () => {
     removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.ok(parsed.mcpServers['yolo-studio'], 'the tampered entry must survive, not be deleted');
+  });
+
+  it('does NOT delete an entry with an EXTRA header added, even though type/url/secret-header still match exactly (Codex review, 2026-08-24, round 13)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'].headers['x-my-own-header'] = 'kept-by-the-operator';
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.ok(parsed.mcpServers['yolo-studio'], "the operator's addition must survive, not be deleted");
   });
 });
