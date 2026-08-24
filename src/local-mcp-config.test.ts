@@ -188,6 +188,28 @@ describe('writeLocalMcpConfig', () => {
     assert.equal(statSync(sidecarPath()).mode & 0o777, 0o600);
   });
 
+  it('does NOT corrupt an existing valid sidecar record when a later sidecar write fails during a RECLAIM (Codex review, 2026-08-24, round 14)', () => {
+    // A plain (non-atomic) writeFileSync on an EXISTING sidecar opens with
+    // O_TRUNC, emptying the file BEFORE writing a single new byte -- an
+    // ENOSPC or crash right there would leave a truncated/corrupt sidecar,
+    // which readSidecar treats as absent. During a reclaim, that "absent"
+    // read then permanently misclassifies the UNCHANGED (still genuinely
+    // ours) .mcp.json entry as foreign on every later attach. Forces the
+    // failure with a read-only directory, which blocks creating the atomic
+    // write's temp file, proving the sidecar write is atomic (leaves the
+    // ORIGINAL content intact) rather than a direct truncate-and-write.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    const beforeSidecar = readFileSync(sidecarPath(), 'utf-8');
+    chmodSync(dir, 0o555);
+    try {
+      const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+      assert.equal(result.ok, false);
+    } finally {
+      chmodSync(dir, 0o755);
+    }
+    assert.equal(readFileSync(sidecarPath(), 'utf-8'), beforeSidecar, 'the sidecar must be byte-for-byte unchanged, not truncated');
+  });
+
   it("writes the secret header as a '\\${VAR}' TEMPLATE, never the raw secret, since .mcp.json is often a git-tracked file (Codex review, 2026-08-24, round 12)", () => {
     // Round 10/11 wrote the actual per-attach random secret straight into
     // the entry -- safe against another local OS user reading the file

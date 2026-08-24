@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 function settingsPath(): string {
-  return join(dir, '.claude', 'settings.json');
+  return join(dir, '.claude', 'settings.local.json');
 }
 
 /** Threads a writeLocalMcpTrust result straight into removeLocalMcpTrust's
@@ -30,8 +30,25 @@ function removeAllFrom(result: { addedServerEntry: boolean; addedPermissionEntry
   };
 }
 
+function sharedSettingsPath(): string {
+  return join(dir, '.claude', 'settings.json');
+}
+
 describe('writeLocalMcpTrust', () => {
-  it('creates .claude/settings.json from scratch with both approval layers, marked as ours with a fresh attachId', () => {
+  it('targets settings.local.json, never the SHARED settings.json (Codex review, 2026-08-24, round 14)', () => {
+    // This ephemeral, per-attach grant must never land in a file meant to
+    // be committed and shared across a team -- a spawned YOLO-mode agent
+    // could commit/push it, and a SIGKILL/reboot before cleanup would leave
+    // it in every other checkout of the repo. `settings.local.json` is
+    // Claude Code's own sanctioned personal/machine-local layer.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(sharedSettingsPath(), JSON.stringify({ someExistingOperatorSetting: true }));
+    writeLocalMcpTrust(dir);
+    assert.deepEqual(JSON.parse(readFileSync(sharedSettingsPath(), 'utf-8')), { someExistingOperatorSetting: true });
+    assert.ok(existsSync(settingsPath()), 'the grant must land in settings.local.json instead');
+  });
+
+  it('creates .claude/settings.local.json from scratch with both approval layers, marked as ours with a fresh attachId', () => {
     const result = writeLocalMcpTrust(dir);
     assert.equal(result.ok, true);
     assert.equal(result.addedServerEntry, true);

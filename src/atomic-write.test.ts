@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -81,5 +81,29 @@ describe('atomicWriteFileSync', () => {
     assert.equal(readFileSync(pathB, 'utf-8'), '{"b":2}');
     assert.equal(existsSync(pathA), true);
     assert.equal(existsSync(pathB), true);
+  });
+
+  it("preserves the destination's existing permissions across the replacement (Codex review, 2026-08-24, round 14)", () => {
+    // A brand-new temp file gets the process's default umask; renameSync
+    // replaces the destination's inode entirely, so without explicitly
+    // carrying the ORIGINAL mode over, a file deliberately tightened to
+    // 0600 (e.g. local-mcp-config.ts's .mcp.json) would silently widen back
+    // to the umask default on every subsequent atomic write.
+    const path = join(dir, 'tightened.json');
+    writeFileSync(path, '{"old":true}');
+    chmodSync(path, 0o600);
+    atomicWriteFileSync(path, '{"new":true}');
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(readFileSync(path, 'utf-8'), '{"new":true}');
+  });
+
+  it('gives a brand-new file the normal default mode, not something artificially restrictive', () => {
+    const path = join(dir, 'fresh.json');
+    atomicWriteFileSync(path, '{}');
+    // No prior file to preserve permissions from -- behaves like any other
+    // freshly-created file (subject to the process umask), matching a plain
+    // writeFileSync's own create-time behavior.
+    const mode = statSync(path).mode & 0o777;
+    assert.notEqual(mode, 0, 'sanity check: a real mode was set');
   });
 });

@@ -165,15 +165,26 @@ class TokenUnavailableError extends Error {}
  * there would hang the whole detach. `abortAll()` is also how the startup
  * mint's own timeout (`STARTUP_MINT_TIMEOUT_MS`) is enforced — same
  * mechanism, just triggered by a timer instead of shutdown.
+ *
+ * `run()` keeps the controller registered for the caller's ENTIRE callback,
+ * not just until `fetch()` itself resolves (Codex review, 2026-08-24,
+ * round 14): `fetch()` resolves as soon as response HEADERS arrive, well
+ * before the body is read. The original design removed the controller in a
+ * `finally` right after that — if the upstream then stalled mid-BODY (e.g.
+ * `res.json()`/`res.text()` never resolves), neither the startup mint
+ * timeout nor `stop()` had a live controller left to abort, since it was
+ * already untracked. Every caller must do its ENTIRE fetch-and-consume
+ * inside the callback so the controller stays registered until the body is
+ * fully read (or the whole thing is aborted).
  */
 class RequestTracker {
   private readonly controllers = new Set<AbortController>();
 
-  async fetch(fetchImpl: FetchImpl, url: string, init?: RequestInit): Promise<Response> {
+  async run<T>(body: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     this.controllers.add(controller);
     try {
-      return await fetchImpl(url, { ...init, signal: controller.signal });
+      return await body(controller.signal);
     } finally {
       this.controllers.delete(controller);
     }
@@ -190,13 +201,15 @@ class RequestTracker {
  *  subset (the mint route itself narrows to what `agentId` is actually
  *  allowed). */
 async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl, tracker: RequestTracker): Promise<string[]> {
-  const res = await tracker.fetch(fetchImpl, `${apiUrl.replace(/\/+$/, '')}/v1/mcp/scopes`);
-  if (!res.ok) throw new TokenUnavailableError(`scope discovery failed: HTTP ${res.status}`);
-  const body = (await res.json()) as any;
-  if (!Array.isArray(body?.scopes) || body.scopes.length === 0) {
-    throw new TokenUnavailableError('scope discovery returned an unexpected shape');
-  }
-  return body.scopes as string[];
+  return tracker.run(async (signal) => {
+    const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/scopes`, { signal });
+    if (!res.ok) throw new TokenUnavailableError(`scope discovery failed: HTTP ${res.status}`);
+    const body = (await res.json()) as any;
+    if (!Array.isArray(body?.scopes) || body.scopes.length === 0) {
+      throw new TokenUnavailableError('scope discovery returned an unexpected shape');
+    }
+    return body.scopes as string[];
+  });
 }
 
 /** One cached, self-refreshing, workspace-wide token — scoped to whatever
@@ -214,31 +227,34 @@ function makeTokenCache(
 
   async function mint(): Promise<MintResult> {
     const scopes = await fetchAllScopes(apiUrl, fetchImpl, tracker);
-    const res = await tracker.fetch(fetchImpl, `${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${getAccessToken()}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        workspaceId,
-        agentId,
-        scopes,
-        ttlSeconds: REQUESTED_TTL_SECONDS,
-      }),
-    });
-    if (!res.ok) {
-      let message = `HTTP ${res.status}`;
-      try {
-        const body = (await res.json()) as any;
-        if (typeof body?.error === 'string') message = body.error;
-      } catch {
-        /* keep the HTTP-status fallback */
+    return tracker.run(async (signal) => {
+      const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${getAccessToken()}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId,
+          agentId,
+          scopes,
+          ttlSeconds: REQUESTED_TTL_SECONDS,
+        }),
+        signal,
+      });
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`;
+        try {
+          const body = (await res.json()) as any;
+          if (typeof body?.error === 'string') message = body.error;
+        } catch {
+          /* keep the HTTP-status fallback */
+        }
+        throw new TokenUnavailableError(`mint failed: ${message}`);
       }
-      throw new TokenUnavailableError(`mint failed: ${message}`);
-    }
-    const body = (await res.json()) as any;
-    if (typeof body?.token !== 'string' || typeof body?.expiresAt !== 'string') {
-      throw new TokenUnavailableError('mint returned an unexpected shape');
-    }
-    return { token: body.token, expiresAtMs: new Date(body.expiresAt).getTime() };
+      const body = (await res.json()) as any;
+      if (typeof body?.token !== 'string' || typeof body?.expiresAt !== 'string') {
+        throw new TokenUnavailableError('mint returned an unexpected shape');
+      }
+      return { token: body.token, expiresAtMs: new Date(body.expiresAt).getTime() };
+    });
   }
 
   // Coalesces concurrent mints into ONE in-flight request (Codex review,
@@ -449,9 +465,11 @@ async function forwardOnce(
   fetchImpl: FetchImpl,
   tracker: RequestTracker,
 ): Promise<{ status: number; headers: Headers; text: string }> {
-  const res = await tracker.fetch(fetchImpl, `${upstream}/mcp`, { method, headers, body });
-  const text = await res.text();
-  return { status: res.status, headers: res.headers, text };
+  return tracker.run(async (signal) => {
+    const res = await fetchImpl(`${upstream}/mcp`, { method, headers, body, signal });
+    const text = await res.text();
+    return { status: res.status, headers: res.headers, text };
+  });
 }
 
 /** Constant-time comparison against the request's `SECRET_HEADER` value —

@@ -1,7 +1,8 @@
 /**
  * Pre-trusts the `yolo-studio` MCP server `local-mcp-config.ts` writes into
- * `.mcp.json`, by writing a companion project-scoped `.claude/settings.json`
- * entry in the same `yolo-bridge attach` spawn `cwd`.
+ * `.mcp.json`, by writing a companion project-scoped
+ * `.claude/settings.local.json` entry in the same `yolo-bridge attach`
+ * spawn `cwd`.
  *
  * Without this, Claude Code shows "New MCP server found in this project:
  * yolo-studio" and every one of its tool calls requires manual approval --
@@ -21,9 +22,22 @@
  * `permissions.allow: ["mcp__yolo-studio__*"]` -- never
  * `enableAllProjectMcpServers` (would trust future/unrelated MCP servers
  * too) and never `--dangerously-skip-permissions`-equivalent blanket rules.
- * Every other key in an existing `.claude/settings.json` (the user's own
- * permissions, hooks, etc.) is preserved untouched, same "only touch what we
- * own" discipline as the `.mcp.json` writer.
+ * Every other key in an existing settings file (the user's own permissions,
+ * hooks, etc.) is preserved untouched, same "only touch what we own"
+ * discipline as the `.mcp.json` writer.
+ *
+ * Targets `settings.local.json`, NOT the shared `settings.json` (Codex
+ * review, 2026-08-24, round 14 — this repo's OWN root already has a
+ * tracked `.claude/settings.json`): the shared file is meant to be
+ * committed and shared across a team, but this grant is per-attach,
+ * ephemeral daemon state — if written there, a spawned coding agent
+ * running with YOLO-mode autonomy could commit/push it, and a SIGKILL or
+ * reboot before cleanup would leave it in a file every OTHER checkout of
+ * the repo inherits, auto-trusting a future `yolo-studio` server
+ * definition with no prompt. `settings.local.json` is Claude Code's own
+ * sanctioned personal/machine-local settings layer (merged with
+ * `settings.json`, conventionally git-ignored) — exactly the "ephemeral,
+ * this-machine-only" semantics this grant actually has.
  *
  * KNOWN GOTCHA, not fixable from here: project-scoped settings are ignored
  * in an UNTRUSTED folder until the user interactively trusts the workspace
@@ -55,7 +69,7 @@ const SERVER_NAME = 'yolo-studio';
 const TOOL_PATTERN = `mcp__${SERVER_NAME}__*`;
 
 function settingsPath(cwd: string): string {
-  return join(cwd, '.claude', 'settings.json');
+  return join(cwd, '.claude', 'settings.local.json');
 }
 
 function readSettings(path: string): Record<string, unknown> {
@@ -126,7 +140,7 @@ export interface McpTrustWriteResult {
   /** True only if `TOOL_PATTERN` was NOT already in `permissions.allow`
    *  before this call. */
   addedPermissionEntry: boolean;
-  /** True only if `.claude/settings.json` did NOT already exist on disk
+  /** True only if `.claude/settings.local.json` did NOT already exist on disk
    *  before this call (Codex review, 2026-08-24, round 6) -- needed at
    *  cleanup time: a pre-existing file that happened to already be `{}`
    *  looks identical, once our entries are removed, to one this module
@@ -139,7 +153,7 @@ export interface McpTrustWriteResult {
 }
 
 /**
- * Adds the `yolo-studio` MCP-trust entries to `.claude/settings.json`.
+ * Adds the `yolo-studio` MCP-trust entries to `.claude/settings.local.json`.
  * Returns `ok: false` (does nothing further) if an existing settings file
  * can't be parsed, rather than overwriting a file the user hand-authored --
  * matches `writeLocalMcpConfig`'s own refusal behavior exactly.
@@ -203,9 +217,9 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   mkdirSync(dirname(path), { recursive: true });
   // Atomic (temp file + rename), not a direct overwrite (Codex review,
   // 2026-08-24, round 13): a direct `writeFileSync` on an EXISTING
-  // `.claude/settings.json` truncates it before writing the new bytes, so
+  // `.claude/settings.local.json` truncates it before writing the new bytes, so
   // ENOSPC or a crash mid-write can leave the OPERATOR's settings
-  // half-written — unrecoverable, and settings.json can carry far more than
+  // half-written — unrecoverable, and settings.local.json can carry far more than
   // just this module's own keys.
   atomicWriteFileSync(path, JSON.stringify(settings, null, 2) + '\n');
   return { ok: true, addedServerEntry, addedPermissionEntry, createdFile, attachId };
@@ -216,7 +230,7 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
  * (`removeServerEntry`/`removePermissionEntry`, from `writeLocalMcpTrust`'s
  * own return) -- never touches any other server name, allow/deny rule,
  * hook, other top-level key, or an entry the operator had already granted
- * before this attach. Deletes `.claude/settings.json` only if `createdFile`
+ * before this attach. Deletes `.claude/settings.local.json` only if `createdFile`
  * (also from `writeLocalMcpTrust`'s return) says THIS attachment is the one
  * that created it AND nothing else was ever added to it -- Codex review,
  * 2026-08-24, round 6: emptiness alone isn't proof of that (a pre-existing

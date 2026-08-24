@@ -369,6 +369,42 @@ describe('startMcpProxy', () => {
     assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
   });
 
+  it('a startup mint whose HEADERS arrive but whose BODY stalls is also aborted by mintTimeoutMs (Codex review, 2026-08-24, round 14)', async () => {
+    // `fetch()` resolves as soon as response headers arrive, well before the
+    // body is read. The original RequestTracker removed the controller from
+    // its tracked set in a `finally` right after `fetch()` itself resolved --
+    // if the upstream then stalled mid-BODY (this test's `json()` never
+    // settles on its own), the controller was ALREADY untracked by the time
+    // `abortAll()` ran at the timeout, so it had nothing left to abort and
+    // `mint()`'s pending `res.json()` call hung forever. This test's `json()`
+    // only ever settles via the abort signal, so it directly proves the
+    // controller stays live through body consumption, not just headers.
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) {
+        return {
+          ok: true,
+          status: 201,
+          json: () => new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    const logs: string[] = [];
+    const start = Date.now();
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude',
+      fetchImpl, mintTimeoutMs: 20, log: (l) => logs.push(l),
+    });
+    assert.equal(handle, undefined);
+    assert.ok(Date.now() - start < 2000, 'must resolve promptly via the short mintTimeoutMs, not hang on a stalled body');
+    assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
+  });
+
   it('stop() aborts an in-flight forwarded request instead of waiting for it to finish (Codex review, 2026-08-24)', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     let forwardSignal: AbortSignal | undefined;
@@ -410,6 +446,52 @@ describe('startMcpProxy', () => {
 
     // The client-side fetch settles (with a transport error, since the
     // server tore down mid-request) rather than hanging forever either.
+    await callPromise.catch(() => undefined);
+  });
+
+  it('stop() aborts a forwarded request whose HEADERS already arrived but whose BODY is still stalled (Codex review, 2026-08-24, round 14)', async () => {
+    // Distinct from the test above: there, the forward fetch() call ITSELF
+    // never resolves. Here it resolves immediately (headers "arrived") and
+    // only the body read (`res.text()`) stalls -- exactly the gap the
+    // original RequestTracker missed, since it released the controller as
+    // soon as fetch() resolved, before forwardOnce ever got to `res.text()`.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardSignal: AbortSignal | undefined;
+    const hangingBodyFetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) return mintResponse('tok-1');
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwardSignal = init?.signal;
+        return {
+          status: 200,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          text: () => new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl: hangingBodyFetchImpl, log: () => {},
+    });
+    assert.ok(handle);
+
+    const callPromise = fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    await waitUntil(() => forwardSignal !== undefined);
+    assert.equal(forwardSignal!.aborted, false, 'sanity check: not aborted yet');
+
+    const stopStart = Date.now();
+    await withTimeout(handle!.stop(), 2000, 'stop() while a forward request body-read is stalled');
+    assert.ok(Date.now() - stopStart < 2000, 'stop() must not wait out the hanging body read');
+    assert.equal(forwardSignal!.aborted, true, 'stop() must abort the request even though headers already arrived');
+
     await callPromise.catch(() => undefined);
   });
 });

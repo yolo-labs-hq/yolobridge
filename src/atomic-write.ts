@@ -16,14 +16,34 @@
  * processes writing into the SAME project directory concurrently (a
  * scenario this codebase already guards against elsewhere — concurrent
  * sibling attach) never collide on the same temp path.
+ *
+ * Preserves the DESTINATION's existing permissions across the replacement
+ * (Codex review, 2026-08-24, round 14): a brand-new temp file is created
+ * with the process's default umask, and `renameSync` replaces the
+ * destination's inode entirely — it does not carry over the ORIGINAL
+ * file's mode. Without this, overwriting an EXISTING file that had been
+ * deliberately tightened (`.mcp.json`'s 0600 from round 11) would silently
+ * widen it back to whatever the umask gives (commonly 0644/0664) on every
+ * subsequent write, quietly undoing that fix through this one. When `path`
+ * doesn't exist yet, there is no permission to preserve — the new file
+ * gets the process's normal default, same as any other file creation (a
+ * caller that wants a specific mode on first create, like `.mcp.json`'s
+ * 0600, chmods explicitly afterward, same as before this change).
  */
-import { writeFileSync, renameSync, unlinkSync, existsSync } from 'node:fs';
+import { writeFileSync, renameSync, unlinkSync, existsSync, statSync, chmodSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
 export function atomicWriteFileSync(path: string, content: string): void {
   const tmpPath = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
     writeFileSync(tmpPath, content, 'utf-8');
+    let existingMode: number | undefined;
+    try {
+      existingMode = statSync(path).mode & 0o777;
+    } catch {
+      // `path` doesn't exist yet — nothing to preserve.
+    }
+    if (existingMode !== undefined) chmodSync(tmpPath, existingMode);
     renameSync(tmpPath, path);
   } catch (err) {
     // Best-effort: don't leave a stray temp file behind on failure.

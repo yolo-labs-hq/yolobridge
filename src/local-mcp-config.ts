@@ -17,7 +17,7 @@
  * key in the file is left untouched.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
 import { atomicWriteFileSync } from './atomic-write.js';
@@ -119,7 +119,16 @@ function readSidecar(cwd: string): SidecarState {
 
 function writeSidecar(cwd: string, state: Required<SidecarState>): void {
   const path = sidecarPath(cwd);
-  writeFileSync(path, JSON.stringify(state, null, 2) + '\n', 'utf-8');
+  // Atomic, not a direct overwrite (Codex review, 2026-08-24, round 14): a
+  // plain `writeFileSync` on an EXISTING sidecar opens with O_TRUNC, which
+  // empties the file BEFORE writing a single new byte — an ENOSPC or crash
+  // right there leaves a truncated/corrupt sidecar, which `readSidecar`
+  // treats as absent. During a RECLAIM, that "absent" read then means the
+  // (unchanged, still genuinely ours) `.mcp.json` entry is permanently
+  // misclassified as foreign on every later attach — the exact class of
+  // bug round 10/11 fixed for the `.mcp.json` entry itself, just one file
+  // over from where this module was already guarding against it.
+  atomicWriteFileSync(path, JSON.stringify(state, null, 2) + '\n');
   // Best-effort permission tightening (Codex review, 2026-08-24, round 12):
   // round 11 chmod'd `.mcp.json` but missed this sidecar, which is exactly
   // as readable-by-any-local-account under a typical umask. It no longer
