@@ -220,6 +220,23 @@ function acquireConfigLock(cwd: string): (() => void) | null {
         continue;
       }
       if (Number.isInteger(holderPid) && !isPidAlive(holderPid)) {
+        // Re-verify the lock still holds the SAME stale pid immediately
+        // before deleting it (Codex review, 2026-08-24, round 22): two
+        // processes can both observe this identical stale holderPid. Without
+        // this re-check, whichever one loses the race to unlink+recreate
+        // first would have its unconditional `unlinkSync` delete the
+        // OTHER's brand-new, LIVE lock instead of the stale one it
+        // originally saw — recreating the exact two-writer race this lock
+        // exists to prevent. A mismatch here means someone else already
+        // reclaimed it; skip deleting and loop back to re-evaluate from
+        // scratch rather than touching a lock that isn't stale anymore.
+        let stillStale: string | undefined;
+        try {
+          stillStale = readFileSync(path, 'utf-8');
+        } catch {
+          continue; // Already gone — someone else's reclaim or release; retry.
+        }
+        if (stillStale !== String(holderPid)) continue;
         try {
           unlinkSync(path);
         } catch {

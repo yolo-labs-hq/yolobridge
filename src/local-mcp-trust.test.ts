@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -370,5 +370,35 @@ describe('removeLocalMcpTrust', () => {
 
     const after = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(after, currentOnDisk, "attach A must not delete attach B's still-live grants");
+  });
+
+  it('does NOT touch the file when enabledMcpjsonServers/permissions/permissions.allow were hand-edited to a NON-ARRAY value entirely (Codex review, 2026-08-24, round 22)', () => {
+    // Round 19's content check only catches a WRONG-SHAPE ARRAY (a
+    // non-string element) -- it never fires when the value isn't an array
+    // AT ALL. Without the shape check this test proves, asStringArray would
+    // silently coerce each of these to `[]`, and this function would then
+    // `delete` the operator's field entirely -- the exact "cleanup destroys
+    // something it doesn't provably still own" failure this module exists
+    // to prevent.
+    for (const corrupt of [
+      { enabledMcpjsonServers: 'not-an-array' },
+      { permissions: 'not-an-object' },
+      { permissions: { allow: 'not-an-array' } },
+    ]) {
+      mkdirSync(join(dir, '.claude'), { recursive: true });
+      const result = writeLocalMcpTrust(dir);
+      const onDisk = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
+      const corrupted = { ...onDisk, ...corrupt };
+      writeFileSync(settingsPath(), JSON.stringify(corrupted));
+
+      removeLocalMcpTrust(dir, removeAllFrom(result));
+
+      assert.deepEqual(
+        JSON.parse(readFileSync(settingsPath(), 'utf-8')),
+        corrupted,
+        `expected the file untouched for: ${JSON.stringify(corrupt)}`,
+      );
+      unlinkSync(settingsPath());
+    }
   });
 });

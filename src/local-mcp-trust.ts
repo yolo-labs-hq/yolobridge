@@ -309,6 +309,21 @@ export function removeLocalMcpTrust(
   // reformatting rewrite of otherwise-unchanged content.
   if (!stillOurs) return;
 
+  // Present-but-invalid is refused, same as the write path (Codex review,
+  // 2026-08-24, round 22): the content checks below only catch a
+  // WRONG-SHAPE ARRAY (a non-string element) -- they never fire when the
+  // value isn't an array AT ALL (hand-edited to a string/number, or
+  // `permissions` itself replaced with a non-object). `asStringArray`
+  // silently coerces any non-array to `[]`, so `enabled.length > 0` would
+  // be false below and this function would `delete` the operator's field
+  // entirely -- exactly the "cleanup destroys something it doesn't
+  // provably still own" failure this function's own doc comment exists to
+  // prevent. Only genuinely ABSENT fields are left to default to empty.
+  if ('enabledMcpjsonServers' in settings && !Array.isArray(settings.enabledMcpjsonServers)) return;
+  if ('permissions' in settings && (settings.permissions === null || typeof settings.permissions !== 'object' || Array.isArray(settings.permissions))) return;
+  const permissionsForShapeCheck = (settings.permissions ?? {}) as Record<string, unknown>;
+  if ('allow' in permissionsForShapeCheck && !Array.isArray(permissionsForShapeCheck.allow)) return;
+
   // Same refuse-rather-than-silently-normalize check as the write path
   // (Codex review, 2026-08-24, round 19): the operator could have
   // hand-edited a non-string element into one of these arrays between
