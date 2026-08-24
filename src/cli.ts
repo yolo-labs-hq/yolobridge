@@ -28,6 +28,7 @@ import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agen
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 import { startMcpProxy, mcpUrl, type McpProxyHandle } from './mcp-proxy.js';
 import { writeLocalMcpConfig, removeLocalMcpConfig } from './local-mcp-config.js';
+import { writeLocalMcpTrust, removeLocalMcpTrust } from './local-mcp-trust.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
@@ -223,6 +224,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   const spawnCwd = process.cwd();
   let mcpProxyHandle: McpProxyHandle | undefined;
   let wroteMcpConfig = false;
+  let wroteMcpTrust = false;
 
   const result = await runAttachFromDisk({
     workspaceId,
@@ -249,6 +251,17 @@ async function cmdAttach(args: string[]): Promise<number> {
         wroteMcpConfig = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
         if (!wroteMcpConfig) {
           process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is not valid JSON — leaving local MCP access unconfigured.\n`);
+        } else {
+          // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
+          // its own tool-call approvals) so Claude Code doesn't sit on an
+          // interactive "New MCP server found" / per-tool-call prompt with
+          // nobody watching. Best-effort: a failure here still leaves the
+          // MCP server configured and usable, just with the normal
+          // approval prompts, so it's logged rather than fatal.
+          wroteMcpTrust = writeLocalMcpTrust(spawnCwd);
+          if (!wroteMcpTrust) {
+            process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.claude/settings.json is not valid JSON — MCP tool calls will need manual approval.\n`);
+          }
         }
       }
 
@@ -290,6 +303,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   // proxy: stop the server (drops the delegated token from memory) and
   // remove the .mcp.json entry we added, if we added one.
   if (mcpProxyHandle) await mcpProxyHandle.stop();
+  if (wroteMcpTrust) removeLocalMcpTrust(spawnCwd);
   if (wroteMcpConfig) removeLocalMcpConfig(spawnCwd);
 
   if (!result.ok) {
