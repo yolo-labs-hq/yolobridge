@@ -45,7 +45,12 @@
 import { writeFileSync, renameSync, unlinkSync, existsSync, statSync, chmodSync, lstatSync, realpathSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
-function resolveWriteTarget(path: string): string {
+/** Exported for `git-safety.ts` (Codex review, 2026-08-24, round 21): the
+ *  git-ignore check must validate the SAME real target this function is
+ *  about to write through, not just the (possibly symlinked) path the
+ *  caller named — see that module's doc comment for the exact gap this
+ *  closes. */
+export function resolveWriteTarget(path: string): string {
   try {
     if (!lstatSync(path).isSymbolicLink()) return path;
   } catch {
