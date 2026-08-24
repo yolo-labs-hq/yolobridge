@@ -80,6 +80,21 @@ describe('writeLocalMcpConfig', () => {
       assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), content, `file must be untouched for root content: ${content}`);
     }
   });
+
+  it('returns false and does not touch a pre-existing file whose mcpServers value is malformed (array or a primitive) (Codex review, 2026-08-24, round 2)', () => {
+    // Same class of bug one level deeper: `typeof [] === 'object'` also
+    // passed the OLD nested-value check, so an array `mcpServers` would
+    // have had SERVER_NAME assigned as a non-index property (silently
+    // dropped by JSON.stringify) while still reporting ok:true; a
+    // primitive mcpServers (e.g. a string) would have been silently
+    // replaced with a fresh {}, discarding it.
+    for (const mcpServers of ['[1,2,3]', '"a string"', '42']) {
+      writeFileSync(mcpJsonPath(), `{"mcpServers":${mcpServers}}`);
+      const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+      assert.equal(ok, false, `expected refusal for mcpServers: ${mcpServers}`);
+      assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), `{"mcpServers":${mcpServers}}`, `file must be untouched for mcpServers: ${mcpServers}`);
+    }
+  });
 });
 
 describe('removeLocalMcpConfig', () => {

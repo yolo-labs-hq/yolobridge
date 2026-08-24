@@ -146,55 +146,16 @@ describe('runAttachDaemon', () => {
     assert.ok(requests.some((r) => r.includes('/yolobridge/stream?attachmentId=a1')));
   });
 
-  it("clears the terminal right when the stream connects, AFTER logging 'Stream connected.' -- so that line is actually visible for a moment, and the shell prompt / Attached. line don't linger once the local agent's own UI takes over", async () => {
-    const sse =
-      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
-      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
-    const fetchImpl = (async (url: any) => {
-      const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
-      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
-      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
-      throw new Error(`unexpected request: ${u}`);
-    }) as any;
-
-    const io = fakeIO();
-    const calls: string[] = [];
-
-    const result = await runAttachDaemon({
-      workspaceId: 'w1',
-      commonApiBaseUrl: 'https://api.example.com',
-      auth: AUTH,
-      env: ENV,
-      io,
-      fetchImpl,
-      log: (line) => calls.push(`log:${line}`),
-      clearScreen: () => calls.push('clear'),
-      deliverPrompt: async () => {},
-      captureOutput: async () => ({ output: 'unused', busy: false }),
-      shouldStop: () => false,
-    });
-
-    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
-    // Exactly one clear (not on the earlier 'Attached.' line, only on
-    // 'connected'), and it comes strictly AFTER 'Stream connected.' is
-    // logged -- clearing BEFORE would wipe that line before it was ever
-    // actually visible on screen.
-    assert.deepEqual(calls.filter((c) => c === 'clear'), ['clear']);
-    const clearIdx = calls.indexOf('clear');
-    const connectedLogIdx = calls.indexOf('log:Stream connected.');
-    assert.ok(connectedLogIdx >= 0, "sanity check: 'Stream connected.' was logged at all");
-    assert.ok(clearIdx > connectedLogIdx, 'clearScreen must fire after the Stream connected. log line');
-  });
-
-  it("does NOT clear the terminal again on a RECONNECT's 'connected' frame -- only the first one (Codex review, 2026-08-24)", async () => {
-    // Two 'connected' frames in one stream stands in for a reconnect (a
-    // transient network blip while the local agent is already mid-session
-    // never actually drops this test's one fetch/stream, but the daemon's
-    // frame handling can't tell that apart from a real reconnect -- both
-    // just see another 'connected' event). Wiping the screen a second time
-    // would be a real loss of visible scrollback for content the agent's
-    // own PTY never actually stopped rendering.
+  it("does NOT clear the terminal on the SSE 'connected' frame -- clearScreen is handed to onAttached instead, for the caller to fire before spawning the agent (reverted design, Codex review, 2026-08-24)", async () => {
+    // Original design cleared on 'connected', reasoning that the agent's
+    // own PTY (started by cli.ts's onAttached, BEFORE this stream even
+    // opens) would always render its first output later than that.
+    // Codex correctly pointed out that assumption doesn't hold for a
+    // fast-booting agent or a slow SSE connect -- clearing after the
+    // agent has already painted wipes content it doesn't know to
+    // repaint (the clear never goes through its PTY). runAttachDaemon
+    // itself must never call clearScreen anymore; only onAttached's
+    // caller decides when, deterministically, right before spawn.
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t2"}\n\n' +
@@ -224,7 +185,38 @@ describe('runAttachDaemon', () => {
 
     assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
     assert.equal(calls.filter((c) => c === 'log:Stream connected.').length, 2, 'sanity check: both connected frames were processed');
-    assert.deepEqual(calls.filter((c) => c === 'clear'), ['clear'], 'exactly one clear, from the FIRST connected frame only');
+    assert.deepEqual(calls.filter((c) => c === 'clear'), [], 'runAttachDaemon must never call clearScreen itself');
+  });
+
+  it("hands a working clearScreen through to onAttached, which the caller can fire on its own schedule", async () => {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const calls: string[] = [];
+    await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => calls.push('clear'),
+      deliverPrompt: async () => {},
+      captureOutput: async () => ({ output: 'unused', busy: false }),
+      shouldStop: () => false,
+      onAttached: async ({ clearScreen }) => { clearScreen(); },
+    });
+
+    assert.deepEqual(calls, ['clear']);
   });
 
   it('calls onAttached exactly once, with the real tileId/attachmentId/accessToken/getAccessToken, before the stream ever opens', async () => {
@@ -266,10 +258,12 @@ describe('runAttachDaemon', () => {
     });
 
     assert.equal(onAttachedCalls, 1);
-    const { getAccessToken, ...rest } = onAttachedInfo as { getAccessToken: () => string; [k: string]: unknown };
+    const { getAccessToken, clearScreen, ...rest } = onAttachedInfo as { getAccessToken: () => string; clearScreen: () => void; [k: string]: unknown };
     assert.deepEqual(rest, { tileId: 'tile-1', attachmentId: 'a1', workspaceId: 'w1', accessToken: 'at' });
     assert.equal(typeof getAccessToken, 'function');
     assert.equal(getAccessToken(), 'at', 'getAccessToken must read the CURRENT token, not just echo the snapshot');
+    assert.equal(typeof clearScreen, 'function');
+    assert.doesNotThrow(() => clearScreen());
     assert.equal(streamOpenedBeforeOnAttached, false, 'onAttached must fire before the SSE stream opens');
   });
 

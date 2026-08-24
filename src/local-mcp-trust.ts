@@ -111,17 +111,33 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
     return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
   }
 
+  // Present-but-invalid is refused, same reasoning as local-mcp-config.ts's
+  // matching fix (Codex review, 2026-08-24): `asStringArray` alone silently
+  // treats a non-array value as `[]`, which would discard a malformed
+  // `enabledMcpjsonServers`/`permissions.allow` (or a non-object
+  // `permissions`) on write while still reporting success. Only genuinely
+  // ABSENT fields default to empty.
+  if ('enabledMcpjsonServers' in settings && !Array.isArray(settings.enabledMcpjsonServers)) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+  }
+  if ('permissions' in settings && (settings.permissions === null || typeof settings.permissions !== 'object' || Array.isArray(settings.permissions))) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+  }
+  const permissionsObj = (settings.permissions ?? {}) as Record<string, unknown>;
+  if ('allow' in permissionsObj && !Array.isArray(permissionsObj.allow)) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+  }
+
   const enabled = new Set(asStringArray(settings.enabledMcpjsonServers));
   const addedServerEntry = !enabled.has(SERVER_NAME);
   enabled.add(SERVER_NAME);
   settings.enabledMcpjsonServers = [...enabled];
 
-  const permissions = (settings.permissions && typeof settings.permissions === 'object' ? settings.permissions : {}) as Record<string, unknown>;
-  const allow = new Set(asStringArray(permissions.allow));
+  const allow = new Set(asStringArray(permissionsObj.allow));
   const addedPermissionEntry = !allow.has(TOOL_PATTERN);
   allow.add(TOOL_PATTERN);
-  permissions.allow = [...allow];
-  settings.permissions = permissions;
+  permissionsObj.allow = [...allow];
+  settings.permissions = permissionsObj;
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');

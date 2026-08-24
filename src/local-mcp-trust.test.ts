@@ -98,6 +98,32 @@ describe('writeLocalMcpTrust', () => {
       assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for root content: ${content}`);
     }
   });
+
+  it('returns ok:false and does not touch a pre-existing file whose enabledMcpjsonServers is not an array (Codex review, 2026-08-24, round 2)', () => {
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    const content = '{"enabledMcpjsonServers":"not-an-array"}';
+    writeFileSync(settingsPath(), content);
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false });
+    assert.equal(readFileSync(settingsPath(), 'utf-8'), content);
+  });
+
+  it('returns ok:false and does not touch a pre-existing file whose permissions value is malformed (array, primitive, or a non-array allow) (Codex review, 2026-08-24, round 2)', () => {
+    // Same class of bug one level deeper: `typeof [] === 'object'` also
+    // passed the OLD nested-value check, so an array `permissions` would
+    // have had `allow` assigned as a non-index property (silently dropped
+    // by JSON.stringify) while still reporting addedPermissionEntry:true;
+    // a primitive `permissions` (or a non-array `permissions.allow`) would
+    // have been silently replaced, discarding whatever was there.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    for (const body of ['[1,2,3]', '"a string"', '{"allow":"not-an-array"}']) {
+      const content = `{"permissions":${body}}`;
+      writeFileSync(settingsPath(), content);
+      const result = writeLocalMcpTrust(dir);
+      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false }, `expected refusal for permissions: ${body}`);
+      assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for permissions: ${body}`);
+    }
+  });
 });
 
 describe('removeLocalMcpTrust', () => {

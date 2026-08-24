@@ -72,7 +72,17 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
   } catch {
     return false;
   }
-  const servers = (config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {}) as Record<string, unknown>;
+  // `config.mcpServers` gets the SAME root-validation treatment as the file
+  // itself (Codex review, 2026-08-24): the old `typeof === 'object'` check
+  // also accepts an array (assigning SERVER_NAME onto it is then silently
+  // dropped by JSON.stringify -- this would have returned `true` while
+  // writing nothing), and silently replaced a PRIMITIVE mcpServers value
+  // (e.g. a string) with a fresh `{}`, discarding it. Present-but-invalid
+  // is refused, same as an invalid root; only ABSENT defaults to `{}`.
+  if ('mcpServers' in config && (config.mcpServers === null || typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers))) {
+    return false;
+  }
+  const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
   if (SERVER_NAME in servers) return false;
   servers[SERVER_NAME] = { type: 'http', url: proxyUrl };
   config.mcpServers = servers;

@@ -110,6 +110,20 @@ export interface AttachDaemonDeps {
      *  stale one would 401 on every mint forever once that happens (Codex
      *  review, 2026-08-24). */
     getAccessToken: () => string;
+    /** Clears the terminal (see this file's default `clearScreen` for the
+     *  ANSI sequence). Exposed here rather than auto-fired on the SSE
+     *  'connected' frame (the original design, reverted — Codex review,
+     *  2026-08-24): `startLocalAgent` is called from `onAttached`, BEFORE
+     *  the SSE stream even opens, so a fast-booting agent (or a slow SSE
+     *  connect) can render its own first output before 'connected' ever
+     *  arrives — clearing AFTER that point wipes content the agent already
+     *  painted, and the agent has no idea it needs to repaint (the clear
+     *  goes straight to this process's stdout, not through its PTY),
+     *  leaving an apparently-blank session. The caller controls exactly
+     *  when the agent is about to spawn; that is the only point that is
+     *  deterministically BEFORE any agent output, regardless of either
+     *  timing race. */
+    clearScreen: () => void;
   }) => void | Promise<void>;
 }
 
@@ -201,6 +215,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         tileId, attachmentId, workspaceId,
         accessToken: currentAuth.accessToken,
         getAccessToken: () => currentAuth.accessToken,
+        clearScreen,
       });
     } catch (err) {
       log(`onAttached hook failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -229,14 +244,6 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   let heartbeat: HeartbeatScheduler | undefined;
   let attempt = 0;
-  /** Guards clearScreen() to the FIRST 'connected' frame only (Codex review,
-   *  2026-08-24): every SSE reconnect (including a transient network blip
-   *  while the local agent is already mid-session) also delivers a fresh
-   *  'connected' frame, and clearing on each one would wipe the visible
-   *  terminal/scrollback on every reconnect even though the agent's own PTY
-   *  never stopped rendering — a real loss for a long session that just had
-   *  a flaky connection. */
-  let hasClearedOnConnect = false;
   /** Set when a proactive refresh (see ensureFreshToken) fails while a
    * stream is open — picked up right after the current for-await unwinds
    * (forced via the stop-poll below) so the daemon stops instead of
@@ -296,26 +303,23 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
               const action = actionForFrame(frame);
               switch (action.kind) {
                 case 'connected':
-                  // Clear the terminal HERE, not on the initial 'Attached.'
-                  // log line above -- the locally-spawned agent's own PTY
-                  // was already started by cli.ts before this stream even
-                  // began connecting, but its first rendered output
-                  // consistently lands after this point in practice (a cold
-                  // Claude Code boot is slower than the attach+SSE-connect
-                  // round trip), so clearing right on 'connected' reliably
-                  // leaves a clean screen just before the agent's own UI
-                  // takes over, instead of it drawing on top of the
-                  // daemon's own connection-status scrollback. AFTER logging
-                  // 'Stream connected.', not before -- the operator wants
-                  // that line to actually be visible (briefly) rather than
-                  // wiped the instant it's written; it still won't linger
-                  // once the agent's own UI paints over/past it a moment
-                  // later.
+                  // Deliberately NOT clearing here (reverted -- Codex
+                  // review, 2026-08-24). The original reasoning was "the
+                  // agent's own PTY was already started by cli.ts before
+                  // this stream even began connecting, but its first
+                  // rendered output consistently lands after this point in
+                  // practice" -- that held for a cold Claude Code boot but
+                  // not in general: a fast-booting `--agent`, or a slow SSE
+                  // connect, can render BEFORE 'connected' ever arrives,
+                  // and clearing after that wipes content straight off this
+                  // process's stdout (not through the agent's PTY, which
+                  // has no idea it needs to repaint) -- an apparently-blank
+                  // session, not a clean one. `onAttached`'s `clearScreen`
+                  // (see AttachDaemonDeps) now fires deterministically
+                  // right before `startLocalAgent`, the one moment
+                  // guaranteed to be before any agent output regardless of
+                  // either timing race.
                   log('Stream connected.');
-                  if (!hasClearedOnConnect) {
-                    clearScreen();
-                    hasClearedOnConnect = true;
-                  }
                   heartbeat?.stop();
                   heartbeat = startHeartbeat(
                     async () => {

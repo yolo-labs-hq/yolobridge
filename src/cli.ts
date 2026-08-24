@@ -247,7 +247,7 @@ async function cmdAttach(args: string[]): Promise<number> {
     // skipped, not fatal — MCP access is an enhancement on a tile that
     // already works without it (send_to_tile/read_tile_output are
     // unaffected either way).
-    onAttached: async ({ getAccessToken }) => {
+    onAttached: async ({ getAccessToken, clearScreen }) => {
       // Isolated from `startLocalAgent` below on purpose (Codex review,
       // 2026-08-24): `startMcpProxy` itself never throws, but
       // `writeLocalMcpConfig`/`writeLocalMcpTrust` do plain synchronous
@@ -306,6 +306,20 @@ async function cmdAttach(args: string[]): Promise<number> {
       } catch (err) {
         process.stdout.write(`yolo-bridge: local MCP setup failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.\n`);
       }
+
+      // A stop signal (Ctrl+C) can arrive while this callback was still
+      // awaiting the MCP-setup block above — `runAttachDaemon` only checks
+      // `shouldStop()` again after `onAttached` RETURNS, so without this
+      // check a cancellation mid-setup would still spawn a brand-new PTY
+      // process just to kill it moments later (Codex review, 2026-08-24).
+      if (stopRequested) return;
+
+      // Clears the terminal right before the agent's own UI takes over —
+      // NOT on the SSE 'connected' frame (reverted design, see
+      // attach-cmd.ts's `onAttached` doc comment for why: this is the one
+      // moment guaranteed to be before any agent output, regardless of how
+      // fast the agent boots or how slow the SSE connect is).
+      clearScreen();
 
       // Spawns the local coding agent under a real PTY — this is what
       // launches the user's local session (see docs/YOLOBRIDGE_PLAN.md's
