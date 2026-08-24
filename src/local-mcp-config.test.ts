@@ -57,11 +57,24 @@ describe('writeLocalMcpConfig', () => {
     assert.equal(existsSync(mcpJsonPath()), false, 'must not create the file at all when it would be unsafe to commit');
   });
 
-  it('proceeds normally when .mcp.json IS confirmed git-ignored', () => {
+  it('proceeds normally when BOTH .mcp.json and the sidecar are confirmed git-ignored', () => {
+    initGitRepo();
+    writeFileSync(join(dir, '.gitignore'), '.mcp.json\n.yolobridge-mcp-state.json\n');
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true);
+  });
+
+  it('refuses to write when .mcp.json is git-ignored but the SIDECAR is not (Codex review, 2026-08-24, round 18)', () => {
+    // A repo's .gitignore naming `.mcp.json` specifically says nothing
+    // about `.yolobridge-mcp-state.json` -- a filename only this module
+    // invented, that no operator would think to add preemptively. Without
+    // checking the sidecar's OWN git-ignore status too, this exact case
+    // would let the sidecar itself get swept into a commit.
     initGitRepo();
     writeFileSync(join(dir, '.gitignore'), '.mcp.json\n');
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    assert.equal(result.ok, true);
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    assert.equal(existsSync(sidecarPath()), false, 'must not create the sidecar either when it would be unsafe to commit');
   });
 
   it('proceeds normally outside a git repo entirely (no commit risk exists)', () => {

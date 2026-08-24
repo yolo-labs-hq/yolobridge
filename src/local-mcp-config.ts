@@ -271,7 +271,15 @@ export interface McpConfigWriteResult {
  */
 export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWriteResult {
   const path = mcpJsonPath(cwd);
-  if (riskyToCommit(cwd, path)) {
+  // Checks the SIDECAR's own path too, not just `.mcp.json`'s (Codex
+  // review, 2026-08-24, round 18): a repo's `.gitignore` naming `.mcp.json`
+  // specifically says nothing about `.yolobridge-mcp-state.json` — a
+  // filename only this module invented, that no operator would think to
+  // add preemptively. Without this, a repo that DID think to gitignore
+  // `.mcp.json` could still have the sidecar itself swept into a commit,
+  // exposing the exact per-attach loopback URL this whole guard exists to
+  // keep out of Git.
+  if (riskyToCommit(cwd, path) || riskyToCommit(cwd, sidecarPath(cwd))) {
     return { ok: false, createdFile: false };
   }
   const createdFile = !existsSync(path);
