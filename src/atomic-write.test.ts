@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, readdirSync, existsSync, statSync, lstatSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -105,5 +105,46 @@ describe('atomicWriteFileSync', () => {
     // writeFileSync's own create-time behavior.
     const mode = statSync(path).mode & 0o777;
     assert.notEqual(mode, 0, 'sanity check: a real mode was set');
+  });
+
+  it('writes THROUGH a symlink instead of destroying it (Codex review, 2026-08-24, round 16)', () => {
+    // A dotfiles manager (stow/chezmoi/a hand-made symlink) can legitimately
+    // symlink .mcp.json or .claude/settings.local.json elsewhere. renameSync
+    // replaces whatever directory entry is at `path` -- symlink or not --
+    // so without resolving first, the FIRST atomic write would permanently
+    // replace the symlink with a plain file.
+    const realFile = join(dir, 'real-target.json');
+    const linkPath = join(dir, 'linked.json');
+    writeFileSync(realFile, '{"old":true}');
+    symlinkSync(realFile, linkPath);
+
+    atomicWriteFileSync(linkPath, '{"new":true}');
+
+    assert.ok(lstatSync(linkPath).isSymbolicLink(), 'the symlink itself must survive the write');
+    assert.equal(readFileSync(realFile, 'utf-8'), '{"new":true}', 'the REAL underlying file must receive the new content');
+    assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}', 'reading through the (still-intact) symlink sees the new content too');
+  });
+
+  it('preserves the REAL target’s permissions when writing through a symlink, not the symlink’s own', () => {
+    const realFile = join(dir, 'real-tightened.json');
+    const linkPath = join(dir, 'linked-tightened.json');
+    writeFileSync(realFile, '{"old":true}');
+    chmodSync(realFile, 0o600);
+    symlinkSync(realFile, linkPath);
+
+    atomicWriteFileSync(linkPath, '{"new":true}');
+
+    assert.equal(statSync(realFile).mode & 0o777, 0o600);
+  });
+
+  it('replaces a BROKEN symlink with a plain file, same as before this fix (not a new regression)', () => {
+    const missingTarget = join(dir, 'does-not-exist.json');
+    const linkPath = join(dir, 'broken-link.json');
+    symlinkSync(missingTarget, linkPath);
+
+    atomicWriteFileSync(linkPath, '{"new":true}');
+
+    assert.equal(lstatSync(linkPath).isSymbolicLink(), false, 'a broken symlink target has nowhere to write through');
+    assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}');
   });
 });

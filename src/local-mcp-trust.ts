@@ -66,7 +66,7 @@ import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { atomicWriteFileSync } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { riskyToCommit } from './git-safety.js';
 
 /** Same identity as local-mcp-config.ts's SERVER_NAME -- kept as an
  *  independent constant (not imported) since these two modules are meant to
@@ -86,21 +86,6 @@ function settingsPath(cwd: string): string {
   return join(cwd, '.claude', 'settings.local.json');
 }
 
-/**
- * True only when `git check-ignore` DEFINITIVELY confirms `path` is NOT
- * ignored inside a real git repo at `cwd` (exit code 1) — i.e. a `git add
- * -A` could actually pick it up (Codex review, 2026-08-24, round 15).
- * Empirically verified exit codes (not assumed): 0 = ignored (safe), 1 =
- * not ignored (risky), 128 = `cwd` isn't a git repo at all (safe — nothing
- * can ever commit it). Any OTHER outcome (git missing, a weird error) is
- * also treated as safe: this function's only job is to catch a CONFIRMED
- * risk, not to require positive proof of safety, matching this module's
- * existing philosophy that MCP pre-trust is a best-effort enhancement.
- */
-function riskyToCommit(cwd: string, path: string): boolean {
-  const result = spawnSync('git', ['check-ignore', '-q', path], { cwd });
-  return result.status === 1;
-}
 
 function readSettings(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};

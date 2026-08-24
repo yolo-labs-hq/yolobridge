@@ -15,12 +15,27 @@
  * adapted to a single project file rather than a global merge: only the key
  * this module owns (`SERVER_NAME`) is ever added or removed; every other
  * key in the file is left untouched.
+ *
+ * Refuses to write anything if `.mcp.json` is confirmed NOT git-ignored
+ * inside a real repo at `cwd` (Codex review, 2026-08-24, round 16 — this
+ * repo's OWN root tracks `.mcp.json`, verified with `git cat-file`, not
+ * assumed): round 12 already moved the actual SECRET out of this file, but
+ * the entry still carries a per-attach, machine-local loopback URL that is
+ * dead the moment this daemon exits. A spawned coding agent running with
+ * YOLO-mode autonomy could `git add -A && commit` while attached, and
+ * cleanup on detach only ever touches the WORKING TREE — it can't repair a
+ * commit already made, so every collaborator who pulls it inherits a
+ * `yolo-studio` server pointing at a port nothing is listening on. Same
+ * `riskyToCommit` check `local-mcp-trust.ts` uses (round 15), same
+ * degraded fallback: `ok: false` (no local MCP access this attach), never
+ * a hard failure.
  */
 
 import { readFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
 import { atomicWriteFileSync } from './atomic-write.js';
+import { riskyToCommit } from './git-safety.js';
 
 /** The literal string written into `.mcp.json`'s `headers` value — a
  *  template, not the secret itself (Codex review, 2026-08-24, round 12).
@@ -256,6 +271,9 @@ export interface McpConfigWriteResult {
  */
 export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWriteResult {
   const path = mcpJsonPath(cwd);
+  if (riskyToCommit(cwd, path)) {
+    return { ok: false, createdFile: false };
+  }
   const createdFile = !existsSync(path);
   let config: Record<string, unknown>;
   try {

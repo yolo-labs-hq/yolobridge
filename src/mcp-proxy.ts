@@ -434,21 +434,34 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
  * comment describes makes this a real, not theoretical, window). Parses
  * defensively (a malformed/unexpected shape is treated as "not this error",
  * never thrown) -- this must not become a new way to crash the proxy.
+ *
+ * Also checks a JSON-RPC BATCH response, not just a single object (Codex
+ * review, 2026-08-24, round 16): `injectToken` above already handles a
+ * batched REQUEST (`Array.isArray(parsed)`), so a batched RESPONSE is
+ * equally real on the way back. Without this, a batch containing an
+ * UNAUTHORIZED result was invisible to this check (`parsed?.result` is
+ * `undefined` on an array), so the force-refresh-and-retry never fired --
+ * every batched call kept failing with the same stale token until the
+ * cache's own `REFRESH_BUFFER_MS`-driven expiry eventually caught up on
+ * its own, not on the first sign of trouble.
  */
 function isUnauthorizedToolResult(text: string): boolean {
   try {
     const parsed = JSON.parse(text);
-    const content = parsed?.result?.content;
-    if (!Array.isArray(content)) return false;
-    for (const item of content) {
-      if (typeof item?.text !== 'string') continue;
-      try {
-        const inner = JSON.parse(item.text);
-        if (inner?.code === 'UNAUTHORIZED') return true;
-      } catch {
-        // item.text wasn't JSON -- not this error shape, keep checking
-        // other content items rather than guessing from a substring match
-        // (a legitimate tool result could coincidentally contain the word).
+    const responses = Array.isArray(parsed) ? parsed : [parsed];
+    for (const response of responses) {
+      const content = response?.result?.content;
+      if (!Array.isArray(content)) continue;
+      for (const item of content) {
+        if (typeof item?.text !== 'string') continue;
+        try {
+          const inner = JSON.parse(item.text);
+          if (inner?.code === 'UNAUTHORIZED') return true;
+        } catch {
+          // item.text wasn't JSON -- not this error shape, keep checking
+          // other content items rather than guessing from a substring match
+          // (a legitimate tool result could coincidentally contain the word).
+        }
       }
     }
   } catch {

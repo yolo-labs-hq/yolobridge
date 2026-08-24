@@ -3,18 +3,37 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import { writeLocalMcpConfig, removeLocalMcpConfig } from './local-mcp-config.js';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
 
 const SECRET_HEADER_TEMPLATE = `\${${SECRET_ENV_VAR}}`;
 
+/** Real `git init` in `dir` -- see local-mcp-trust.test.ts's identical
+ *  helper for why this must be the real thing, not a mock. */
+function initGitRepo(): void {
+  spawnSync('git', ['init', '-q'], { cwd: dir });
+}
+
 let dir: string;
+let xdgConfigDir: string;
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'yolo-bridge-mcp-config-test-'));
+  // Isolates `git check-ignore` from THIS machine's own global excludes --
+  // see local-mcp-trust.test.ts's identical setup for the empirically-found
+  // reason (a real dev machine commonly gitignores `.claude/` globally,
+  // which would make a "not ignored" test here pass for the wrong reason
+  // too, even though this file is about `.mcp.json` not `.claude/*`).
+  xdgConfigDir = mkdtempSync(join(tmpdir(), 'yolo-bridge-xdg-config-test-'));
+  process.env.XDG_CONFIG_HOME = xdgConfigDir;
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(xdgConfigDir, { recursive: true, force: true });
+  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
 });
 
 function mcpJsonPath(): string {
@@ -26,6 +45,30 @@ function sidecarPath(): string {
 }
 
 describe('writeLocalMcpConfig', () => {
+  it('refuses to write when .mcp.json would NOT be git-ignored inside a real repo (Codex review, 2026-08-24, round 16)', () => {
+    // Round 12 already moved the SECRET out of this file, but the entry
+    // still carries a per-attach, machine-local loopback URL that's dead
+    // the moment this daemon exits. This repo's OWN root tracks .mcp.json
+    // (verified with `git cat-file`, not assumed) -- a committed dead entry
+    // breaks the shared server definition for every collaborator.
+    initGitRepo();
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    assert.equal(existsSync(mcpJsonPath()), false, 'must not create the file at all when it would be unsafe to commit');
+  });
+
+  it('proceeds normally when .mcp.json IS confirmed git-ignored', () => {
+    initGitRepo();
+    writeFileSync(join(dir, '.gitignore'), '.mcp.json\n');
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true);
+  });
+
+  it('proceeds normally outside a git repo entirely (no commit risk exists)', () => {
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true);
+  });
+
   it('creates .mcp.json from scratch with a plain yolo-studio entry, and records ownership in the sidecar', () => {
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: true });

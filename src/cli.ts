@@ -324,7 +324,7 @@ async function cmdAttach(args: string[]): Promise<number> {
         } else if (mcpProxyHandle) {
           const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
           if (!configResult.ok) {
-            process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is unparseable or already has its own "yolo-studio" entry — leaving local MCP access unconfigured rather than overwrite it.\n`);
+            process.stdout.write(`yolo-bridge: could not configure local MCP access (${spawnCwd}/.mcp.json is unparseable, already has its own "yolo-studio" entry, or would not be safe from a future commit) — leaving it unconfigured rather than overwrite/dirty it.\n`);
           } else {
             mcpConfigCleanup = { expectedProxyUrl: mcpProxyHandle.url, createdFile: configResult.createdFile };
             // Pre-trusts ONLY the yolo-studio server (server-discovery trust +

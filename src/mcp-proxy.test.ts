@@ -263,6 +263,47 @@ describe('startMcpProxy', () => {
     assert.equal(forwardCount, 2, 'initial forward (in-band UNAUTHORIZED) + one retry');
   });
 
+  it('force-refreshes and retries on an in-band UNAUTHORIZED result inside a JSON-RPC BATCH response (Codex review, 2026-08-24, round 16)', async () => {
+    // injectToken already handles a batched REQUEST (Array.isArray(parsed))
+    // -- a batched RESPONSE is equally real coming back. The body here is a
+    // JSON ARRAY of one or more responses, so `parsed?.result` (the
+    // single-object shape the original check assumed) is undefined and the
+    // in-band UNAUTHORIZED was invisible until this fix.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({
+      mintToken: () => { mintCount++; return mintResponse(`tok-${mintCount}`); },
+      upstream: (init) => {
+        forwardCount++;
+        const bodyArr = JSON.parse(init.body);
+        const usedToken = bodyArr[0].params.arguments._delegatedToken;
+        if (usedToken === 'tok-1') {
+          return new Response(JSON.stringify([
+            { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ error: 'Invalid delegated token', code: 'UNAUTHORIZED' }) }] } },
+          ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify([
+          { jsonrpc: '2.0', id: 1, result: { usedToken } },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }]),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as any;
+    assert.equal(body[0].result.usedToken, 'tok-2');
+    assert.equal(mintCount, 2, 'initial mint + one force-refresh');
+    assert.equal(forwardCount, 2, 'initial forward (in-band UNAUTHORIZED in a batch) + one retry');
+  });
+
   it('does NOT retry on a real tool error that happens to be HTTP 200 but is not UNAUTHORIZED (e.g. a legitimate FORBIDDEN scope error)', async () => {
     // The fix above must be specific to UNAUTHORIZED -- retrying a
     // FORBIDDEN (correctly-enforced, not-in-scope) call would just waste a
