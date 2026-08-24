@@ -54,42 +54,88 @@ function readConfig(path: string): Record<string, unknown> {
 }
 
 /**
- * Marker key written into the `yolo-studio` entry itself so a LATER attach
- * can tell "we wrote this, safe to reclaim after a crash" apart from
- * "genuinely the operator's own config" with certainty, not a guess.
+ * Sidecar file recording the proxy URL this module most recently wrote into
+ * `yolo-studio`, kept OUTSIDE `.mcp.json` itself.
  *
- * Round 6 tried a URL-shape heuristic instead (loopback-looking URL = ours)
- * — Codex review, 2026-08-24, round 7 correctly pointed out a legitimate
- * hand-authored entry for LOCAL development can have that exact shape too
- * (`http://127.0.0.1:<port>/mcp` is a completely normal thing for a human
- * to point a real local MCP server at), so URL shape alone can't establish
- * ownership. An explicit marker can: no hand-authored entry has any reason
- * to carry this exact key, and Claude Code's MCP client only reads
- * `type`/`url`/etc. from a server entry — an extra unknown key is inert to
- * it, the same way `.mcp.json`'s own unrelated top-level keys already are.
+ * Round 7-8 tracked ownership with a marker key (`_yolobridge: true`)
+ * embedded directly in the `mcpServers.yolo-studio` entry. Codex review,
+ * 2026-08-24, round 9, correctly flagged that as broken: Claude Code
+ * (v2.0.21+) validates `mcpServers` entries strictly on some releases and
+ * rejects unknown fields (anthropics/claude-code#10606) — this repo's own
+ * pod-side writer (`containers/services/container-api/mcp-config-writer.js`)
+ * already hit exactly this and solved it with an external sidecar rather
+ * than an in-entry marker. This file now does the same, adapted to
+ * `.mcp.json`'s project-scoped (not home-scoped) design: the entry this
+ * module writes is a plain, spec-shaped `{ type: 'http', url }` with no
+ * extra keys, so it can never trip strict validation, and ownership is
+ * instead established by comparing the entry's `url` against the URL this
+ * sidecar recorded us writing.
  */
-const OWNERSHIP_MARKER = '_yolobridge';
+function sidecarPath(cwd: string): string {
+  return join(cwd, '.yolobridge-mcp-state.json');
+}
+
+interface SidecarState {
+  proxyUrl?: string;
+}
+
+/** Best-effort read: a missing or corrupt sidecar just means "we don't know
+ *  what we last wrote", which correctly makes `looksLikeOurOwnEntry` refuse
+ *  to reclaim rather than guess — fail closed, same as everywhere else in
+ *  this file. */
+function readSidecar(cwd: string): SidecarState {
+  const path = sidecarPath(cwd);
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof (parsed as Record<string, unknown>).proxyUrl === 'string') {
+      return { proxyUrl: (parsed as Record<string, unknown>).proxyUrl as string };
+    }
+  } catch {
+    // Corrupt sidecar — treated as absent above.
+  }
+  return {};
+}
+
+function writeSidecar(cwd: string, proxyUrl: string): void {
+  writeFileSync(sidecarPath(cwd), JSON.stringify({ proxyUrl }, null, 2) + '\n', 'utf-8');
+}
+
+function deleteSidecar(cwd: string): void {
+  const path = sidecarPath(cwd);
+  if (existsSync(path)) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // Best-effort cleanup; a leftover sidecar only ever makes the NEXT
+      // write more conservative (it just won't match a differing URL), it
+      // never causes an unsafe reclaim.
+    }
+  }
+}
 
 /** Matches ONLY the exact URL shape this module itself ever generates. */
 const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
 
 /**
- * True if an existing `yolo-studio` entry carries `OWNERSHIP_MARKER` AND
- * still has the exact shape this module writes — `type: 'http'` and a
- * loopback `url`. BOTH signals are required (Codex review, 2026-08-24,
- * round 8): the marker alone isn't enough, because an operator can edit
- * the entry's VALUE (point it somewhere else entirely) WHILE an attachment
- * is still running, without knowing to also strip the marker they don't
- * know exists — a marker-only check would then have the NEXT attach
- * overwrite that intentional edit as though it were stale daemon state.
- * Requiring the shape to STILL look loopback-generated closes that gap:
- * an edited entry no longer matches, so it's correctly left alone even
- * with a stale marker attached.
+ * True if an existing `yolo-studio` entry's `type`/`url` still exactly match
+ * the URL the sidecar recorded us writing, AND that recorded URL still has
+ * the loopback shape this module generates (Codex review, 2026-08-24,
+ * round 8's "both signals required" reasoning still applies, now expressed
+ * as sidecar-match + shape instead of marker + shape): the sidecar alone
+ * isn't enough, because an operator can edit the entry's VALUE (point it
+ * somewhere else entirely) WHILE an attachment is still running, without
+ * knowing a sidecar exists — a sidecar-only check would then have the NEXT
+ * attach overwrite that intentional edit as though it were stale daemon
+ * state. Requiring the CURRENT entry to still equal the recorded URL closes
+ * that gap: an edited entry no longer matches, so it's correctly left alone
+ * even with a stale sidecar record.
  */
-function looksLikeOurOwnEntry(value: unknown): boolean {
+function looksLikeOurOwnEntry(value: unknown, recordedUrl: string | undefined): boolean {
+  if (!recordedUrl || !OWN_ENTRY_URL_PATTERN.test(recordedUrl)) return false;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
-  return v[OWNERSHIP_MARKER] === true && v.type === 'http' && typeof v.url === 'string' && OWN_ENTRY_URL_PATTERN.test(v.url);
+  return v.type === 'http' && v.url === recordedUrl;
 }
 
 export interface McpConfigWriteResult {
@@ -140,10 +186,15 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
     return { ok: false, createdFile: false };
   }
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-  if (SERVER_NAME in servers && !looksLikeOurOwnEntry(servers[SERVER_NAME])) return { ok: false, createdFile: false };
-  servers[SERVER_NAME] = { type: 'http', url: proxyUrl, [OWNERSHIP_MARKER]: true };
+  const recordedUrl = readSidecar(cwd).proxyUrl;
+  if (SERVER_NAME in servers && !looksLikeOurOwnEntry(servers[SERVER_NAME], recordedUrl)) return { ok: false, createdFile: false };
+  // Plain, spec-shaped entry — no ownership marker inside it (round 9): an
+  // unknown field here is exactly what a strict-validating Claude Code
+  // release rejects the whole server entry over.
+  servers[SERVER_NAME] = { type: 'http', url: proxyUrl };
   config.mcpServers = servers;
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  writeSidecar(cwd, proxyUrl);
   return { ok: true, createdFile };
 }
 
@@ -168,10 +219,18 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
  * the operator already had. When it's empty but NOT ours to delete, the
  * (now-empty-of-our-stuff) config is written back instead, same as any
  * other "file had other content" case.
+ *
+ * The sidecar (round 9) is only ever deleted when it still records exactly
+ * `expectedProxyUrl` — the same re-verify-before-touching discipline as the
+ * `.mcp.json` entry itself, so a concurrent sibling attach that already
+ * overwrote the sidecar with ITS OWN newer URL is never clobbered here.
  */
 export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, createdFile: boolean): void {
   const path = mcpJsonPath(cwd);
-  if (!existsSync(path)) return;
+  if (!existsSync(path)) {
+    if (readSidecar(cwd).proxyUrl === expectedProxyUrl) deleteSidecar(cwd);
+    return;
+  }
   let config: Record<string, unknown>;
   try {
     config = readConfig(path);
@@ -181,7 +240,8 @@ export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, crea
   }
   const servers = (config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {}) as Record<string, unknown>;
   const current = servers[SERVER_NAME] as { type?: unknown; url?: unknown } | undefined;
-  if (!current || current.type !== 'http' || current.url !== expectedProxyUrl || !looksLikeOurOwnEntry(current)) return;
+  const recordedUrl = readSidecar(cwd).proxyUrl;
+  if (!current || current.type !== 'http' || current.url !== expectedProxyUrl || !looksLikeOurOwnEntry(current, recordedUrl)) return;
   delete servers[SERVER_NAME];
 
   const hasOtherServers = Object.keys(servers).length > 0;
@@ -189,9 +249,11 @@ export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, crea
 
   if (createdFile && !hasOtherServers && otherTopLevelKeys.length === 0) {
     unlinkSync(path);
+    if (recordedUrl === expectedProxyUrl) deleteSidecar(cwd);
     return;
   }
 
   config.mcpServers = servers;
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  if (recordedUrl === expectedProxyUrl) deleteSidecar(cwd);
 }

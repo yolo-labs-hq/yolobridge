@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -18,12 +18,30 @@ function mcpJsonPath(): string {
   return join(dir, '.mcp.json');
 }
 
+function sidecarPath(): string {
+  return join(dir, '.yolobridge-mcp-state.json');
+}
+
 describe('writeLocalMcpConfig', () => {
-  it('creates .mcp.json from scratch with the yolo-studio entry, marked as ours', () => {
+  it('creates .mcp.json from scratch with a plain yolo-studio entry, and records ownership in the sidecar', () => {
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: true });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.deepEqual(parsed, { mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true } } });
+    assert.deepEqual(parsed, { mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' } } });
+    assert.deepEqual(JSON.parse(readFileSync(sidecarPath(), 'utf-8')), { proxyUrl: 'http://127.0.0.1:4123/mcp' });
+  });
+
+  it('writes a plain, spec-shaped entry with no custom fields (Codex review, 2026-08-24, round 9)', () => {
+    // Round 7-8 embedded an `_yolobridge` marker directly in the entry.
+    // Codex review, 2026-08-24, round 9: Claude Code (v2.0.21+) validates
+    // mcpServers entries strictly on some releases and rejects unknown
+    // fields (anthropics/claude-code#10606) -- an unknown key here can get
+    // the WHOLE entry rejected, bricking local MCP access. Ownership now
+    // lives entirely in the sidecar, so the entry itself is exactly what a
+    // hand-authored one would be.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.deepEqual(Object.keys(parsed.mcpServers['yolo-studio']).sort(), ['type', 'url']);
   });
 
   it('preserves other server entries and top-level keys already in the file, and reports createdFile:false', () => {
@@ -37,19 +55,19 @@ describe('writeLocalMcpConfig', () => {
     assert.deepEqual(parsed, {
       mcpServers: {
         'my-own-server': { type: 'stdio', command: 'foo' },
-        'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true },
+        'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' },
       },
       someOtherTopLevelKey: 'kept',
     });
   });
 
-  it("refuses to overwrite an EXISTING yolo-studio entry with no ownership marker -- real hand-authored config, including one that happens to use a loopback URL (Codex review, 2026-08-24, round 7)", () => {
+  it('refuses to overwrite an EXISTING yolo-studio entry with no matching sidecar record -- real hand-authored config, including one that happens to use a loopback URL', () => {
     // Round 6 tried a URL-shape heuristic (loopback URL = probably ours).
     // Round 7 correctly pointed out a legitimate hand-authored entry for
     // LOCAL DEVELOPMENT can have that exact shape too -- URL shape alone
-    // can't establish ownership. Only the explicit `_yolobridge` marker
-    // can, and a hand-authored entry has no reason to carry it, regardless
-    // of what URL it points at.
+    // can't establish ownership. Round 9 replaced the in-entry marker with
+    // a sidecar record, but the invariant is the same: no sidecar entry
+    // recording this exact URL means this module never wrote it.
     for (const url of ['https://services.yolo.studio/mcp', 'http://127.0.0.1:9999/mcp']) {
       writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url } } }));
       const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
@@ -59,28 +77,31 @@ describe('writeLocalMcpConfig', () => {
     }
   });
 
-  it("overwrites a STALE entry left behind by an uncleanly-terminated previous attach, identified by its _yolobridge marker (Codex review, 2026-08-24, round 6 + round 7)", () => {
-    // The entry carries the marker THIS module itself writes -- almost
-    // certainly ours, from a session that exited via SIGKILL/crash/reboot
-    // and never reached its own removeLocalMcpConfig call, not a
-    // hand-authored config. Refusing unconditionally (the original round-2
-    // fix) would brick local MCP access on every subsequent attach until
-    // the operator manually edited the file.
-    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:9999/mcp', _yolobridge: true } } }));
+  it('overwrites a STALE entry left behind by an uncleanly-terminated previous attach, identified by the sidecar recording that exact URL (Codex review, 2026-08-24, round 6 + round 9)', () => {
+    // The entry's URL matches what the sidecar recorded THIS module writing
+    // -- almost certainly ours, from a session that exited via
+    // SIGKILL/crash/reboot and never reached its own removeLocalMcpConfig
+    // call, not a hand-authored config. Refusing unconditionally would
+    // brick local MCP access on every subsequent attach until the operator
+    // manually edited the file.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp'); // simulates the prior attach's write
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true });
+    assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp' });
   });
 
-  it("does NOT reclaim an entry that still carries the marker but was EDITED to point somewhere non-loopback while an attachment was running (Codex review, 2026-08-24, round 8)", () => {
-    // The operator changed the URL to their own real server while attach
-    // #1 was still running, without knowing to also strip the marker they
-    // don't know exists. A marker-only check would have the NEXT attach
-    // overwrite that intentional edit as though it were stale daemon
-    // state -- requiring the shape to STILL look loopback-generated closes
-    // that gap.
-    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'https://my-own-real-server.example.com/mcp', _yolobridge: true } } }));
+  it('does NOT reclaim an entry that was EDITED to point somewhere else while an attachment was running, even though the sidecar still records the old URL (Codex review, 2026-08-24, round 8 + round 9)', () => {
+    // The operator changed the URL to their own real server while attach #1
+    // was still running, without knowing a sidecar exists. A sidecar-only
+    // check would have the NEXT attach overwrite that intentional edit as
+    // though it were stale daemon state -- requiring the CURRENT entry to
+    // still equal the recorded URL closes that gap.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'] = { type: 'http', url: 'https://my-own-real-server.example.com/mcp' };
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: false, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
@@ -123,14 +144,16 @@ describe('writeLocalMcpConfig', () => {
 });
 
 describe('removeLocalMcpConfig', () => {
-  it('deletes the file entirely if we created it from scratch (no other content)', () => {
+  it('deletes the file entirely if we created it from scratch (no other content), and clears the sidecar', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.ok(existsSync(mcpJsonPath()));
+    assert.ok(existsSync(sidecarPath()));
     removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     assert.equal(existsSync(mcpJsonPath()), false);
+    assert.equal(existsSync(sidecarPath()), false);
   });
 
-  it('leaves the file in place, with only our entry removed, when other servers/keys exist', () => {
+  it('leaves the file in place, with only our entry removed, when other servers/keys exist, and clears the sidecar', () => {
     writeFileSync(mcpJsonPath(), JSON.stringify({
       mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } },
     }));
@@ -139,10 +162,26 @@ describe('removeLocalMcpConfig', () => {
     assert.ok(existsSync(mcpJsonPath()), 'file should survive since it had other content');
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed, { mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } } });
+    assert.equal(existsSync(sidecarPath()), false);
   });
 
   it('is a safe no-op when no .mcp.json exists at all', () => {
     assert.doesNotThrow(() => removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true));
+  });
+
+  it('cleans up a leftover sidecar when .mcp.json is already gone (matching URL)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    unlinkSync(mcpJsonPath()); // simulates the operator deleting a stray .mcp.json externally
+    assert.ok(existsSync(sidecarPath()));
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
+    assert.equal(existsSync(sidecarPath()), false);
+  });
+
+  it('leaves a leftover sidecar alone when .mcp.json is gone but the URL does not match (a different attach cycle)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    unlinkSync(mcpJsonPath());
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp', true);
+    assert.ok(existsSync(sidecarPath()), 'sidecar recording a different URL must not be cleared');
   });
 
   it('leaves an unparseable file alone rather than deleting or rewriting it', () => {
@@ -185,6 +224,7 @@ describe('removeLocalMcpConfig', () => {
     removeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp', true);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:4123/mcp');
+    assert.ok(existsSync(sidecarPath()), 'sidecar recording the real URL must not be cleared by a mismatched detach');
   });
 
   it('does NOT unlink a pre-existing (createdFile:false) file even when removing our entry leaves it empty (Codex review, 2026-08-24, round 6)', () => {
@@ -201,10 +241,11 @@ describe('removeLocalMcpConfig', () => {
     assert.deepEqual(parsed, { mcpServers: {} });
   });
 
-  it('does NOT delete an entry that matches the URL but lacks the ownership marker (a foreign entry someone else pointed at the same port coincidentally)', () => {
+  it('does NOT delete an entry that matches the URL but has no matching sidecar record (a foreign entry someone else pointed at the same port coincidentally)', () => {
     // Belt-and-suspenders: even an exact URL match isn't enough by itself
     // (Codex review, 2026-08-24, round 7's reasoning applied symmetrically
-    // to the remove path) -- require the marker too.
+    // to the remove path, now via the sidecar instead of an in-entry
+    // marker) -- require a sidecar record too.
     writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' } } }));
     removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', false);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
