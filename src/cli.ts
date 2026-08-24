@@ -102,6 +102,9 @@ function printHelp(): void {
       '                         interactively from `yolo-bridge workspaces`.',
       '    [--label <name>]     Operator-facing host label (reported to the workspace).',
       '    [--agent <binary>]   Local coding-agent binary to spawn (default: $YOLOBRIDGE_AGENT_BIN or "claude").',
+      '    [--agent-id <id>]    Registry identity for local MCP access, if different from --agent',
+      '                         (e.g. a raw executable path, or an agent whose binary name differs',
+      '                         from its registry id like qwen-code/qwen). Defaults to --agent.',
       '  detach                 Detach the current workspace attachment.',
       '  status                 Print local login/attach state.',
       '  --help                 Print this help.',
@@ -126,6 +129,7 @@ export interface AttachArgs {
   workspaceId?: string;
   hostLabel?: string;
   agentBin?: string;
+  agentId?: string;
 }
 
 export interface AttachArgsError {
@@ -134,26 +138,41 @@ export interface AttachArgsError {
 
 /**
  * Parses `attach`'s argv into its recognized `--label <name>` / `--agent
- * <binary>` flag pairs plus a leftover positional workspaceId — consuming
- * each flag's value together with the flag itself *before* deciding what's
- * left over for the positional, so e.g. `attach --label laptop` doesn't
- * mistake "laptop" for a workspace id (it should still fall through to the
- * interactive picker). An unrecognized `--something` is a hard error rather
- * than being silently swallowed as some other flag's value.
+ * <binary>` / `--agent-id <registryId>` flag pairs plus a leftover
+ * positional workspaceId — consuming each flag's value together with the
+ * flag itself *before* deciding what's left over for the positional, so
+ * e.g. `attach --label laptop` doesn't mistake "laptop" for a workspace id
+ * (it should still fall through to the interactive picker). An unrecognized
+ * `--something` is a hard error rather than being silently swallowed as
+ * some other flag's value.
+ *
+ * `--agent-id` exists because `--agent` names the literal spawn command
+ * (whatever `startLocalAgent` execs), which is NOT always the same string
+ * as the mint route's registry `agentId` (Codex review, 2026-08-24, round
+ * 4/5): a raw executable path (`--agent /opt/bin/claude`) 400s as
+ * unregistered, and some registered agents' own binary differs from their
+ * registry id (`qwen-code`'s binary is `qwen`, `kiro`'s is `kiro-cli`).
+ * yolobridge has no local copy of `agents.json` to resolve this itself (it
+ * runs on the operator's own machine, not in a pod) — asserting it
+ * explicitly is the honest fix, not guessing. Defaults to `agentBin` when
+ * omitted, which is correct for every agent whose registry id equals its
+ * binary name (the common case: `claude`, `codex`, ...).
  */
 export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
   let workspaceId: string | undefined;
   let hostLabel: string | undefined;
   let agentBin: string | undefined;
+  let agentId: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--label' || a === '--agent') {
+    if (a === '--label' || a === '--agent' || a === '--agent-id') {
       const value = args[i + 1];
       if (value === undefined || value.startsWith('--')) {
         return { error: `${a} requires a value` };
       }
       if (a === '--label') hostLabel = value;
-      else agentBin = value;
+      else if (a === '--agent') agentBin = value;
+      else agentId = value;
       i++;
       continue;
     }
@@ -164,7 +183,7 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
       workspaceId = a;
     }
   }
-  return { workspaceId, hostLabel, agentBin };
+  return { workspaceId, hostLabel, agentBin, agentId };
 }
 
 async function cmdAttach(args: string[]): Promise<number> {
@@ -180,12 +199,18 @@ async function cmdAttach(args: string[]): Promise<number> {
   const parsed = parseAttachArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`yolo-bridge attach: ${parsed.error}\n`);
-    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>]\n');
+    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>]\n');
     return 64;
   }
   let workspaceId = parsed.workspaceId;
   const hostLabel = parsed.hostLabel;
   const agentBin = parsed.agentBin;
+  // The mint route's registry identity, NOT necessarily the same string as
+  // the spawn command above (see parseAttachArgs's doc comment). Falls back
+  // to agentBin (then DEFAULT_AGENT_BIN) for the common case where they
+  // match, which is every built-in agent this daemon has been used with so
+  // far (claude, codex).
+  const resolvedAgentId = parsed.agentId ?? agentBin ?? DEFAULT_AGENT_BIN;
   if (workspaceId) {
     const resolved = await resolveWorkspaceIdOrName(workspaceId, { commonApiBaseUrl: apiUrl() });
     if (!resolved.ok) {
@@ -214,7 +239,7 @@ async function cmdAttach(args: string[]): Promise<number> {
           process.stderr.write(`yolo-bridge attach: ${pick.message}\n`);
           break;
       }
-      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>]\n');
+      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>]\n');
       return 64;
     }
     workspaceId = pick.workspaceId;
@@ -264,7 +289,7 @@ async function cmdAttach(args: string[]): Promise<number> {
           apiUrl: apiUrl(),
           getAccessToken,
           workspaceId,
-          agentId: agentBin ?? DEFAULT_AGENT_BIN,
+          agentId: resolvedAgentId,
           log: (line) => process.stdout.write(`${line}\n`),
         });
         // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
