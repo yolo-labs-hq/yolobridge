@@ -58,6 +58,10 @@ function sidecarPath(): string {
   return join(dir, '.yolobridge-mcp-state.json');
 }
 
+function lockPath(): string {
+  return join(dir, '.yolobridge-mcp-state.json.lock');
+}
+
 describe('writeLocalMcpConfig', () => {
   it('refuses to write when .mcp.json would NOT be git-ignored inside a real repo (Codex review, 2026-08-24, round 16)', () => {
     // Round 12 already moved the SECRET out of this file, but the entry
@@ -409,6 +413,45 @@ describe('writeLocalMcpConfig', () => {
   });
 });
 
+describe('cross-process config lock (Codex review, 2026-08-24, round 20)', () => {
+  it('reclaims a STALE lock (its recorded holder pid confirmed dead) and still succeeds, rather than blocking forever', () => {
+    // Simulates a prior `attach` invocation that crashed while holding the
+    // lock -- a genuinely dead pid, not a fake number (see spawnAndExit's
+    // own doc comment for why this test process's own pid wouldn't do).
+    writeFileSync(lockPath(), String(spawnAndExit()));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
+    assert.equal(existsSync(lockPath()), false, 'the lock must not be left behind after a successful write');
+  });
+
+  it('refuses (ok:false) without touching .mcp.json when the lock is held by a confirmed-LIVE pid, instead of racing a concurrent sibling write', () => {
+    // The two-process race this lock exists to close (Codex review,
+    // 2026-08-24, round 20): two `attach` invocations starting in the same
+    // directory before either had written a sidecar could both pass the
+    // ownership checks and then overwrite each other's .mcp.json entry.
+    // This test process's own pid is, trivially, alive -- standing in for
+    // a genuinely concurrent sibling holding the lock right now.
+    writeFileSync(lockPath(), String(process.pid));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    assert.equal(existsSync(mcpJsonPath()), false, 'must not have written .mcp.json while the lock was held by a live process');
+  });
+
+  it('releases its own lock after a successful write, so a later call is never blocked by a self-inflicted stale lock', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(existsSync(lockPath()), false, 'the lock must not outlive the call that took it');
+    // A genuinely dead pid (not this still-running test process's own --
+    // see spawnAndExit's doc comment) so the SECOND call's outcome turns on
+    // the lock alone, not round 19's separate liveness-of-the-PRIOR-ATTACH
+    // check.
+    const sidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
+    sidecar.pid = spawnAndExit();
+    writeFileSync(sidecarPath(), JSON.stringify(sidecar));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    assert.equal(result.ok, true, 'a second call must not be blocked by a lock the first call already released');
+  });
+});
+
 describe('removeLocalMcpConfig', () => {
   it('deletes the file entirely if we created it from scratch (no other content), and clears the sidecar', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
@@ -538,5 +581,13 @@ describe('removeLocalMcpConfig', () => {
     removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.ok(parsed.mcpServers['yolo-studio'], "the operator's addition must survive, not be deleted");
+  });
+
+  it('leaves .mcp.json completely untouched when the lock is held by a confirmed-LIVE pid (Codex review, 2026-08-24, round 20)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const before = readFileSync(mcpJsonPath(), 'utf-8');
+    writeFileSync(lockPath(), String(process.pid));
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
+    assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), before, 'must be untouched while a live process holds the lock');
   });
 });

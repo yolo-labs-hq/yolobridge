@@ -445,29 +445,105 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
  * cache's own `REFRESH_BUFFER_MS`-driven expiry eventually caught up on
  * its own, not on the first sign of trouble.
  */
+function isUnauthorizedResponseItem(response: any): boolean {
+  const content = response?.result?.content;
+  if (!Array.isArray(content)) return false;
+  for (const item of content) {
+    if (typeof item?.text !== 'string') continue;
+    try {
+      const inner = JSON.parse(item.text);
+      if (inner?.code === 'UNAUTHORIZED') return true;
+    } catch {
+      // item.text wasn't JSON -- not this error shape, keep checking other
+      // content items rather than guessing from a substring match (a
+      // legitimate tool result could coincidentally contain the word).
+    }
+  }
+  return false;
+}
+
 function isUnauthorizedToolResult(text: string): boolean {
   try {
     const parsed = JSON.parse(text);
     const responses = Array.isArray(parsed) ? parsed : [parsed];
-    for (const response of responses) {
-      const content = response?.result?.content;
-      if (!Array.isArray(content)) continue;
-      for (const item of content) {
-        if (typeof item?.text !== 'string') continue;
-        try {
-          const inner = JSON.parse(item.text);
-          if (inner?.code === 'UNAUTHORIZED') return true;
-        } catch {
-          // item.text wasn't JSON -- not this error shape, keep checking
-          // other content items rather than guessing from a substring match
-          // (a legitimate tool result could coincidentally contain the word).
-        }
-      }
-    }
+    return responses.some(isUnauthorizedResponseItem);
   } catch {
     // Top-level body wasn't JSON at all -- not this error shape.
+    return false;
   }
-  return false;
+}
+
+/**
+ * Picks out only the batch elements that need a retry, instead of replaying
+ * the WHOLE original batch (Codex review, 2026-08-24, round 20): a JSON-RPC
+ * batch with a short-lived token can come back 200-with-mixed-results --
+ * some calls already succeeded, one or more failed in-band UNAUTHORIZED
+ * because the token expired partway through. The previous retry resent the
+ * entire original body, including the already-successful calls; many MCP
+ * tools are not idempotent, so a mutating call earlier in the batch would
+ * execute a SECOND time. Matches request/response pairs by JSON-RPC `id`
+ * (batch elements needing a response always carry one; bare notifications
+ * never appear in the response array either, so they're naturally excluded
+ * from both sides).
+ *
+ * Returns `null` when there's nothing to partition -- a non-batch request,
+ * an unparseable/non-array response, or a batch where nothing came back
+ * UNAUTHORIZED -- so the caller falls back to its existing whole-body retry,
+ * which is already correct and minimal for a single (non-batch) request.
+ */
+function buildUnauthorizedRetryBatch(
+  requestBody: string,
+  responseText: string,
+): { requestSubset: string; ids: Set<string | number> } | null {
+  let requestParsed: any;
+  let responseParsed: any;
+  try {
+    requestParsed = JSON.parse(requestBody);
+    responseParsed = JSON.parse(responseText);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(requestParsed) || !Array.isArray(responseParsed)) return null;
+
+  const unauthorizedIds = new Set<string | number>();
+  for (const response of responseParsed) {
+    if (response?.id === undefined || response?.id === null) continue;
+    if (isUnauthorizedResponseItem(response)) unauthorizedIds.add(response.id);
+  }
+  if (unauthorizedIds.size === 0) return null;
+
+  const requestSubset = requestParsed.filter((msg: any) => msg?.id !== undefined && msg?.id !== null && unauthorizedIds.has(msg.id));
+  if (requestSubset.length === 0) return null;
+
+  return { requestSubset: JSON.stringify(requestSubset), ids: unauthorizedIds };
+}
+
+/**
+ * Splices a retried subset's responses back into their original positions
+ * in the first attempt's batch response, leaving every already-successful
+ * element exactly as it came back the first time. Falls back to the ORIGINAL
+ * response text on any parse failure -- this only ever runs after a retry
+ * that itself only fires for a confirmed-parseable batch (`buildUnauthorized
+ * RetryBatch` already validated both shapes), so a failure here means
+ * something unexpected changed between the two parses; discarding the
+ * (already-good) first response in that case would be strictly worse than
+ * keeping it.
+ */
+function mergeRetryResponses(originalResponseText: string, retryResponseText: string, retriedIds: Set<string | number>): string {
+  try {
+    const original = JSON.parse(originalResponseText);
+    if (!Array.isArray(original)) return originalResponseText;
+    const retryParsed = JSON.parse(retryResponseText);
+    const retryArray = Array.isArray(retryParsed) ? retryParsed : [retryParsed];
+    const retryById = new Map<string | number, any>();
+    for (const r of retryArray) {
+      if (r?.id !== undefined && r?.id !== null) retryById.set(r.id, r);
+    }
+    const merged = original.map((r: any) => (r?.id !== undefined && retriedIds.has(r.id) && retryById.has(r.id) ? retryById.get(r.id) : r));
+    return JSON.stringify(merged);
+  } catch {
+    return originalResponseText;
+  }
 }
 
 async function forwardOnce(
@@ -541,8 +617,21 @@ async function handleRequest(
     log(`yolo-bridge: MCP upstream reported an invalid/expired token (status ${result.status}), force-refreshing`);
     try {
       const refreshed = await forceRefresh();
-      const reinjected = injectToken(body, refreshed);
-      result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
+      // A transport-level 401 means nothing in the request was ever applied
+      // (the upstream rejected it before running any tool), so retrying the
+      // whole original body is correct and minimal there. Only an in-band
+      // 200-with-mixed-results batch (Codex review, 2026-08-24, round 20)
+      // needs the narrower partial-batch retry below -- see
+      // `buildUnauthorizedRetryBatch`'s doc comment.
+      const retryBatch = result.status === 401 ? null : buildUnauthorizedRetryBatch(body, result.text);
+      if (retryBatch) {
+        const reinjected = injectToken(retryBatch.requestSubset, refreshed);
+        const retryResult = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
+        result = { ...retryResult, text: mergeRetryResponses(result.text, retryResult.text, retryBatch.ids) };
+      } else {
+        const reinjected = injectToken(body, refreshed);
+        result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
+      }
     } catch (err) {
       log(`yolo-bridge: MCP token refresh failed: ${err instanceof Error ? err.message : String(err)}`);
     }

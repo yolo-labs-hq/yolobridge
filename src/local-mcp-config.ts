@@ -31,7 +31,7 @@
  * a hard failure.
  */
 
-import { readFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
 import { atomicWriteFileSync } from './atomic-write.js';
@@ -162,6 +162,74 @@ function isPidAlive(pid: number): boolean {
     return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function lockPath(cwd: string): string {
+  return sidecarPath(cwd) + '.lock';
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Acquires an exclusive, CROSS-PROCESS lock over the read-check-write
+ * sequence in `writeLocalMcpConfig`/`removeLocalMcpConfig` (Codex review,
+ * 2026-08-24, round 20): two `attach` invocations starting in the same
+ * directory before either had written a sidecar could both observe "no
+ * existing entry," both pass every check in `writeLocalMcpConfig`, and then
+ * race to write — whichever process's `.mcp.json` write lands LAST wins,
+ * silently stranding the other's sidecar/proxy pairing (its proxy is still
+ * listening at a URL nothing in `.mcp.json` points to any more, and its
+ * later `removeLocalMcpConfig` could delete the entry out from under the
+ * survivor). An exclusive-create (`wx`) lock file makes the whole
+ * read-check-write section atomic across processes, not just within one.
+ *
+ * A stale lock (its own writer crashed mid-section) is reclaimed the same
+ * way a stale sidecar entry is (round 19): the lock file records the
+ * writer's pid, and a lock whose recorded pid is confirmed DEAD is deleted
+ * and retried immediately, rather than blocking every future attach in
+ * this directory forever. Gives up after a bounded wait — a genuinely live
+ * holder releases in low milliseconds, this isn't a long-held lock — and
+ * returns `null`, which callers treat as their existing degraded `ok:
+ * false`, never a hard failure/throw.
+ */
+function acquireConfigLock(cwd: string): (() => void) | null {
+  const path = lockPath(cwd);
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try {
+      writeFileSync(path, String(process.pid), { flag: 'wx' });
+      return () => {
+        try {
+          unlinkSync(path);
+        } catch {
+          // Already gone (or replaced by a stale-lock reclaim elsewhere) —
+          // nothing left for us to clean up either way.
+        }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null;
+      let holderPid: number | undefined;
+      try {
+        holderPid = Number(readFileSync(path, 'utf-8'));
+      } catch {
+        // Lock file vanished between our failed create and this read —
+        // another process's release raced us; loop around and retry.
+        continue;
+      }
+      if (Number.isInteger(holderPid) && !isPidAlive(holderPid)) {
+        try {
+          unlinkSync(path);
+        } catch {
+          // Raced with the holder's own (late) release — fine, loop retries.
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) return null;
+      sleepSync(20);
+    }
   }
 }
 
@@ -315,6 +383,19 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   if (riskyToCommit(cwd, path) || riskyToCommit(cwd, sidecarPath(cwd))) {
     return { ok: false, createdFile: false };
   }
+  // Serializes the whole read-check-write sequence below across PROCESSES,
+  // not just within one (Codex review, 2026-08-24, round 20) — see
+  // `acquireConfigLock`'s doc comment for the race this closes.
+  const releaseLock = acquireConfigLock(cwd);
+  if (!releaseLock) return { ok: false, createdFile: false };
+  try {
+    return writeLocalMcpConfigLocked(cwd, proxyUrl, path);
+  } finally {
+    releaseLock();
+  }
+}
+
+function writeLocalMcpConfigLocked(cwd: string, proxyUrl: string, path: string): McpConfigWriteResult {
   const createdFile = !existsSync(path);
   let config: Record<string, unknown>;
   try {
@@ -442,6 +523,22 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
  * overwrote the sidecar with ITS OWN newer URL is never clobbered here.
  */
 export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, createdFile: boolean): void {
+  // Same cross-process lock `writeLocalMcpConfig` takes (Codex review,
+  // 2026-08-24, round 20) — a concurrent attach's read-check-write could
+  // otherwise interleave with this read-modify-write of the same file. A
+  // lock we can't acquire degrades to leaving the file untouched, same as
+  // every other refusal path below: a missed cleanup is recoverable, an
+  // interleaved write that corrupts a sibling's entry is not.
+  const releaseLock = acquireConfigLock(cwd);
+  if (!releaseLock) return;
+  try {
+    removeLocalMcpConfigLocked(cwd, expectedProxyUrl, createdFile);
+  } finally {
+    releaseLock();
+  }
+}
+
+function removeLocalMcpConfigLocked(cwd: string, expectedProxyUrl: string, createdFile: boolean): void {
   const path = mcpJsonPath(cwd);
   if (!existsSync(path)) {
     if (readSidecar(cwd).proxyUrl === expectedProxyUrl) deleteSidecar(cwd);

@@ -304,6 +304,61 @@ describe('startMcpProxy', () => {
     assert.equal(forwardCount, 2, 'initial forward (in-band UNAUTHORIZED in a batch) + one retry');
   });
 
+  it('retries ONLY the unauthorized element of a mixed-result BATCH, never replaying an already-successful mutating call (Codex review, 2026-08-24, round 20)', async () => {
+    // The previous fix (round 16, the test above) made the force-refresh
+    // FIRE for a batch -- but it still resent the WHOLE original batch,
+    // including any element that already succeeded. Many MCP tools are not
+    // idempotent, so a mutating call earlier in the batch (id 1 here) would
+    // execute a SECOND time purely because a LATER element (id 2) happened
+    // to hit an expired token. This proves id 1 is never resent to the
+    // upstream at all -- `mutateCount` would be 2 if it were.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    let mutateCount = 0;
+    const forwardedIds: number[][] = [];
+    const fetchImpl = makeFetch({
+      mintToken: () => { mintCount++; return mintResponse(`tok-${mintCount}`); },
+      upstream: (init) => {
+        forwardCount++;
+        const bodyArr = JSON.parse(init.body);
+        forwardedIds.push(bodyArr.map((m: any) => m.id));
+        const responses = bodyArr.map((msg: any) => {
+          const usedToken = msg.params.arguments._delegatedToken;
+          if (msg.id === 1) {
+            mutateCount++;
+            return { jsonrpc: '2.0', id: 1, result: { mutated: mutateCount, usedToken } };
+          }
+          if (usedToken === 'tok-1') {
+            return { jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: JSON.stringify({ error: 'Invalid delegated token', code: 'UNAUTHORIZED' }) }] } };
+          }
+          return { jsonrpc: '2.0', id: 2, result: { usedToken } };
+        });
+        return new Response(JSON.stringify(responses), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'update_tile_status', arguments: {} } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } },
+      ]),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as any[];
+    assert.equal(mintCount, 2, 'initial mint + one force-refresh');
+    assert.equal(forwardCount, 2, 'initial forward + one PARTIAL retry');
+    assert.deepEqual(forwardedIds, [[1, 2], [2]], 'the retry must resend ONLY the unauthorized element (id 2), not the whole original batch');
+    assert.equal(mutateCount, 1, 'the mutating call (id 1) must never be sent to the upstream a second time');
+    assert.deepEqual(body.find((r) => r.id === 1).result, { mutated: 1, usedToken: 'tok-1' }, "id 1's first, already-successful response must survive untouched in the merged output");
+    assert.equal(body.find((r) => r.id === 2).result.usedToken, 'tok-2', "id 2's retried response must be the one returned to the caller");
+  });
+
   it('does NOT retry on a real tool error that happens to be HTTP 200 but is not UNAUTHORIZED (e.g. a legitimate FORBIDDEN scope error)', async () => {
     // The fix above must be specific to UNAUTHORIZED -- retrying a
     // FORBIDDEN (correctly-enforced, not-in-scope) call would just waste a
