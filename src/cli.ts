@@ -258,7 +258,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   const spawnCwd = process.cwd();
   let mcpProxyHandle: McpProxyHandle | undefined;
   let mcpConfigCleanup: { expectedProxyUrl: string; createdFile: boolean } | undefined;
-  let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean } | undefined;
+  let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean; attachId?: string } | undefined;
 
   const result = await runAttachFromDisk({
     workspaceId,
@@ -333,6 +333,7 @@ async function cmdAttach(args: string[]): Promise<number> {
                 removeServerEntry: trustResult.addedServerEntry,
                 removePermissionEntry: trustResult.addedPermissionEntry,
                 createdFile: trustResult.createdFile,
+                attachId: trustResult.attachId,
               };
             }
           }

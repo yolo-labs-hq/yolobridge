@@ -70,14 +70,26 @@ function readConfig(path: string): Record<string, unknown> {
  */
 const OWNERSHIP_MARKER = '_yolobridge';
 
+/** Matches ONLY the exact URL shape this module itself ever generates. */
+const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
+
 /**
- * True if an existing `yolo-studio` entry carries `OWNERSHIP_MARKER` — i.e.
- * THIS module wrote it (in some earlier, possibly uncleanly-terminated,
- * attach), not the operator by hand.
+ * True if an existing `yolo-studio` entry carries `OWNERSHIP_MARKER` AND
+ * still has the exact shape this module writes — `type: 'http'` and a
+ * loopback `url`. BOTH signals are required (Codex review, 2026-08-24,
+ * round 8): the marker alone isn't enough, because an operator can edit
+ * the entry's VALUE (point it somewhere else entirely) WHILE an attachment
+ * is still running, without knowing to also strip the marker they don't
+ * know exists — a marker-only check would then have the NEXT attach
+ * overwrite that intentional edit as though it were stale daemon state.
+ * Requiring the shape to STILL look loopback-generated closes that gap:
+ * an edited entry no longer matches, so it's correctly left alone even
+ * with a stale marker attached.
  */
 function looksLikeOurOwnEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  return (value as Record<string, unknown>)[OWNERSHIP_MARKER] === true;
+  const v = value as Record<string, unknown>;
+  return v[OWNERSHIP_MARKER] === true && v.type === 'http' && typeof v.url === 'string' && OWN_ENTRY_URL_PATTERN.test(v.url);
 }
 
 export interface McpConfigWriteResult {

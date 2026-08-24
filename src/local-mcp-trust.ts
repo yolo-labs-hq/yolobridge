@@ -37,6 +37,7 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 /** Same identity as local-mcp-config.ts's SERVER_NAME -- kept as an
  *  independent constant (not imported) since these two modules are meant to
@@ -92,6 +93,20 @@ function asStringArray(value: unknown): string[] {
 const OWNERSHIP_MARKER = '_yolobridge';
 
 interface OwnershipMarker {
+  /** Random per-`writeLocalMcpTrust`-call id (Codex review, 2026-08-24,
+   *  round 8) -- lets `removeLocalMcpTrust` verify the marker currently on
+   *  disk is still the EXACT one THIS attach wrote, not just "some marker
+   *  claiming these booleans." Without this, two gaps existed: (1) an
+   *  operator editing/removing the marker mid-session (while keeping the
+   *  grants, meaning "I want to keep trusting this") would still have
+   *  cleanup blindly act on booleans decided at attach time, deleting
+   *  grants the operator just said to keep; (2) two attaches concurrently
+   *  running against the same directory could each overwrite the other's
+   *  marker, so whichever detaches first could delete grants the other
+   *  attach's session still depends on. Requiring an exact id match at
+   *  cleanup time makes both cases fail closed (refuse to touch anything)
+   *  instead of destroying state that isn't provably this attach's own. */
+  attachId?: string;
   enabledServerEntry?: boolean;
   permissionEntry?: boolean;
 }
@@ -116,6 +131,10 @@ export interface McpTrustWriteResult {
    *  looks identical, once our entries are removed, to one this module
    *  created from scratch. */
   createdFile: boolean;
+  /** Pass this straight through to `removeLocalMcpTrust`'s `opts.attachId`
+   *  unchanged (Codex review, 2026-08-24, round 8) -- undefined when
+   *  `ok: false` (nothing was written, nothing to reclaim later). */
+  attachId?: string;
 }
 
 /**
@@ -177,11 +196,12 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   permissionsObj.allow = [...allow];
   settings.permissions = permissionsObj;
 
-  settings[OWNERSHIP_MARKER] = { enabledServerEntry: addedServerEntry, permissionEntry: addedPermissionEntry } satisfies OwnershipMarker;
+  const attachId = randomUUID();
+  settings[OWNERSHIP_MARKER] = { attachId, enabledServerEntry: addedServerEntry, permissionEntry: addedPermissionEntry } satisfies OwnershipMarker;
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
-  return { ok: true, addedServerEntry, addedPermissionEntry, createdFile };
+  return { ok: true, addedServerEntry, addedPermissionEntry, createdFile, attachId };
 }
 
 /**
@@ -196,10 +216,22 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
  * `{}` looks identical once our entries are removed); a file with other
  * content, or one that already existed before this attach touched it, is
  * left in place, minus just what this attach added.
+ *
+ * `opts.attachId` (from that same `writeLocalMcpTrust` call) must EXACTLY
+ * match the marker CURRENTLY on disk, re-read here, before anything is
+ * touched (Codex review, 2026-08-24, round 8) -- decisions captured at
+ * write time can go stale by the time cleanup actually runs: the operator
+ * may have edited or removed the marker mid-session (a signal to leave
+ * their grants alone, not something a blind boolean-driven delete should
+ * override), or a second concurrent attach in the same directory may have
+ * overwritten it with its own. A mismatched or missing marker means this
+ * attach can no longer prove the current state is provably its own, so it
+ * fails closed and leaves everything untouched rather than risk deleting
+ * something it doesn't actually own anymore.
  */
 export function removeLocalMcpTrust(
   cwd: string,
-  opts: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean },
+  opts: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean; attachId?: string },
 ): void {
   const path = settingsPath(cwd);
   if (!existsSync(path)) return;
@@ -209,6 +241,14 @@ export function removeLocalMcpTrust(
   } catch {
     return;
   }
+
+  const currentMarker = readOwnershipMarker(settings);
+  const stillOurs = opts.attachId !== undefined && currentMarker.attachId === opts.attachId;
+  // A mismatched/missing marker means this call can no longer prove the
+  // current state is provably its own (edited/removed mid-session, or
+  // clobbered by a concurrent attach) -- touch NOTHING, not even a
+  // reformatting rewrite of otherwise-unchanged content.
+  if (!stillOurs) return;
 
   if (opts.removeServerEntry) {
     const enabled = asStringArray(settings.enabledMcpjsonServers).filter((s) => s !== SERVER_NAME);

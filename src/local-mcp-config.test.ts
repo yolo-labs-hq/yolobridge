@@ -73,6 +73,20 @@ describe('writeLocalMcpConfig', () => {
     assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true });
   });
 
+  it("does NOT reclaim an entry that still carries the marker but was EDITED to point somewhere non-loopback while an attachment was running (Codex review, 2026-08-24, round 8)", () => {
+    // The operator changed the URL to their own real server while attach
+    // #1 was still running, without knowing to also strip the marker they
+    // don't know exists. A marker-only check would have the NEXT attach
+    // overwrite that intentional edit as though it were stale daemon
+    // state -- requiring the shape to STILL look loopback-generated closes
+    // that gap.
+    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'https://my-own-real-server.example.com/mcp', _yolobridge: true } } }));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].url, 'https://my-own-real-server.example.com/mcp', "the operator's edit must be left exactly as it was");
+  });
+
   it('returns ok:false and does not overwrite a pre-existing file that is not valid JSON', () => {
     writeFileSync(mcpJsonPath(), 'not json{{{');
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
