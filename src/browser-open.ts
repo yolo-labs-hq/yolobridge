@@ -11,18 +11,39 @@
  * automatically, no separate code path needed.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn as realSpawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 
-export function openBrowserBestEffort(url: string): void {
+/** Narrowed to what this module actually calls — injectable so a test can
+ * force a real async `error` event (e.g. spawning a binary that doesn't
+ * exist) without depending on the test environment's actual opener binaries
+ * being present or absent. */
+export type SpawnImpl = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+
+export function openBrowserBestEffort(url: string, spawnImpl: SpawnImpl = realSpawn): void {
   try {
     const platform = process.platform;
+    let child: ChildProcess;
     if (platform === 'darwin') {
-      spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
+      child = spawnImpl('open', [url], { stdio: 'ignore', detached: true });
     } else if (platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, shell: true }).unref();
+      child = spawnImpl('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, shell: true });
     } else {
-      spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+      child = spawnImpl('xdg-open', [url], { stdio: 'ignore', detached: true });
     }
+    // Codex review (2026-08-23, fourth pass): a missing opener binary (no
+    // `xdg-open` on a minimal/headless Linux box, the common case this
+    // helper is meant to degrade gracefully on) doesn't throw SYNCHRONOUSLY
+    // — spawn() returns a child and emits `error` (e.g. ENOENT) on a later
+    // tick, which this surrounding try/catch cannot catch. An EventEmitter
+    // `error` event with no listener throws and crashes the process, so
+    // login was crashing instead of degrading to "copy this URL" as
+    // intended. Register the listener BEFORE unref() so it's in place for
+    // that later tick.
+    child.on('error', () => {
+      // Best-effort only — the caller always prints the URL, so a failed
+      // spawn (no DISPLAY, missing xdg-open, headless box) is a non-event.
+    });
+    child.unref();
   } catch {
     // Best-effort only — the caller always prints the URL, so a failed
     // spawn (no DISPLAY, missing xdg-open, headless box) is a non-event.

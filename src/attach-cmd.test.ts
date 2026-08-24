@@ -42,6 +42,20 @@ function neverEndingSseStreamResponse(text: string): Response {
   return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
 }
 
+/** Like sseStreamResponse but enqueues each byte chunk SEPARATELY instead of
+ * as one blob — lets a test control exactly where the network "cuts" the
+ * stream, including deliberately mid-multibyte-character, which a single
+ * enqueue() can never reproduce. */
+function sseStreamResponseChunked(chunks: Uint8Array[]): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
@@ -129,6 +143,59 @@ describe('runAttachDaemon', () => {
     assert.equal(loadAttachment(ENV, io), undefined, 'attachment record should be cleared after server-initiated detach');
     assert.ok(requests.some((r) => r.startsWith('POST') && r.includes('/yolobridge/attach')));
     assert.ok(requests.some((r) => r.includes('/yolobridge/stream?attachmentId=a1')));
+  });
+
+  it('reassembles a multibyte UTF-8 character split across a network chunk boundary (Codex review, 2026-08-23)', async () => {
+    // Regression guard: `chunk.toString('utf-8')` per chunk (the pre-fix
+    // code) decodes each network chunk in isolation. If a multibyte UTF-8
+    // character straddles a chunk boundary, each half decodes independently
+    // to a replacement character (U+FFFD) on its own, corrupting the prompt
+    // before it ever reaches JSON.parse. StringDecoder carries incomplete
+    // trailing bytes over to the next write() call instead.
+    const full =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: prompt\ndata: {"attachmentId":"a1","prompt":"say \u{1F680} now"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const bytes = new TextEncoder().encode(full);
+    const marker = new TextEncoder().encode('\u{1F680}'); // the 4-byte rocket emoji
+
+    let idx = -1;
+    outer: for (let i = 0; i <= bytes.length - marker.length; i++) {
+      for (let j = 0; j < marker.length; j++) {
+        if (bytes[i + j] !== marker[j]) continue outer;
+      }
+      idx = i;
+      break;
+    }
+    assert.ok(idx >= 0, 'sanity check: the emoji bytes must be findable in the encoded stream');
+    const splitAt = idx + 2; // cut INSIDE the 4-byte sequence, not on its edge
+    const chunk1 = bytes.slice(0, splitAt);
+    const chunk2 = bytes.slice(splitAt);
+
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponseChunked([chunk1, chunk2]);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const delivered: string[] = [];
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      deliverPrompt: async (prompt) => { delivered.push(prompt); },
+      captureOutput: async () => ({ output: 'unused', busy: false }),
+      shouldStop: () => false,
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.deepEqual(delivered, ['say \u{1F680} now']);
   });
 
   it('returns attach-failed without opening a stream when attach itself fails', async () => {

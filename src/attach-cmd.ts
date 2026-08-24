@@ -17,6 +17,7 @@
  */
 
 import { Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import * as readline from 'node:readline';
 import { SseFrameParser } from './sse-frame-parser.js';
 import { actionForFrame } from './frame-actions.js';
@@ -202,6 +203,20 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
         const parser = new SseFrameParser();
         const nodeStream = Readable.fromWeb(res.body as any);
+        // Codex review (2026-08-23, fourth pass): a per-chunk
+        // `chunk.toString('utf-8')` decodes each network chunk in
+        // isolation — if a multibyte UTF-8 character (e.g. in a
+        // non-ASCII prompt) straddles a chunk boundary, each half decodes
+        // independently to a replacement character (U+FFFD), corrupting
+        // the prompt before it ever reaches JSON parsing or the PTY.
+        // `StringDecoder` carries incomplete trailing bytes over to the
+        // next `write()` call, so a split character reassembles correctly
+        // regardless of where the network happened to cut the chunk. Scoped
+        // per-connection (declared here, not outside the `while` loop) —
+        // a new connection can't continue a byte sequence from a previous
+        // one, so fresh decoder state per attempt is correct, matching the
+        // per-connection `parser` right above.
+        const decoder = new StringDecoder('utf-8');
 
         // Bug 1 fix: the server holds this stream open indefinitely
         // (keepalive pings only), so `for await` below never completes on
@@ -221,7 +236,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
         try {
           for await (const chunk of nodeStream) {
-            const text = Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk);
+            const text = Buffer.isBuffer(chunk) ? decoder.write(chunk) : String(chunk);
             for (const frame of parser.push(text)) {
               const action = actionForFrame(frame);
               switch (action.kind) {
