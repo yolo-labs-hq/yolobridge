@@ -101,7 +101,7 @@ describe('removeLocalMcpConfig', () => {
   it('deletes the file entirely if we created it from scratch (no other content)', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.ok(existsSync(mcpJsonPath()));
-    removeLocalMcpConfig(dir);
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.equal(existsSync(mcpJsonPath()), false);
   });
 
@@ -110,25 +110,55 @@ describe('removeLocalMcpConfig', () => {
       mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } },
     }));
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    removeLocalMcpConfig(dir);
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.ok(existsSync(mcpJsonPath()), 'file should survive since it had other content');
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed, { mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } } });
   });
 
   it('is a safe no-op when no .mcp.json exists at all', () => {
-    assert.doesNotThrow(() => removeLocalMcpConfig(dir));
+    assert.doesNotThrow(() => removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp'));
   });
 
   it('leaves an unparseable file alone rather than deleting or rewriting it', () => {
     writeFileSync(mcpJsonPath(), 'not json{{{');
-    removeLocalMcpConfig(dir);
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), 'not json{{{');
   });
 
   it('leaves a file with a non-object JSON root (array/null/scalar) alone too (Codex review, 2026-08-24)', () => {
     writeFileSync(mcpJsonPath(), '[1,2,3]');
-    removeLocalMcpConfig(dir);
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), '[1,2,3]');
+  });
+
+  it('does NOT delete the entry if its value changed since this attachment wrote it (Codex review, 2026-08-24, round 5)', () => {
+    // Simulates a long-running attachment where the operator (or another
+    // `claude mcp add`/hand edit) replaced the yolo-studio entry with
+    // something else entirely in between attach and detach. Blind deletion
+    // keyed only on "did we create this key originally" would destroy that
+    // newer, unrelated edit.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'] = { type: 'stdio', command: 'something-else-entirely' };
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+
+    const after = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.deepEqual(after.mcpServers['yolo-studio'], { type: 'stdio', command: 'something-else-entirely' });
+  });
+
+  it('DOES delete the entry when its value still exactly matches what this attachment wrote', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(existsSync(mcpJsonPath()), false);
+  });
+
+  it('does NOT delete when a DIFFERENT proxy URL is passed than what was actually written (a new attach cycle must not clean up a stale one)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:4123/mcp');
   });
 });

@@ -91,14 +91,23 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
 }
 
 /**
- * Removes exactly the `yolo-studio` entry this module added. If that leaves
- * `.mcp.json` with no `mcpServers` entries and nothing else in the file
- * (i.e. we created it from scratch), deletes the file entirely rather than
- * leaving an empty shell behind. A file that had OTHER content (either other
- * server entries, or other top-level keys) is left in place with just the
- * one entry removed.
+ * Removes exactly the `yolo-studio` entry this module added — but ONLY if
+ * its value still matches exactly what `writeLocalMcpConfig` wrote
+ * (`expectedProxyUrl`, the same one passed to that call) — Codex review,
+ * 2026-08-24, round 5: over a long-running attachment, the operator (or
+ * another `claude mcp add`/hand edit) could replace that entry with
+ * something else entirely; blind deletion keyed only on "did WE create
+ * this key originally" would destroy that newer, unrelated edit too. A
+ * changed value is left completely alone, matching an unparseable file's
+ * treatment — this function only ever removes the EXACT thing it added.
+ *
+ * If that leaves `.mcp.json` with no `mcpServers` entries and nothing else
+ * in the file (i.e. we created it from scratch), deletes the file entirely
+ * rather than leaving an empty shell behind. A file that had OTHER content
+ * (either other server entries, or other top-level keys) is left in place
+ * with just the one entry removed.
  */
-export function removeLocalMcpConfig(cwd: string): void {
+export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string): void {
   const path = mcpJsonPath(cwd);
   if (!existsSync(path)) return;
   let config: Record<string, unknown>;
@@ -109,6 +118,8 @@ export function removeLocalMcpConfig(cwd: string): void {
     return;
   }
   const servers = (config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {}) as Record<string, unknown>;
+  const current = servers[SERVER_NAME] as { type?: unknown; url?: unknown } | undefined;
+  if (!current || current.type !== 'http' || current.url !== expectedProxyUrl) return;
   delete servers[SERVER_NAME];
 
   const hasOtherServers = Object.keys(servers).length > 0;

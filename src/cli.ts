@@ -300,9 +300,16 @@ async function cmdAttach(args: string[]): Promise<number> {
         // binary ever reads (Codex review, 2026-08-24) — the proxy still
         // starts (harmless, agent-agnostic), but only Claude gets it
         // wired in until a Codex-format writer exists.
-        const resolvedAgentBin = agentBin ?? DEFAULT_AGENT_BIN;
-        if (mcpProxyHandle && resolvedAgentBin !== 'claude') {
-          process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for --agent claude (got "${resolvedAgentBin}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
+        //
+        // Keyed on `resolvedAgentId`, NOT `agentBin`/`resolvedAgentBin`
+        // (Codex review, round 5): `--agent-id` exists precisely to assert
+        // "this really is claude" even when spawned via a nonstandard path
+        // or name (`--agent /opt/bin/claude --agent-id claude`) — keying
+        // this decision on the raw spawn string instead would mint
+        // successfully but still skip writing the config a real Claude
+        // Code process would actually read.
+        if (mcpProxyHandle && resolvedAgentId !== 'claude') {
+          process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
         } else if (mcpProxyHandle) {
           wroteMcpConfig = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
           if (!wroteMcpConfig) {
@@ -402,9 +409,14 @@ async function cmdAttach(args: string[]): Promise<number> {
   // Same "nothing left running detached" discipline for the local MCP
   // proxy: stop the server (drops the delegated token from memory) and
   // remove the .mcp.json entry we added, if we added one.
+  const proxyUrlForCleanup = mcpProxyHandle?.url;
   if (mcpProxyHandle) await mcpProxyHandle.stop();
   if (mcpTrustRemoval) removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
-  if (wroteMcpConfig) removeLocalMcpConfig(spawnCwd);
+  // Captured BEFORE stop() above (stop() itself doesn't clear .url, but this
+  // keeps the dependency explicit) -- removeLocalMcpConfig only deletes the
+  // entry if its CURRENT value still matches this exact URL, so a `false`
+  // wroteMcpConfig (nothing to verify against) correctly skips the call.
+  if (wroteMcpConfig && proxyUrlForCleanup) removeLocalMcpConfig(spawnCwd, proxyUrlForCleanup);
 
   if (!result.ok) {
     if (result.reason === 'not-logged-in') {
