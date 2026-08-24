@@ -88,6 +88,16 @@ describe('writeLocalMcpTrust', () => {
     assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false });
     assert.equal(readFileSync(settingsPath(), 'utf-8'), 'not json{{{');
   });
+
+  it('returns ok:false and does not touch a pre-existing file whose JSON root is an array or other non-object (Codex review, 2026-08-24)', () => {
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    for (const content of ['[1,2,3]', 'null', '42', '"a string"']) {
+      writeFileSync(settingsPath(), content);
+      const result = writeLocalMcpTrust(dir);
+      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false }, `expected refusal for root content: ${content}`);
+      assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for root content: ${content}`);
+    }
+  });
 });
 
 describe('removeLocalMcpTrust', () => {
@@ -130,6 +140,13 @@ describe('removeLocalMcpTrust', () => {
     writeFileSync(settingsPath(), 'not json{{{');
     removeLocalMcpTrust(dir, REMOVE_ALL);
     assert.equal(readFileSync(settingsPath(), 'utf-8'), 'not json{{{');
+  });
+
+  it('leaves a file with a non-object JSON root (array/null/scalar) alone too (Codex review, 2026-08-24)', () => {
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), '[1,2,3]');
+    removeLocalMcpTrust(dir, REMOVE_ALL);
+    assert.equal(readFileSync(settingsPath(), 'utf-8'), '[1,2,3]');
   });
 
   it("does NOT revoke trust the operator granted independently before this attach (Codex review, 2026-08-24)", () => {

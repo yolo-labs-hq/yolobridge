@@ -58,12 +58,20 @@ function settingsPath(cwd: string): string {
 
 function readSettings(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    parsed = JSON.parse(readFileSync(path, 'utf-8'));
   } catch {
     throw new Error(`existing ${path} is not valid JSON`);
   }
+  // Same refuse-rather-than-clobber fix as local-mcp-config.ts's
+  // readConfig (Codex review, 2026-08-24) — a JSON array root passed the
+  // old truthy-and-typeof-object check and would have been cast straight
+  // into Record<string, unknown>.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`existing ${path} is not a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function asStringArray(value: unknown): string[] {

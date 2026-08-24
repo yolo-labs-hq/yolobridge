@@ -62,6 +62,13 @@ const REQUESTED_TTL_SECONDS = 300;
 // assumed 300s one — a buffer sized for the default TTL would refresh AFTER
 // this token already expired.
 const REFRESH_BUFFER_MS = 15_000;
+// Bounds the STARTUP mint only (Codex review, 2026-08-24): without this, a
+// stalled scope-discovery or mint fetch would block `startMcpProxy` — and
+// therefore `onAttached` — indefinitely, wedging `startLocalAgent` behind a
+// best-effort enhancement that was supposed to degrade, not hang. Generous
+// for a real round trip (2 sequential requests: scopes, then mint) but
+// bounded; a caller that hits this still gets a working attach without MCP.
+const STARTUP_MINT_TIMEOUT_MS = 15_000;
 
 export type FetchImpl = typeof fetch;
 
@@ -82,6 +89,9 @@ export interface McpProxyOptions {
   agentId: string;
   fetchImpl?: FetchImpl;
   log?: (line: string) => void;
+  /** Overrides `STARTUP_MINT_TIMEOUT_MS` — for tests only (a real caller
+   *  should never need less than the default). */
+  mintTimeoutMs?: number;
 }
 
 export interface McpProxyHandle {
@@ -97,13 +107,41 @@ interface MintResult {
 
 class TokenUnavailableError extends Error {}
 
+/**
+ * Tracks every outgoing fetch this proxy makes (mint, scope discovery, AND
+ * every forwarded `tools/call`) in one `Set<AbortController>`, so `stop()`
+ * (Codex review, 2026-08-24) can abort every in-flight request instead of
+ * `server.close()` silently waiting out a stalled upstream — `cmdAttach`
+ * awaits `stop()` before finishing cleanup, so an un-abortable hung fetch
+ * there would hang the whole detach. `abortAll()` is also how the startup
+ * mint's own timeout (`STARTUP_MINT_TIMEOUT_MS`) is enforced — same
+ * mechanism, just triggered by a timer instead of shutdown.
+ */
+class RequestTracker {
+  private readonly controllers = new Set<AbortController>();
+
+  async fetch(fetchImpl: FetchImpl, url: string, init?: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    try {
+      return await fetchImpl(url, { ...init, signal: controller.signal });
+    } finally {
+      this.controllers.delete(controller);
+    }
+  }
+
+  abortAll(): void {
+    for (const c of this.controllers) c.abort();
+  }
+}
+
 /** Fetches the full universe of valid scope names from the public,
  *  unauthenticated `GET /v1/mcp/scopes` — see this file's header comment
  *  for why the mint request asks for all of them rather than a hardcoded
  *  subset (the mint route itself narrows to what `agentId` is actually
  *  allowed). */
-async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl): Promise<string[]> {
-  const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/scopes`);
+async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl, tracker: RequestTracker): Promise<string[]> {
+  const res = await tracker.fetch(fetchImpl, `${apiUrl.replace(/\/+$/, '')}/v1/mcp/scopes`);
   if (!res.ok) throw new TokenUnavailableError(`scope discovery failed: HTTP ${res.status}`);
   const body = (await res.json()) as any;
   if (!Array.isArray(body?.scopes) || body.scopes.length === 0) {
@@ -121,12 +159,13 @@ function makeTokenCache(
   workspaceId: string,
   agentId: string,
   fetchImpl: FetchImpl,
+  tracker: RequestTracker,
 ) {
   let cached: MintResult | undefined;
 
   async function mint(): Promise<MintResult> {
-    const scopes = await fetchAllScopes(apiUrl, fetchImpl);
-    const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
+    const scopes = await fetchAllScopes(apiUrl, fetchImpl, tracker);
+    const res = await tracker.fetch(fetchImpl, `${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${getAccessToken()}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -176,20 +215,30 @@ function makeTokenCache(
 export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHandle | undefined> {
   const log = opts.log ?? (() => {});
   const fetchImpl = opts.fetchImpl ?? fetch;
+  const tracker = new RequestTracker();
 
-  const tokenCache = makeTokenCache(opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, fetchImpl);
+  const tokenCache = makeTokenCache(opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, fetchImpl, tracker);
 
+  // Bounded (STARTUP_MINT_TIMEOUT_MS): a stalled scope-discovery/mint fetch
+  // must not block `onAttached` from ever reaching `startLocalAgent`
+  // (Codex review, 2026-08-24). `abortAll()` only affects requests in
+  // flight AT the timeout — this timer is cleared as soon as the mint
+  // settles either way, so it can never fire against the running proxy's
+  // later request traffic.
+  const startupTimeout = setTimeout(() => tracker.abortAll(), opts.mintTimeoutMs ?? STARTUP_MINT_TIMEOUT_MS);
   try {
     await tokenCache.getToken();
   } catch (err) {
     log(`yolo-bridge: local MCP access unavailable (${err instanceof Error ? err.message : String(err)}) — continuing without it.`);
     return undefined;
+  } finally {
+    clearTimeout(startupTimeout);
   }
 
   const upstream = mcpUrl().replace(/\/+$/, '');
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, upstream, tokenCache.getToken, tokenCache.forceRefresh, fetchImpl, log).catch((err) => {
+    handleRequest(req, res, upstream, tokenCache.getToken, tokenCache.forceRefresh, fetchImpl, tracker, log).catch((err) => {
       log(`yolo-bridge: local MCP proxy error: ${err instanceof Error ? err.message : String(err)}`);
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -214,11 +263,23 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
     url,
     stop: () =>
       new Promise<void>((resolve) => {
+        // Two separate reasons server.close() alone could hang (Codex
+        // review, 2026-08-24; `cmdAttach` awaits `stop()` before finishing
+        // its own cleanup, so either one hangs the whole detach):
+        // 1. A stalled/slow fetch to `upstream` — abortAll() rejects it,
+        //    which lets handleRequest's own catch send a response and end
+        //    the local connection.
+        // 2. Node's http server keeps a client's underlying socket open
+        //    for keep-alive by default; close() only waits for connections
+        //    to end NATURALLY (it does not itself close idle ones), so a
+        //    client that doesn't proactively close its socket (real MCP
+        //    clients keep HTTP connections alive) would otherwise still
+        //    hang close() even after (1) ends the in-flight request/response.
+        //    closeAllConnections() (Node >=18.2, this package requires
+        //    >=20) force-closes every connection immediately.
+        tracker.abortAll();
         server.close(() => resolve());
-        // close() waits for in-flight requests; this proxy has no persistent
-        // connections to worry about (each MCP call is a plain request/response,
-        // confirmed in the design doc — no SSE/session state here), so this
-        // resolves promptly in practice.
+        server.closeAllConnections();
       }),
   };
 }
@@ -304,8 +365,9 @@ async function forwardOnce(
   headers: Record<string, string>,
   body: string | undefined,
   fetchImpl: FetchImpl,
+  tracker: RequestTracker,
 ): Promise<{ status: number; headers: Headers; text: string }> {
-  const res = await fetchImpl(`${upstream}/mcp`, { method, headers, body });
+  const res = await tracker.fetch(fetchImpl, `${upstream}/mcp`, { method, headers, body });
   const text = await res.text();
   return { status: res.status, headers: res.headers, text };
 }
@@ -317,6 +379,7 @@ async function handleRequest(
   getToken: () => Promise<string>,
   forceRefresh: () => Promise<string>,
   fetchImpl: FetchImpl,
+  tracker: RequestTracker,
   log: (line: string) => void,
 ): Promise<void> {
   const method = req.method ?? 'POST';
@@ -340,7 +403,7 @@ async function handleRequest(
     }
   }
 
-  let result = await forwardOnce(upstream, method, headers, forwardedBody, fetchImpl);
+  let result = await forwardOnce(upstream, method, headers, forwardedBody, fetchImpl, tracker);
 
   // Retry once on 401, force-refreshing first — mirrors mcp-proxy.js's own
   // retry shape exactly (containers/services/container-api/mcp-proxy.js:456-460).
@@ -353,7 +416,7 @@ async function handleRequest(
     try {
       const refreshed = await forceRefresh();
       const reinjected = injectToken(body, refreshed);
-      result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl);
+      result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
     } catch (err) {
       log(`yolo-bridge: MCP token refresh failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -68,6 +68,18 @@ describe('writeLocalMcpConfig', () => {
     assert.equal(ok, false);
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), 'not json{{{');
   });
+
+  it('returns false and does not touch a pre-existing file whose JSON root is an array or other non-object (Codex review, 2026-08-24)', () => {
+    // `typeof [] === 'object'` -- a naive `typeof parsed === 'object'` check
+    // (the original bug here) would have cast an array straight into
+    // Record<string, unknown> and silently corrupted it on write.
+    for (const content of ['[1,2,3]', 'null', '42', '"a string"']) {
+      writeFileSync(mcpJsonPath(), content);
+      const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+      assert.equal(ok, false, `expected refusal for root content: ${content}`);
+      assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), content, `file must be untouched for root content: ${content}`);
+    }
+  });
 });
 
 describe('removeLocalMcpConfig', () => {
@@ -97,5 +109,11 @@ describe('removeLocalMcpConfig', () => {
     writeFileSync(mcpJsonPath(), 'not json{{{');
     removeLocalMcpConfig(dir);
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), 'not json{{{');
+  });
+
+  it('leaves a file with a non-object JSON root (array/null/scalar) alone too (Codex review, 2026-08-24)', () => {
+    writeFileSync(mcpJsonPath(), '[1,2,3]');
+    removeLocalMcpConfig(dir);
+    assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), '[1,2,3]');
   });
 });

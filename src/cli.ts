@@ -313,24 +313,43 @@ async function cmdAttach(args: string[]): Promise<number> {
       // this process's own stdout and this process's stdin is piped into
       // the PTY, so the terminal running `attach` is a live view onto the
       // exact session remote prompts land in.
-      startLocalAgent({
-        agentBin,
-        cwd: spawnCwd,
-        onExit: ({ exitCode, signal }) => {
-          localAgentExited = true;
-          stopRequested = true;
-          process.stdout.write(
-            `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
-          );
-          // Fire-and-forget: don't wait on the SSE loop to unwind on its own
-          // (it only re-checks shouldStop() at loop boundaries) to report the
-          // status change — tell the server immediately so the tile flips to
-          // `stopped` right away instead of riding out the heartbeat
-          // staleness window (~90s, Decision Q2). The daemon loop below still
-          // exits promptly too, via `shouldStop`.
-          runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
-        },
-      });
+      //
+      // Deliberately OUTSIDE the MCP-setup try/catch above and in its own
+      // (Codex review, 2026-08-24): an unspawnable agent (missing/
+      // non-executable binary — node-pty's `spawn()` throws synchronously,
+      // ENOENT) must not be swallowed by `runAttachDaemon`'s own
+      // best-effort `onAttached` wrapper, which only logs and continues —
+      // that would leave a live, apparently-connected tile with no PTY,
+      // waiting forever with nothing able to receive a prompt. Mirrors the
+      // real `onExit` handler below: stop + detach immediately rather than
+      // let the daemon loop ride out the full heartbeat-staleness window.
+      try {
+        startLocalAgent({
+          agentBin,
+          cwd: spawnCwd,
+          onExit: ({ exitCode, signal }) => {
+            localAgentExited = true;
+            stopRequested = true;
+            process.stdout.write(
+              `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
+            );
+            // Fire-and-forget: don't wait on the SSE loop to unwind on its own
+            // (it only re-checks shouldStop() at loop boundaries) to report the
+            // status change — tell the server immediately so the tile flips to
+            // `stopped` right away instead of riding out the heartbeat
+            // staleness window (~90s, Decision Q2). The daemon loop below still
+            // exits promptly too, via `shouldStop`.
+            runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+          },
+        });
+      } catch (err) {
+        localAgentExited = true;
+        stopRequested = true;
+        process.stdout.write(
+          `\nyolo-bridge: failed to start the local agent (${err instanceof Error ? err.message : String(err)}), detaching...\n`,
+        );
+        runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+      }
     },
   });
 

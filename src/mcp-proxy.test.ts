@@ -317,4 +317,85 @@ describe('startMcpProxy', () => {
     assert.equal(handle, undefined);
     assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
   });
+
+  it('a startup mint that never resolves is aborted by mintTimeoutMs, returning undefined instead of hanging forever (Codex review, 2026-08-24)', async () => {
+    // A real `fetch` rejects with an AbortError once its signal fires --
+    // this fetchImpl mirrors that instead of just ignoring the signal, so
+    // the test actually proves startMcpProxy's own abort wiring works, not
+    // just that it eventually gives up waiting on its own.
+    const fetchImpl = (async (_url: any, init?: any) => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+    }) as any;
+
+    const logs: string[] = [];
+    const start = Date.now();
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude',
+      fetchImpl, mintTimeoutMs: 20, log: (l) => logs.push(l),
+    });
+    assert.equal(handle, undefined);
+    assert.ok(Date.now() - start < 2000, 'must resolve promptly via the short mintTimeoutMs, not hang');
+    assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
+  });
+
+  it('stop() aborts an in-flight forwarded request instead of waiting for it to finish (Codex review, 2026-08-24)', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardSignal: AbortSignal | undefined;
+    // makeFetch's `upstream` hook returns a Response synchronously; the
+    // forward call here needs to hang until aborted, so this test uses its
+    // own fetchImpl instead of the shared helper.
+    const hangingFetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) return mintResponse('tok-1');
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwardSignal = init?.signal;
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl: hangingFetchImpl, log: () => {},
+    });
+    assert.ok(handle);
+
+    // Fire a tools/call and let it reach the (hanging) forward fetch, but
+    // don't await the response yet.
+    const callPromise = fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    await waitUntil(() => forwardSignal !== undefined);
+    assert.equal(forwardSignal!.aborted, false, 'sanity check: not aborted yet');
+
+    const stopStart = Date.now();
+    await withTimeout(handle!.stop(), 2000, 'stop() while a forward request is in flight');
+    assert.ok(Date.now() - stopStart < 2000, 'stop() must not wait out the hanging upstream request');
+    assert.equal(forwardSignal!.aborted, true, 'stop() must abort the in-flight forwarded request');
+
+    // The client-side fetch settles (with a transport error, since the
+    // server tore down mid-request) rather than hanging forever either.
+    await callPromise.catch(() => undefined);
+  });
 });
+
+async function waitUntil(cond: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitUntil: timed out');
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label}: timed out after ${ms}ms`)), ms)),
+  ]);
+}

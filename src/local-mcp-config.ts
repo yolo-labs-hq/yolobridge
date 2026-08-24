@@ -30,15 +30,27 @@ function mcpJsonPath(cwd: string): string {
 
 function readConfig(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    parsed = JSON.parse(readFileSync(path, 'utf-8'));
   } catch {
     // Malformed existing file — do not clobber it silently by overwriting
     // with a fresh one; treat as unreadable and refuse to touch it (see
     // writeLocalMcpConfig's caller, which logs and skips on `false`).
     throw new Error(`existing ${path} is not valid JSON`);
   }
+  // A valid-JSON, non-object root (an array, or a bare scalar like `null`/
+  // a number/a string) is just as unsafe to treat as `{}` as malformed JSON
+  // is (Codex review, 2026-08-24): `typeof [] === 'object'` passed the old
+  // truthy-and-typeof-object check, so an array root would have been cast
+  // straight into `Record<string, unknown>` — `config.mcpServers = ...`
+  // then silently adds a property onto the operator's array, and the
+  // JSON.stringify write below would replace their original array content
+  // with an object. Same refuse-rather-than-clobber treatment as bad JSON.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`existing ${path} is not a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
 }
 
 /**
