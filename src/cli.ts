@@ -260,200 +260,216 @@ async function cmdAttach(args: string[]): Promise<number> {
   let mcpConfigCleanup: { expectedProxyUrl: string; createdFile: boolean } | undefined;
   let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean; attachId?: string } | undefined;
 
-  const result = await runAttachFromDisk({
-    workspaceId,
-    commonApiBaseUrl: apiUrl(),
-    hostLabel,
-    shouldStop: () => stopRequested,
-    // Fires once the real tileId exists (docs/YOLOBRIDGE_PLAN.md's "Local
-    // MCP access" section) — starts the local MCP proxy and writes
-    // `.mcp.json` BEFORE spawning the local agent, since Claude Code reads
-    // that file at process launch. A proxy-start failure is logged and
-    // skipped, not fatal — MCP access is an enhancement on a tile that
-    // already works without it (send_to_tile/read_tile_output are
-    // unaffected either way).
-    onAttached: async ({ getAccessToken, clearScreen }) => {
-      // Isolated from `startLocalAgent` below on purpose (Codex review,
-      // 2026-08-24): `startMcpProxy` itself never throws, but
-      // `writeLocalMcpConfig`/`writeLocalMcpTrust` do plain synchronous
-      // `fs` writes (e.g. a read-only `spawnCwd` throws EACCES) — without
-      // this try/catch, that exception propagates out of the WHOLE
-      // `onAttached` callback (`runAttachDaemon`'s own best-effort wrapper
-      // only logs it), and `startLocalAgent` — later in this same
-      // callback — never runs. That leaves a daemon holding a live
-      // attachment + SSE stream with no local PTY to ever receive a
-      // prompt. MCP access is an enhancement on a tile that already works
-      // without it; the local agent spawning is not optional.
-      try {
-        mcpProxyHandle = await startMcpProxy({
-          apiUrl: apiUrl(),
-          getAccessToken,
-          workspaceId,
-          agentId: resolvedAgentId,
-          log: (line) => process.stdout.write(`${line}\n`),
-        });
-        // Exported on THIS process's env, before `startLocalAgent` spawns
-        // the local agent below (which inherits it) — the actual secret
-        // never touches `.mcp.json` itself (Codex review, 2026-08-24,
-        // round 12: that file is a `${SECRET_ENV_VAR}` template Claude Code
-        // expands against its own inherited env at load time, since many
-        // repos — including this one's own root — already track a
-        // `.mcp.json`, and a YOLO-mode agent committing/pushing it would
-        // publish a live full-workspace credential). Harmless to set even
-        // when `mcpProxyHandle` ends up unused (e.g. a non-claude agent
-        // below).
-        if (mcpProxyHandle) process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
-        // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
-        // conventions — Codex reads `~/.codex/config.toml`'s
-        // `[mcp_servers.*]` instead (`containers/services/container-api/
-        // mcp-config-writer.js:5-7`). Writing Claude's files for a
-        // non-Claude `--agent` would silently configure nothing that
-        // binary ever reads (Codex review, 2026-08-24) — the proxy still
-        // starts (harmless, agent-agnostic), but only Claude gets it
-        // wired in until a Codex-format writer exists.
-        //
-        // Keyed on `resolvedAgentId`, NOT `agentBin`/`resolvedAgentBin`
-        // (Codex review, round 5): `--agent-id` exists precisely to assert
-        // "this really is claude" even when spawned via a nonstandard path
-        // or name (`--agent /opt/bin/claude --agent-id claude`) — keying
-        // this decision on the raw spawn string instead would mint
-        // successfully but still skip writing the config a real Claude
-        // Code process would actually read.
-        if (mcpProxyHandle && resolvedAgentId !== 'claude') {
-          process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
-        } else if (mcpProxyHandle) {
-          const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
-          if (!configResult.ok) {
-            process.stdout.write(`yolo-bridge: could not configure local MCP access (${spawnCwd}/.mcp.json is unparseable, already has its own "yolo-studio" entry, or would not be safe from a future commit) — leaving it unconfigured rather than overwrite/dirty it.\n`);
-          } else {
-            mcpConfigCleanup = { expectedProxyUrl: mcpProxyHandle.url, createdFile: configResult.createdFile };
-            // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
-            // its own tool-call approvals) so Claude Code doesn't sit on an
-            // interactive "New MCP server found" / per-tool-call prompt with
-            // nobody watching. Best-effort: a failure here still leaves the
-            // MCP server configured and usable, just with the normal
-            // approval prompts, so it's logged rather than fatal.
-            const trustResult = writeLocalMcpTrust(spawnCwd);
-            if (!trustResult.ok) {
-              process.stdout.write(`yolo-bridge: could not pre-trust the local MCP server (${spawnCwd}/.claude/settings.local.json is unparseable, or would not be safe from a future commit) — MCP tool calls will need manual approval.\n`);
+  let result: Awaited<ReturnType<typeof runAttachFromDisk>>;
+  try {
+    result = await runAttachFromDisk({
+      workspaceId,
+      commonApiBaseUrl: apiUrl(),
+      hostLabel,
+      shouldStop: () => stopRequested,
+      // Fires once the real tileId exists (docs/YOLOBRIDGE_PLAN.md's "Local
+      // MCP access" section) — starts the local MCP proxy and writes
+      // `.mcp.json` BEFORE spawning the local agent, since Claude Code reads
+      // that file at process launch. A proxy-start failure is logged and
+      // skipped, not fatal — MCP access is an enhancement on a tile that
+      // already works without it (send_to_tile/read_tile_output are
+      // unaffected either way).
+      onAttached: async ({ getAccessToken, clearScreen }) => {
+        // Isolated from `startLocalAgent` below on purpose (Codex review,
+        // 2026-08-24): `startMcpProxy` itself never throws, but
+        // `writeLocalMcpConfig`/`writeLocalMcpTrust` do plain synchronous
+        // `fs` writes (e.g. a read-only `spawnCwd` throws EACCES) — without
+        // this try/catch, that exception propagates out of the WHOLE
+        // `onAttached` callback (`runAttachDaemon`'s own best-effort wrapper
+        // only logs it), and `startLocalAgent` — later in this same
+        // callback — never runs. That leaves a daemon holding a live
+        // attachment + SSE stream with no local PTY to ever receive a
+        // prompt. MCP access is an enhancement on a tile that already works
+        // without it; the local agent spawning is not optional.
+        try {
+          mcpProxyHandle = await startMcpProxy({
+            apiUrl: apiUrl(),
+            getAccessToken,
+            workspaceId,
+            agentId: resolvedAgentId,
+            log: (line) => process.stdout.write(`${line}\n`),
+          });
+          // Exported on THIS process's env, before `startLocalAgent` spawns
+          // the local agent below (which inherits it) — the actual secret
+          // never touches `.mcp.json` itself (Codex review, 2026-08-24,
+          // round 12: that file is a `${SECRET_ENV_VAR}` template Claude Code
+          // expands against its own inherited env at load time, since many
+          // repos — including this one's own root — already track a
+          // `.mcp.json`, and a YOLO-mode agent committing/pushing it would
+          // publish a live full-workspace credential). Harmless to set even
+          // when `mcpProxyHandle` ends up unused (e.g. a non-claude agent
+          // below).
+          if (mcpProxyHandle) process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
+          // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
+          // conventions — Codex reads `~/.codex/config.toml`'s
+          // `[mcp_servers.*]` instead (`containers/services/container-api/
+          // mcp-config-writer.js:5-7`). Writing Claude's files for a
+          // non-Claude `--agent` would silently configure nothing that
+          // binary ever reads (Codex review, 2026-08-24) — the proxy still
+          // starts (harmless, agent-agnostic), but only Claude gets it
+          // wired in until a Codex-format writer exists.
+          //
+          // Keyed on `resolvedAgentId`, NOT `agentBin`/`resolvedAgentBin`
+          // (Codex review, round 5): `--agent-id` exists precisely to assert
+          // "this really is claude" even when spawned via a nonstandard path
+          // or name (`--agent /opt/bin/claude --agent-id claude`) — keying
+          // this decision on the raw spawn string instead would mint
+          // successfully but still skip writing the config a real Claude
+          // Code process would actually read.
+          if (mcpProxyHandle && resolvedAgentId !== 'claude') {
+            process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
+          } else if (mcpProxyHandle) {
+            const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
+            if (!configResult.ok) {
+              process.stdout.write(`yolo-bridge: could not configure local MCP access (${spawnCwd}/.mcp.json is unparseable, already has its own "yolo-studio" entry, or would not be safe from a future commit) — leaving it unconfigured rather than overwrite/dirty it.\n`);
             } else {
-              // Only remove on cleanup what THIS attach actually inserted —
-              // an entry the operator already had (added_*Entry: false)
-              // was their own standing trust grant, not ours to revoke.
-              mcpTrustRemoval = {
-                removeServerEntry: trustResult.addedServerEntry,
-                removePermissionEntry: trustResult.addedPermissionEntry,
-                createdFile: trustResult.createdFile,
-                attachId: trustResult.attachId,
-              };
+              mcpConfigCleanup = { expectedProxyUrl: mcpProxyHandle.url, createdFile: configResult.createdFile };
+              // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
+              // its own tool-call approvals) so Claude Code doesn't sit on an
+              // interactive "New MCP server found" / per-tool-call prompt with
+              // nobody watching. Best-effort: a failure here still leaves the
+              // MCP server configured and usable, just with the normal
+              // approval prompts, so it's logged rather than fatal.
+              const trustResult = writeLocalMcpTrust(spawnCwd);
+              if (!trustResult.ok) {
+                process.stdout.write(`yolo-bridge: could not pre-trust the local MCP server (${spawnCwd}/.claude/settings.local.json is unparseable, or would not be safe from a future commit) — MCP tool calls will need manual approval.\n`);
+              } else {
+                // Only remove on cleanup what THIS attach actually inserted —
+                // an entry the operator already had (added_*Entry: false)
+                // was their own standing trust grant, not ours to revoke.
+                mcpTrustRemoval = {
+                  removeServerEntry: trustResult.addedServerEntry,
+                  removePermissionEntry: trustResult.addedPermissionEntry,
+                  createdFile: trustResult.createdFile,
+                  attachId: trustResult.attachId,
+                };
+              }
             }
           }
+        } catch (err) {
+          process.stdout.write(`yolo-bridge: local MCP setup failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.\n`);
         }
-      } catch (err) {
-        process.stdout.write(`yolo-bridge: local MCP setup failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.\n`);
-      }
+  
+        // A stop signal (Ctrl+C) can arrive while this callback was still
+        // awaiting the MCP-setup block above — `runAttachDaemon` only checks
+        // `shouldStop()` again after `onAttached` RETURNS, so without this
+        // check a cancellation mid-setup would still spawn a brand-new PTY
+        // process just to kill it moments later (Codex review, 2026-08-24).
+        if (stopRequested) return;
+  
+        // Clears the terminal right before the agent's own UI takes over —
+        // NOT on the SSE 'connected' frame (reverted design, see
+        // attach-cmd.ts's `onAttached` doc comment for why: this is the one
+        // moment guaranteed to be before any agent output, regardless of how
+        // fast the agent boots or how slow the SSE connect is).
+        clearScreen();
+  
+        // Spawns the local coding agent under a real PTY — this is what
+        // launches the user's local session (see docs/YOLOBRIDGE_PLAN.md's
+        // "⚠ Not yet functional" section). The PTY's output streams live to
+        // this process's own stdout and this process's stdin is piped into
+        // the PTY, so the terminal running `attach` is a live view onto the
+        // exact session remote prompts land in.
+        //
+        // Deliberately OUTSIDE the MCP-setup try/catch above and in its own
+        // (Codex review, 2026-08-24): an unspawnable agent (missing/
+        // non-executable binary — node-pty's `spawn()` throws synchronously,
+        // ENOENT) must not be swallowed by `runAttachDaemon`'s own
+        // best-effort `onAttached` wrapper, which only logs and continues —
+        // that would leave a live, apparently-connected tile with no PTY,
+        // waiting forever with nothing able to receive a prompt. Mirrors the
+        // real `onExit` handler below: stop + detach immediately rather than
+        // let the daemon loop ride out the full heartbeat-staleness window.
+        try {
+          startLocalAgent({
+            agentBin,
+            cwd: spawnCwd,
+            onExit: ({ exitCode, signal }) => {
+              localAgentExited = true;
+              stopRequested = true;
+              process.stdout.write(
+                `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
+              );
+              // Fire-and-forget: don't wait on the SSE loop to unwind on its own
+              // (it only re-checks shouldStop() at loop boundaries) to report the
+              // status change — tell the server immediately so the tile flips to
+              // `stopped` right away instead of riding out the heartbeat
+              // staleness window (~90s, Decision Q2). The daemon loop below still
+              // exits promptly too, via `shouldStop`.
+              runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+            },
+          });
+        } catch (err) {
+          localAgentExited = true;
+          stopRequested = true;
+          process.stdout.write(
+            `\nyolo-bridge: failed to start the local agent (${err instanceof Error ? err.message : String(err)}), detaching...\n`,
+          );
+          runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+        }
+      },
+    });
+  } finally {
+    // Codex review, 2026-08-24, round 17: this whole block used to run
+    // unconditionally AFTER the `await` above, which only happens if
+    // `runAttachFromDisk` actually RESOLVES. If it instead throws (e.g. a
+    // reconnect-time fetch inside the daemon loop rejects in a way its own
+    // internal handling doesn't catch), the exception skips straight past
+    // ALL of this — signal listeners stay attached, the local PTY and the
+    // MCP proxy's HTTP server both stay alive, and neither local nor
+    // server-side state ever gets cleaned up. `main()`'s own top-level
+    // `.catch()` only sets `process.exitCode`, which does NOT force an
+    // exit — with the PTY/HTTP server still referenced, the process's
+    // event loop has no reason to ever end on its own, leaving the CLI
+    // hung indefinitely with a stale attachment and a live local proxy. A
+    // `finally` runs this cleanup on EITHER outcome, resolve or reject.
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
 
-      // A stop signal (Ctrl+C) can arrive while this callback was still
-      // awaiting the MCP-setup block above — `runAttachDaemon` only checks
-      // `shouldStop()` again after `onAttached` RETURNS, so without this
-      // check a cancellation mid-setup would still spawn a brand-new PTY
-      // process just to kill it moments later (Codex review, 2026-08-24).
-      if (stopRequested) return;
-
-      // Clears the terminal right before the agent's own UI takes over —
-      // NOT on the SSE 'connected' frame (reverted design, see
-      // attach-cmd.ts's `onAttached` doc comment for why: this is the one
-      // moment guaranteed to be before any agent output, regardless of how
-      // fast the agent boots or how slow the SSE connect is).
-      clearScreen();
-
-      // Spawns the local coding agent under a real PTY — this is what
-      // launches the user's local session (see docs/YOLOBRIDGE_PLAN.md's
-      // "⚠ Not yet functional" section). The PTY's output streams live to
-      // this process's own stdout and this process's stdin is piped into
-      // the PTY, so the terminal running `attach` is a live view onto the
-      // exact session remote prompts land in.
-      //
-      // Deliberately OUTSIDE the MCP-setup try/catch above and in its own
-      // (Codex review, 2026-08-24): an unspawnable agent (missing/
-      // non-executable binary — node-pty's `spawn()` throws synchronously,
-      // ENOENT) must not be swallowed by `runAttachDaemon`'s own
-      // best-effort `onAttached` wrapper, which only logs and continues —
-      // that would leave a live, apparently-connected tile with no PTY,
-      // waiting forever with nothing able to receive a prompt. Mirrors the
-      // real `onExit` handler below: stop + detach immediately rather than
-      // let the daemon loop ride out the full heartbeat-staleness window.
+    // Whatever ended the attach loop — local Ctrl+C, a server-initiated
+    // `detached` frame, or the agent process exiting on its own — also ends
+    // the PTY session `attach` spawned. Safe no-op if it already exited.
+    stopLocalAgent();
+    // Same "nothing left running detached" discipline for the local MCP
+    // proxy: stop the server (drops the delegated token from memory) and
+    // remove the .mcp.json entry we added, if we added one. Each step is
+    // wrapped individually (Codex review, 2026-08-24, round 12): the removal
+    // helpers' own `writeFileSync`/`unlinkSync` calls are unguarded, and an
+    // exception from any one of them — a permission change or a full disk
+    // mid-session — would otherwise propagate out of this whole cleanup
+    // sequence and skip the SERVER-side detach below entirely, leaving the
+    // tile live on the server even though the local process is exiting. Local
+    // cleanup is best-effort; the server detach is not.
+    if (mcpProxyHandle) {
       try {
-        startLocalAgent({
-          agentBin,
-          cwd: spawnCwd,
-          onExit: ({ exitCode, signal }) => {
-            localAgentExited = true;
-            stopRequested = true;
-            process.stdout.write(
-              `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
-            );
-            // Fire-and-forget: don't wait on the SSE loop to unwind on its own
-            // (it only re-checks shouldStop() at loop boundaries) to report the
-            // status change — tell the server immediately so the tile flips to
-            // `stopped` right away instead of riding out the heartbeat
-            // staleness window (~90s, Decision Q2). The daemon loop below still
-            // exits promptly too, via `shouldStop`.
-            runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
-          },
-        });
+        await mcpProxyHandle.stop();
       } catch (err) {
-        localAgentExited = true;
-        stopRequested = true;
-        process.stdout.write(
-          `\nyolo-bridge: failed to start the local agent (${err instanceof Error ? err.message : String(err)}), detaching...\n`,
-        );
-        runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+        process.stdout.write(`yolo-bridge: local MCP proxy shutdown failed (${err instanceof Error ? err.message : String(err)}).\n`);
       }
-    },
-  });
-
-  process.removeListener('SIGINT', onSignal);
-  process.removeListener('SIGTERM', onSignal);
-
-  // Whatever ended the attach loop — local Ctrl+C, a server-initiated
-  // `detached` frame, or the agent process exiting on its own — also ends
-  // the PTY session `attach` spawned. Safe no-op if it already exited.
-  stopLocalAgent();
-  // Same "nothing left running detached" discipline for the local MCP
-  // proxy: stop the server (drops the delegated token from memory) and
-  // remove the .mcp.json entry we added, if we added one. Each step is
-  // wrapped individually (Codex review, 2026-08-24, round 12): the removal
-  // helpers' own `writeFileSync`/`unlinkSync` calls are unguarded, and an
-  // exception from any one of them — a permission change or a full disk
-  // mid-session — would otherwise propagate out of this whole cleanup
-  // sequence and skip the SERVER-side detach below entirely, leaving the
-  // tile live on the server even though the local process is exiting. Local
-  // cleanup is best-effort; the server detach is not.
-  if (mcpProxyHandle) {
-    try {
-      await mcpProxyHandle.stop();
-    } catch (err) {
-      process.stdout.write(`yolo-bridge: local MCP proxy shutdown failed (${err instanceof Error ? err.message : String(err)}).\n`);
     }
-  }
-  if (mcpTrustRemoval) {
-    try {
-      removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
-    } catch (err) {
-      process.stdout.write(`yolo-bridge: local MCP trust cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
+    if (mcpTrustRemoval) {
+      try {
+        removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
+      } catch (err) {
+        process.stdout.write(`yolo-bridge: local MCP trust cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
+      }
     }
-  }
-  // removeLocalMcpConfig only deletes the entry if its CURRENT value still
-  // matches the exact URL captured in mcpConfigCleanup, and only unlinks
-  // the whole file if THIS attachment is the one that created it
-  // (createdFile) -- an undefined mcpConfigCleanup (nothing was ever
-  // successfully written) correctly skips the call.
-  if (mcpConfigCleanup) {
-    try {
-      removeLocalMcpConfig(spawnCwd, mcpConfigCleanup.expectedProxyUrl, mcpConfigCleanup.createdFile);
-    } catch (err) {
-      process.stdout.write(`yolo-bridge: local MCP config cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
+    // removeLocalMcpConfig only deletes the entry if its CURRENT value still
+    // matches the exact URL captured in mcpConfigCleanup, and only unlinks
+    // the whole file if THIS attachment is the one that created it
+    // (createdFile) -- an undefined mcpConfigCleanup (nothing was ever
+    // successfully written) correctly skips the call.
+    if (mcpConfigCleanup) {
+      try {
+        removeLocalMcpConfig(spawnCwd, mcpConfigCleanup.expectedProxyUrl, mcpConfigCleanup.createdFile);
+      } catch (err) {
+        process.stdout.write(`yolo-bridge: local MCP config cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
+      }
     }
   }
 
