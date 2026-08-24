@@ -284,9 +284,14 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                   // round trip), so clearing right on 'connected' reliably
                   // leaves a clean screen just before the agent's own UI
                   // takes over, instead of it drawing on top of the
-                  // daemon's own connection-status scrollback.
-                  clearScreen();
+                  // daemon's own connection-status scrollback. AFTER logging
+                  // 'Stream connected.', not before -- the operator wants
+                  // that line to actually be visible (briefly) rather than
+                  // wiped the instant it's written; it still won't linger
+                  // once the agent's own UI paints over/past it a moment
+                  // later.
                   log('Stream connected.');
+                  clearScreen();
                   heartbeat?.stop();
                   heartbeat = startHeartbeat(
                     async () => {

@@ -146,7 +146,7 @@ describe('runAttachDaemon', () => {
     assert.ok(requests.some((r) => r.includes('/yolobridge/stream?attachmentId=a1')));
   });
 
-  it("clears the terminal right when the stream connects, before logging 'Stream connected.' -- so the shell prompt / Attached. line don't linger once the local agent's own UI takes over", async () => {
+  it("clears the terminal right when the stream connects, AFTER logging 'Stream connected.' -- so that line is actually visible for a moment, and the shell prompt / Attached. line don't linger once the local agent's own UI takes over", async () => {
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
@@ -177,14 +177,14 @@ describe('runAttachDaemon', () => {
 
     assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
     // Exactly one clear (not on the earlier 'Attached.' line, only on
-    // 'connected'), and it comes strictly before 'Stream connected.' is
-    // logged -- clearing AFTER would wipe out the very message it's meant
-    // to leave visible for a moment before the agent's UI takes over.
+    // 'connected'), and it comes strictly AFTER 'Stream connected.' is
+    // logged -- clearing BEFORE would wipe that line before it was ever
+    // actually visible on screen.
     assert.deepEqual(calls.filter((c) => c === 'clear'), ['clear']);
     const clearIdx = calls.indexOf('clear');
     const connectedLogIdx = calls.indexOf('log:Stream connected.');
     assert.ok(connectedLogIdx >= 0, "sanity check: 'Stream connected.' was logged at all");
-    assert.ok(clearIdx < connectedLogIdx, 'clearScreen must fire before the Stream connected. log line');
+    assert.ok(clearIdx > connectedLogIdx, 'clearScreen must fire after the Stream connected. log line');
   });
 
   it('calls onAttached exactly once, with the real tileId/attachmentId/accessToken, before the stream ever opens', async () => {
