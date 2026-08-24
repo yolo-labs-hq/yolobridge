@@ -168,6 +168,15 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
 }
 
 async function cmdAttach(args: string[]): Promise<number> {
+  // Printed unconditionally, first thing, regardless of how the rest of
+  // this command goes — a self-diagnosing fix for a real, repeated support
+  // cost (2026-08-24): every one of that day's "Invalid delegated token" /
+  // wrong-workspace confusions traced back to ONE of these three URLs being
+  // stale in the caller's shell (e.g. YOLOBRIDGE_MCP_URL added to a .bashrc
+  // AFTER the terminal in use had already sourced it), with nothing in the
+  // command's own output making that visible until well after the fact.
+  process.stdout.write(`yolo-bridge: API base ${apiUrl()} · Auth base ${authUrl()} · MCP base ${mcpUrl()}\n`);
+
   const parsed = parseAttachArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`yolo-bridge attach: ${parsed.error}\n`);
