@@ -16,6 +16,20 @@ function initGitRepo(): void {
   spawnSync('git', ['init', '-q'], { cwd: dir });
 }
 
+/** A PID guaranteed to belong to an already-exited process, for simulating
+ *  a crashed prior attach's sidecar record (Codex review, 2026-08-24,
+ *  round 19's `isPidAlive` check treats THIS test process's own PID as
+ *  live, since it obviously is -- a real dead-PID scenario needs an
+ *  actually-dead process, not a fake number). `spawnSync` blocks until the
+ *  child exits, so by the time it returns the PID it reports is free (bar
+ *  the OS reusing that exact number in the intervening instant, the same
+ *  inherent limitation every PID-based staleness check accepts). */
+function spawnAndExit(): number {
+  const result = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  if (typeof result.pid !== 'number') throw new Error('spawnAndExit: no pid reported');
+  return result.pid;
+}
+
 let dir: string;
 let xdgConfigDir: string;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
@@ -91,7 +105,7 @@ describe('writeLocalMcpConfig', () => {
         'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', headers: { [SECRET_HEADER]: SECRET_HEADER_TEMPLATE } },
       },
     });
-    assert.deepEqual(JSON.parse(readFileSync(sidecarPath(), 'utf-8')), { proxyUrl: 'http://127.0.0.1:4123/mcp' });
+    assert.deepEqual(JSON.parse(readFileSync(sidecarPath(), 'utf-8')), { proxyUrl: 'http://127.0.0.1:4123/mcp', pid: process.pid });
   });
 
   it('writes an entry with only standard http-transport fields, no custom marker (Codex review, 2026-08-24, round 9)', () => {
@@ -148,10 +162,41 @@ describe('writeLocalMcpConfig', () => {
     // brick local MCP access on every subsequent attach until the operator
     // manually edited the file.
     writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp'); // simulates the prior attach's write
+    // Overwrite the recorded pid with one from a process that has ALREADY
+    // exited (round 19's isPidAlive check would otherwise see THIS test
+    // process's own pid -- which is, trivially, alive -- and correctly
+    // refuse to reclaim, defeating the "prior attach crashed" premise this
+    // test exists to cover).
+    const sidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
+    sidecar.pid = spawnAndExit();
+    writeFileSync(sidecarPath(), JSON.stringify(sidecar));
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp', headers: { [SECRET_HEADER]: SECRET_HEADER_TEMPLATE } });
+  });
+
+  it('does NOT reclaim an entry whose recorded pid is STILL ALIVE -- a live sibling attach, not a crashed one (Codex review, 2026-08-24, round 19)', () => {
+    // Two attaches running from the SAME directory is a real, supported
+    // scenario elsewhere in this codebase ("concurrent sibling attach").
+    // A content match alone (round 9-13) can't tell "the attach that wrote
+    // this has since exited" apart from "it's still running, right now, as
+    // a sibling" -- reclaiming the latter would point the shared
+    // .mcp.json at the WRONG proxy for whichever one wrote it first.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp'); // sibling A's write, from THIS still-running process
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp'); // sibling B tries to attach
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:9999/mcp', "sibling A's still-live entry must be left exactly as it was");
+  });
+
+  it('DOES reclaim once the recorded pid is confirmed dead, even though the content still matches (Codex review, 2026-08-24, round 19)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    const sidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
+    sidecar.pid = spawnAndExit();
+    writeFileSync(sidecarPath(), JSON.stringify(sidecar));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: false });
   });
 
   it('does NOT reclaim an entry that was EDITED to point somewhere else while an attachment was running, even though the sidecar still records the old URL (Codex review, 2026-08-24, round 8 + round 9)', () => {
@@ -295,6 +340,13 @@ describe('writeLocalMcpConfig', () => {
     // the target's own permissions; only the rename touches the original
     // path). A non-writable directory blocks creating that temp file at all.
     writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    // Substitute a dead pid so round 19's liveness check doesn't short-
+    // circuit this test before it ever reaches the reclaim-then-fail path
+    // below (THIS test process's own pid, which is what a real write would
+    // record, is trivially alive).
+    const priorSidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
+    priorSidecar.pid = spawnAndExit();
+    writeFileSync(sidecarPath(), JSON.stringify(priorSidecar));
     const beforeEntry = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     chmodSync(dir, 0o555);
     try {
@@ -302,7 +354,7 @@ describe('writeLocalMcpConfig', () => {
       assert.equal(result.ok, false);
       assert.deepEqual(
         JSON.parse(readFileSync(sidecarPath(), 'utf-8')),
-        { proxyUrl: 'http://127.0.0.1:9999/mcp' },
+        { proxyUrl: 'http://127.0.0.1:9999/mcp', pid: priorSidecar.pid },
         'sidecar must be rolled back to what it recorded before this failed call',
       );
     } finally {

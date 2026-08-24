@@ -226,6 +226,23 @@ describe('writeLocalMcpTrust', () => {
       assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for permissions: ${body}`);
     }
   });
+
+  it('returns ok:false and does not touch a pre-existing file whose enabledMcpjsonServers/permissions.allow arrays contain a non-string element (Codex review, 2026-08-24, round 19)', () => {
+    // The shape checks above only confirm "this is an array" -- not "every
+    // element is a string." asStringArray silently filters out anything
+    // else, which would PERMANENTLY discard an unrelated value (e.g. `42`)
+    // from the operator's own file the moment this module wrote it back.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    for (const content of [
+      '{"enabledMcpjsonServers":["real-server",42]}',
+      '{"permissions":{"allow":["mcp__real__*",true]}}',
+    ]) {
+      writeFileSync(settingsPath(), content);
+      const result = writeLocalMcpTrust(dir);
+      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false }, `expected refusal for: ${content}`);
+      assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for: ${content}`);
+    }
+  });
 });
 
 describe('removeLocalMcpTrust', () => {

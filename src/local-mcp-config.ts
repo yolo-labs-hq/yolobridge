@@ -112,24 +112,57 @@ function sidecarPath(cwd: string): string {
 
 interface SidecarState {
   proxyUrl?: string;
+  /** PID of the process that wrote this record (Codex review, 2026-08-24,
+   *  round 19) — see `isPidAlive`'s doc comment for why this exists: a
+   *  sidecar match alone can't tell "the attach that wrote this has since
+   *  exited" apart from "it's still running, from a SIBLING attach in the
+   *  same directory." */
+  pid?: number;
 }
 
 /** Best-effort read: a missing or corrupt sidecar just means "we don't know
  *  what we last wrote", which correctly makes `looksLikeOurOwnEntry` refuse
  *  to reclaim rather than guess — fail closed, same as everywhere else in
- *  this file. */
+ *  this file. Requires BOTH fields present and correctly typed — a sidecar
+ *  missing `pid` (e.g. a half-written file) must not be treated as a
+ *  partial match either. */
 function readSidecar(cwd: string): SidecarState {
   const path = sidecarPath(cwd);
   if (!existsSync(path)) return {};
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.proxyUrl === 'string') {
-      return { proxyUrl: parsed.proxyUrl };
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.proxyUrl === 'string' && typeof parsed.pid === 'number') {
+      return { proxyUrl: parsed.proxyUrl, pid: parsed.pid };
     }
   } catch {
     // Corrupt sidecar — treated as absent above.
   }
   return {};
+}
+
+/**
+ * True if the process that recorded `pid` is (as far as we can tell) still
+ * running (Codex review, 2026-08-24, round 19): `looksLikeOurOwnEntry`
+ * alone answers "does the on-disk entry match what SOME attach from this
+ * module wrote," which is exactly as true for a crashed attach's stale
+ * leftover as it is for a SIBLING attach that's still live in the same
+ * directory (a real, supported scenario elsewhere in this codebase —
+ * "concurrent sibling attach"). Reclaiming the latter would point the
+ * shared `.mcp.json` at the wrong proxy for whichever sibling wrote it
+ * first, and a later detach could delete the entry out from under a still-
+ * running daemon. `process.kill(pid, 0)` is the standard POSIX liveness
+ * check (send no actual signal, just probe): ESRCH means no such process
+ * (dead — safe to reclaim); EPERM means it exists but we lack permission to
+ * signal it (still alive — NOT safe to reclaim); any other outcome is
+ * treated as "can't prove it's dead," which fails closed the same way.
+ */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 function writeSidecar(cwd: string, state: Required<SidecarState>): void {
@@ -168,8 +201,8 @@ function writeSidecar(cwd: string, state: Required<SidecarState>): void {
  *  more conservative than it needs to be, never an unsafe reclaim. */
 function rollbackSidecar(cwd: string, prior: SidecarState): void {
   try {
-    if (prior.proxyUrl !== undefined) {
-      writeSidecar(cwd, { proxyUrl: prior.proxyUrl });
+    if (prior.proxyUrl !== undefined && prior.pid !== undefined) {
+      writeSidecar(cwd, { proxyUrl: prior.proxyUrl, pid: prior.pid });
     } else {
       deleteSidecar(cwd);
     }
@@ -301,7 +334,19 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   }
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
   const priorSidecar = readSidecar(cwd);
-  if (SERVER_NAME in servers && !looksLikeOurOwnEntry(servers[SERVER_NAME], priorSidecar)) return { ok: false, createdFile: false };
+  if (SERVER_NAME in servers) {
+    if (!looksLikeOurOwnEntry(servers[SERVER_NAME], priorSidecar)) return { ok: false, createdFile: false };
+    // A content match alone doesn't distinguish a crashed attach's stale
+    // leftover from a SIBLING attach that's still live in the same
+    // directory — a real, supported scenario elsewhere in this codebase
+    // (Codex review, 2026-08-24, round 19). Reclaiming a live sibling's
+    // entry would point the shared `.mcp.json` at the WRONG proxy for
+    // whichever one wrote it first, and this attach's own later detach
+    // could delete the entry out from under that still-running daemon.
+    // `priorSidecar.pid` is guaranteed defined here — `looksLikeOurOwnEntry`
+    // already required it for the match above to succeed.
+    if (priorSidecar.pid !== undefined && isPidAlive(priorSidecar.pid)) return { ok: false, createdFile: false };
+  }
 
   // Sidecar written BEFORE the `.mcp.json` entry itself (Codex review,
   // 2026-08-24, round 10): the original order wrote the entry first, so a
@@ -315,7 +360,7 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   // the sidecar first means a failure here leaves `.mcp.json` completely
   // untouched — nothing to roll back.
   try {
-    writeSidecar(cwd, { proxyUrl });
+    writeSidecar(cwd, { proxyUrl, pid: process.pid });
   } catch {
     return { ok: false, createdFile: false };
   }

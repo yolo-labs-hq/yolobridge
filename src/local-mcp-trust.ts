@@ -215,6 +215,21 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   if ('allow' in permissionsObj && !Array.isArray(permissionsObj.allow)) {
     return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
+  // An array that's the right SHAPE can still hold the wrong ELEMENT types
+  // (Codex review, 2026-08-24, round 19): the checks above only confirm
+  // "this is an array," not "every element is a string" — `asStringArray`
+  // below silently filters out anything else, so a non-string element
+  // (e.g. `["real-server", 42]`) would be PERMANENTLY discarded from the
+  // operator's own file the moment this module writes it back, despite
+  // having nothing to do with what this module owns. Refused here for the
+  // same reason a malformed shape is: present-but-invalid content is not
+  // this module's to silently normalize away.
+  if (Array.isArray(settings.enabledMcpjsonServers) && !settings.enabledMcpjsonServers.every((v) => typeof v === 'string')) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
+  }
+  if (Array.isArray(permissionsObj.allow) && !permissionsObj.allow.every((v) => typeof v === 'string')) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
+  }
 
   // Consulted BEFORE mutating anything below (Codex review, 2026-08-24,
   // round 7): if the entry is already present but OUR OWN marker from a
@@ -293,6 +308,18 @@ export function removeLocalMcpTrust(
   // clobbered by a concurrent attach) -- touch NOTHING, not even a
   // reformatting rewrite of otherwise-unchanged content.
   if (!stillOurs) return;
+
+  // Same refuse-rather-than-silently-normalize check as the write path
+  // (Codex review, 2026-08-24, round 19): the operator could have
+  // hand-edited a non-string element into one of these arrays between
+  // attach and detach; `asStringArray` below would otherwise drop it
+  // permanently the moment this function writes the file back.
+  if (Array.isArray(settings.enabledMcpjsonServers) && !settings.enabledMcpjsonServers.every((v) => typeof v === 'string')) return;
+  if (
+    settings.permissions && typeof settings.permissions === 'object' && !Array.isArray(settings.permissions) &&
+    Array.isArray((settings.permissions as Record<string, unknown>).allow) &&
+    !((settings.permissions as Record<string, unknown>).allow as unknown[]).every((v) => typeof v === 'string')
+  ) return;
 
   if (opts.removeServerEntry) {
     const enabled = asStringArray(settings.enabledMcpjsonServers).filter((s) => s !== SERVER_NAME);
