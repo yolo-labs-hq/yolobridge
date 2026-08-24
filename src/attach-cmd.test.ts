@@ -133,6 +133,7 @@ describe('runAttachDaemon', () => {
       io,
       fetchImpl,
       log: (line) => logs.push(line),
+      clearScreen: () => {},
       deliverPrompt: async (prompt) => { delivered.push(prompt); },
       captureOutput: async () => ({ output: 'unused', busy: false }),
       shouldStop: () => false,
@@ -143,6 +144,48 @@ describe('runAttachDaemon', () => {
     assert.equal(loadAttachment(ENV, io), undefined, 'attachment record should be cleared after server-initiated detach');
     assert.ok(requests.some((r) => r.startsWith('POST') && r.includes('/yolobridge/attach')));
     assert.ok(requests.some((r) => r.includes('/yolobridge/stream?attachmentId=a1')));
+  });
+
+  it("clears the terminal right when the stream connects, before logging 'Stream connected.' -- so the shell prompt / Attached. line don't linger once the local agent's own UI takes over", async () => {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    const calls: string[] = [];
+
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: (line) => calls.push(`log:${line}`),
+      clearScreen: () => calls.push('clear'),
+      deliverPrompt: async () => {},
+      captureOutput: async () => ({ output: 'unused', busy: false }),
+      shouldStop: () => false,
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    // Exactly one clear (not on the earlier 'Attached.' line, only on
+    // 'connected'), and it comes strictly before 'Stream connected.' is
+    // logged -- clearing AFTER would wipe out the very message it's meant
+    // to leave visible for a moment before the agent's UI takes over.
+    assert.deepEqual(calls.filter((c) => c === 'clear'), ['clear']);
+    const clearIdx = calls.indexOf('clear');
+    const connectedLogIdx = calls.indexOf('log:Stream connected.');
+    assert.ok(connectedLogIdx >= 0, "sanity check: 'Stream connected.' was logged at all");
+    assert.ok(clearIdx < connectedLogIdx, 'clearScreen must fire before the Stream connected. log line');
   });
 
   it('reassembles a multibyte UTF-8 character split across a network chunk boundary (Codex review, 2026-08-23)', async () => {
@@ -189,6 +232,7 @@ describe('runAttachDaemon', () => {
       io: fakeIO(),
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       deliverPrompt: async (prompt) => { delivered.push(prompt); },
       captureOutput: async () => ({ output: 'unused', busy: false }),
       shouldStop: () => false,
@@ -214,6 +258,7 @@ describe('runAttachDaemon', () => {
       io: fakeIO(),
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
     });
 
     assert.equal(result.ok, false);
@@ -252,6 +297,7 @@ describe('runAttachDaemon', () => {
       io,
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       shouldStop: () => true, // already asked to stop before attach even started
     });
 
@@ -290,6 +336,7 @@ describe('runAttachDaemon', () => {
       io: fakeIO(),
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       captureOutput: async () => ({ output: 'stub output', busy: true }),
     });
 
@@ -318,6 +365,7 @@ describe('runAttachDaemon', () => {
       io: fakeIO(),
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       shouldStop: () => stop,
       timers,
     });
@@ -382,6 +430,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       io,
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       now: () => 1_000_000,
       refreshAccessToken,
     });
@@ -427,6 +476,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       io: fakeIO(),
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       now: () => 1_000_000 - 3600_000, // an hour of validity left, buffer is 5 min
       refreshAccessToken,
     });
@@ -467,6 +517,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       io: fakeIO(),
       fetchImpl,
       log: (line) => logs.push(line),
+      clearScreen: () => {},
       now: () => 1_000_000,
       refreshAccessToken,
       timers,
@@ -517,6 +568,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       io: fakeIO(),
       fetchImpl,
       log: () => {},
+      clearScreen: () => {},
       now: () => clock,
       refreshAccessToken,
       timers,

@@ -63,6 +63,13 @@ export interface AttachDaemonDeps {
   backoffOpts?: Partial<BackoffOptions>;
   timers?: TimerImpl;
   log?: (line: string) => void;
+  /** Called once, right when the SSE stream reports 'connected' — clears the
+   *  terminal so the shell prompt / `Attached.` line don't linger once the
+   *  locally-spawned agent's own UI takes over. Defaults to a real ANSI
+   *  clear (`\x1b[2J\x1b[3J\x1b[H` — clear screen, clear scrollback, cursor
+   *  home). Injectable so tests can assert it fired without touching a real
+   *  terminal. */
+  clearScreen?: () => void;
   deliverPrompt?: (prompt: string) => Promise<void>;
   captureOutput?: () => Promise<{ output: string; busy: boolean }>;
   /** auth-service base URL for token refresh. Defaults to
@@ -98,6 +105,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const shouldStop = deps.shouldStop ?? (() => false);
   const sleep = deps.sleep ?? defaultSleep;
   const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const clearScreen = deps.clearScreen ?? (() => process.stdout.write('\x1b[2J\x1b[3J\x1b[H'));
   const deliverPrompt = deps.deliverPrompt ?? deliverPromptToLocalAgent;
   const captureOutput = deps.captureOutput ?? captureLocalAgentOutput;
   const timers = deps.timers ?? defaultTimers;
@@ -241,6 +249,17 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
               const action = actionForFrame(frame);
               switch (action.kind) {
                 case 'connected':
+                  // Clear the terminal HERE, not on the initial 'Attached.'
+                  // log line above -- the locally-spawned agent's own PTY
+                  // was already started by cli.ts before this stream even
+                  // began connecting, but its first rendered output
+                  // consistently lands after this point in practice (a cold
+                  // Claude Code boot is slower than the attach+SSE-connect
+                  // round trip), so clearing right on 'connected' reliably
+                  // leaves a clean screen just before the agent's own UI
+                  // takes over, instead of it drawing on top of the
+                  // daemon's own connection-status scrollback.
+                  clearScreen();
                   log('Stream connected.');
                   heartbeat?.stop();
                   heartbeat = startHeartbeat(
