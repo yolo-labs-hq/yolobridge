@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,7 +32,7 @@ describe('writeLocalMcpConfig', () => {
         'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', headers: { 'x-yolobridge-proxy-secret': 'test-secret' } },
       },
     });
-    assert.deepEqual(JSON.parse(readFileSync(sidecarPath(), 'utf-8')), { proxyUrl: 'http://127.0.0.1:4123/mcp' });
+    assert.deepEqual(JSON.parse(readFileSync(sidecarPath(), 'utf-8')), { proxyUrl: 'http://127.0.0.1:4123/mcp', secret: 'test-secret' });
   });
 
   it('writes an entry with only standard http-transport fields, no custom marker (Codex review, 2026-08-24, round 9)', () => {
@@ -160,6 +160,67 @@ describe('writeLocalMcpConfig', () => {
     assert.equal(result.ok, false);
     assert.equal(existsSync(mcpJsonPath()), false, '.mcp.json must not have been created');
   });
+
+  it('writes .mcp.json with owner-only (0600) permissions -- the entry now carries a live full-workspace credential (Codex review, 2026-08-24, round 11)', () => {
+    // `writeFileSync`'s default mode only applies at file CREATION -- an
+    // EXISTING file keeps whatever it already had, commonly 0644/0664 under
+    // a typical umask, readable by any other local account on a multi-user
+    // machine. Checked here for the from-scratch case; the next test covers
+    // an existing, looser-permissioned file.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', 'test-secret');
+    assert.equal(statSync(mcpJsonPath()).mode & 0o777, 0o600);
+  });
+
+  it('tightens permissions to 0600 even when overwriting a pre-existing, looser-permissioned file', () => {
+    writeFileSync(mcpJsonPath(), '{}');
+    chmodSync(mcpJsonPath(), 0o644);
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', 'test-secret');
+    assert.equal(statSync(mcpJsonPath()).mode & 0o777, 0o600);
+  });
+
+  it("rolls back the sidecar to its PRIOR state when the .mcp.json write fails during a RECLAIM (Codex review, 2026-08-24, round 11)", () => {
+    // Round 10 fixed sidecar-then-entry ordering for the "no prior entry"
+    // case, reasoning a failure there is harmless since nothing gates on a
+    // stale sidecar yet. That reasoning does NOT hold for reclaiming an
+    // ALREADY-owned stale entry: the sidecar held a valid record matching
+    // the entry still on disk. Overwriting it with the new url/secret and
+    // then failing the .mcp.json write would strand that valid record too,
+    // permanently misclassifying the (unchanged) on-disk entry as foreign
+    // on every later attach. Forces the failure with a chmod'd-read-only
+    // .mcp.json (real fs permission enforcement, not a mock).
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp', 'secret-a');
+    const beforeEntry = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    chmodSync(mcpJsonPath(), 0o444);
+    try {
+      const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', 'secret-b');
+      assert.equal(result.ok, false);
+      assert.deepEqual(
+        JSON.parse(readFileSync(sidecarPath(), 'utf-8')),
+        { proxyUrl: 'http://127.0.0.1:9999/mcp', secret: 'secret-a' },
+        'sidecar must be rolled back to what it recorded before this failed call',
+      );
+    } finally {
+      chmodSync(mcpJsonPath(), 0o644); // restore writability so afterEach's rmSync can clean up
+    }
+    const afterEntry = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.deepEqual(afterEntry, beforeEntry, '.mcp.json itself was never actually written, since writeFileSync failed');
+  });
+
+  it('does NOT reclaim an entry whose secret header was tampered with, even though type/url still match the sidecar (Codex review, 2026-08-24, round 11)', () => {
+    // Comparing only `url` (round 9/10) missed an edit to `headers` alone --
+    // `type`/`url` still matched, so the entry was still treated as ours to
+    // overwrite despite this module's own "only ever touch exactly what we
+    // wrote" guarantee.
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', 'test-secret');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'].headers['x-yolobridge-proxy-secret'] = 'tampered';
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp', 'new-secret');
+    assert.deepEqual(result, { ok: false, createdFile: false });
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].headers['x-yolobridge-proxy-secret'], 'tampered', 'the tampered entry must be left exactly as it was');
+  });
 });
 
 describe('removeLocalMcpConfig', () => {
@@ -269,5 +330,16 @@ describe('removeLocalMcpConfig', () => {
     removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', false);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp' });
+  });
+
+  it('does NOT delete an entry whose secret header was tampered with, even though the URL still matches (Codex review, 2026-08-24, round 11)', () => {
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', 'test-secret');
+    const config = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    config.mcpServers['yolo-studio'].headers['x-yolobridge-proxy-secret'] = 'tampered';
+    writeFileSync(mcpJsonPath(), JSON.stringify(config));
+
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.ok(parsed.mcpServers['yolo-studio'], 'the tampered entry must survive, not be deleted');
   });
 });
