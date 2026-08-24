@@ -19,7 +19,16 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
-import { SECRET_HEADER } from './mcp-proxy.js';
+import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
+
+/** The literal string written into `.mcp.json`'s `headers` value — a
+ *  template, not the secret itself (Codex review, 2026-08-24, round 12).
+ *  Claude Code expands `${VAR}` in `.mcp.json` string fields against its
+ *  OWN process env at load time; `cli.ts` sets `SECRET_ENV_VAR` on
+ *  `process.env` right before spawning the local agent, which inherits it.
+ *  The real random secret this resolves to at runtime never touches any
+ *  file this module writes. */
+const SECRET_HEADER_TEMPLATE = `\${${SECRET_ENV_VAR}}`;
 
 /** Matches the pod-side writer's own server name (agents.json's
  *  `mcp.servers.yolo-studio` key) — same identity, different transport. */
@@ -69,10 +78,17 @@ function readConfig(path: string): Record<string, unknown> {
  * `.mcp.json`'s project-scoped (not home-scoped) design: the entry this
  * module writes is a plain, spec-shaped `{ type: 'http', url, headers }`
  * with no extra keys, so it can never trip strict validation, and
- * ownership is instead established by comparing the entry's `url` AND
- * `headers[SECRET_HEADER]` against what this sidecar recorded us writing
+ * ownership is instead established by comparing the entry's `url` against
+ * what this sidecar recorded us writing, AND its `headers[SECRET_HEADER]`
+ * against the fixed `SECRET_HEADER_TEMPLATE` this module always writes
  * (Codex review, 2026-08-24, round 11 — see `looksLikeOurOwnEntry`'s own
  * doc comment for why `url` alone wasn't enough).
+ *
+ * Holds only the URL, never the secret (round 12 moved the actual secret
+ * out of the project tree entirely — see `SECRET_HEADER_TEMPLATE` above)
+ * — still chmod'd owner-only regardless, since even the loopback URL alone
+ * is enough to attempt a request against this operator's specific running
+ * proxy instance.
  */
 function sidecarPath(cwd: string): string {
   return join(cwd, '.yolobridge-mcp-state.json');
@@ -80,22 +96,19 @@ function sidecarPath(cwd: string): string {
 
 interface SidecarState {
   proxyUrl?: string;
-  secret?: string;
 }
 
 /** Best-effort read: a missing or corrupt sidecar just means "we don't know
  *  what we last wrote", which correctly makes `looksLikeOurOwnEntry` refuse
  *  to reclaim rather than guess — fail closed, same as everywhere else in
- *  this file. Requires BOTH fields to be present strings, not just
- *  `proxyUrl` — a sidecar missing `secret` (e.g. a half-written file) must
- *  not be treated as a partial match either. */
+ *  this file. */
 function readSidecar(cwd: string): SidecarState {
   const path = sidecarPath(cwd);
   if (!existsSync(path)) return {};
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.proxyUrl === 'string' && typeof parsed.secret === 'string') {
-      return { proxyUrl: parsed.proxyUrl, secret: parsed.secret };
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.proxyUrl === 'string') {
+      return { proxyUrl: parsed.proxyUrl };
     }
   } catch {
     // Corrupt sidecar — treated as absent above.
@@ -104,22 +117,34 @@ function readSidecar(cwd: string): SidecarState {
 }
 
 function writeSidecar(cwd: string, state: Required<SidecarState>): void {
-  writeFileSync(sidecarPath(cwd), JSON.stringify(state, null, 2) + '\n', 'utf-8');
+  const path = sidecarPath(cwd);
+  writeFileSync(path, JSON.stringify(state, null, 2) + '\n', 'utf-8');
+  // Best-effort permission tightening (Codex review, 2026-08-24, round 12):
+  // round 11 chmod'd `.mcp.json` but missed this sidecar, which is exactly
+  // as readable-by-any-local-account under a typical umask. It no longer
+  // carries the secret itself, but it does carry the exact loopback URL of
+  // this operator's live proxy instance.
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Best-effort — a chmod failure leaves weaker-than-ideal permissions,
+    // not a broken write.
+  }
 }
 
 /** Restores whatever the sidecar recorded BEFORE this call started, or
  *  deletes it if nothing was recorded yet — used to undo `writeSidecar`
  *  when the `.mcp.json` write that was supposed to follow it fails (Codex
  *  review, 2026-08-24, round 11): without this, a failed config write
- *  after a successful sidecar write leaves the sidecar pointing at a
- *  URL/secret that was never actually applied to `.mcp.json`, permanently
+ *  after a successful sidecar write leaves the sidecar pointing at a URL
+ *  that was never actually applied to `.mcp.json`, permanently
  *  misclassifying the file's REAL (unchanged) entry as foreign on every
  *  later attach. Best-effort: a failed rollback just leaves the next write
  *  more conservative than it needs to be, never an unsafe reclaim. */
 function rollbackSidecar(cwd: string, prior: SidecarState): void {
   try {
-    if (prior.proxyUrl !== undefined && prior.secret !== undefined) {
-      writeSidecar(cwd, { proxyUrl: prior.proxyUrl, secret: prior.secret });
+    if (prior.proxyUrl !== undefined) {
+      writeSidecar(cwd, { proxyUrl: prior.proxyUrl });
     } else {
       deleteSidecar(cwd);
     }
@@ -146,17 +171,21 @@ const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
 
 /**
  * True if an existing `yolo-studio` entry's `type`/`url`/secret header still
- * exactly match what the sidecar recorded us writing, AND that recorded URL
- * still has the loopback shape this module generates (Codex review,
- * 2026-08-24, round 8's "both signals required" reasoning still applies, now
- * expressed as sidecar-match + shape instead of marker + shape): the sidecar
- * alone isn't enough, because an operator can edit the entry's VALUE (point
- * it somewhere else entirely) WHILE an attachment is still running, without
- * knowing a sidecar exists — a sidecar-only check would then have the NEXT
- * attach overwrite that intentional edit as though it were stale daemon
- * state. Requiring the CURRENT entry to still equal the recorded URL closes
- * that gap: an edited entry no longer matches, so it's correctly left alone
- * even with a stale sidecar record.
+ * exactly match what this module writes — `url` against what the sidecar
+ * recorded, and the secret header against the fixed `SECRET_HEADER_TEMPLATE`
+ * this module ALWAYS writes (round 12 moved the actual per-attach secret out
+ * of `.mcp.json` entirely, so there's no per-attach value left to compare
+ * the header against — the template string itself is the invariant) — AND
+ * that recorded URL still has the loopback shape this module generates
+ * (Codex review, 2026-08-24, round 8's "both signals required" reasoning
+ * still applies, now expressed as sidecar-match + shape instead of marker +
+ * shape): the sidecar alone isn't enough, because an operator can edit the
+ * entry's VALUE (point it somewhere else entirely) WHILE an attachment is
+ * still running, without knowing a sidecar exists — a sidecar-only check
+ * would then have the NEXT attach overwrite that intentional edit as though
+ * it were stale daemon state. Requiring the CURRENT entry to still equal the
+ * recorded URL closes that gap: an edited entry no longer matches, so it's
+ * correctly left alone even with a stale sidecar record.
  *
  * Round 11: comparing `url` alone missed an edit to `headers` (or another
  * standard field) ONLY — `type`/`url` still matched, so the predicate still
@@ -166,13 +195,13 @@ const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
  * the entry this module actually controls breaks the match.
  */
 function looksLikeOurOwnEntry(value: unknown, recorded: SidecarState): boolean {
-  if (!recorded.proxyUrl || !recorded.secret || !OWN_ENTRY_URL_PATTERN.test(recorded.proxyUrl)) return false;
+  if (!recorded.proxyUrl || !OWN_ENTRY_URL_PATTERN.test(recorded.proxyUrl)) return false;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   if (v.type !== 'http' || v.url !== recorded.proxyUrl) return false;
   const headers = v.headers;
   if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return false;
-  return (headers as Record<string, unknown>)[SECRET_HEADER] === recorded.secret;
+  return (headers as Record<string, unknown>)[SECRET_HEADER] === SECRET_HEADER_TEMPLATE;
 }
 
 export interface McpConfigWriteResult {
@@ -203,7 +232,7 @@ export interface McpConfigWriteResult {
  * here would otherwise brick local MCP access on every subsequent attach
  * until the operator manually edited the file.
  */
-export function writeLocalMcpConfig(cwd: string, proxyUrl: string, secret: string): McpConfigWriteResult {
+export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWriteResult {
   const path = mcpJsonPath(cwd);
   const createdFile = !existsSync(path);
   let config: Record<string, unknown>;
@@ -238,7 +267,7 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string, secret: strin
   // the sidecar first means a failure here leaves `.mcp.json` completely
   // untouched — nothing to roll back.
   try {
-    writeSidecar(cwd, { proxyUrl, secret });
+    writeSidecar(cwd, { proxyUrl });
   } catch {
     return { ok: false, createdFile: false };
   }
@@ -247,10 +276,12 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string, secret: strin
   // release rejects the whole server entry over. `headers` IS a standard
   // field for an http-type entry (Claude Code's own docs; this repo's
   // pod-side writer emits the identical shape,
-  // containers/services/container-api/mcp-config-writer.js:191) carrying the
-  // per-attach secret the proxy requires on every request (Codex review,
-  // 2026-08-24, round 10 — see mcp-proxy.ts's header comment).
-  servers[SERVER_NAME] = { type: 'http', url: proxyUrl, headers: { [SECRET_HEADER]: secret } };
+  // containers/services/container-api/mcp-config-writer.js:191). Its value
+  // is a `${VAR}` TEMPLATE, not the actual secret (round 12 — see
+  // `SECRET_HEADER_TEMPLATE`'s doc comment): the real per-attach secret the
+  // proxy requires on every request never touches this (often git-tracked)
+  // file.
+  servers[SERVER_NAME] = { type: 'http', url: proxyUrl, headers: { [SECRET_HEADER]: SECRET_HEADER_TEMPLATE } };
   config.mcpServers = servers;
   try {
     writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
@@ -259,22 +290,23 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string, secret: strin
     // prior entry existed" case (round 10's own reasoning). When RECLAIMING
     // a stale entry (`SERVER_NAME in servers` above), the sidecar already
     // held a valid record matching the entry still on disk — round 11:
-    // overwriting it with the NEW url/secret and then failing here would
-    // strand that valid record too, permanently misclassifying the
-    // (unchanged) on-disk entry as foreign. Roll back to whatever was there
-    // before this call.
+    // overwriting it with the NEW url and then failing here would strand
+    // that valid record too, permanently misclassifying the (unchanged)
+    // on-disk entry as foreign. Roll back to whatever was there before this
+    // call.
     rollbackSidecar(cwd, priorSidecar);
     return { ok: false, createdFile: false };
   }
-  // Best-effort permission tightening (Codex review, 2026-08-24, round 11):
-  // this entry's `headers` now carries a live credential granting full
-  // workspace scope, and `writeFileSync`'s default mode only applies at
-  // file CREATION — an EXISTING file keeps whatever permissions it already
-  // had (commonly 0644/0664 under a typical umask on a multi-user machine,
-  // readable by any other local account). A chmod failure here (e.g. an FS
-  // that doesn't support it) does not roll back the write above: the entry
-  // and sidecar are already consistent with each other, just left at
-  // weaker-than-ideal permissions rather than an unrecoverable state.
+  // Best-effort permission tightening (Codex review, 2026-08-24, round 11;
+  // no longer strictly about the secret since round 12 moved that out of
+  // this file — kept as defense-in-depth against exposing the loopback
+  // port/URL itself to another local account). `writeFileSync`'s default
+  // mode only applies at file CREATION — an EXISTING file keeps whatever
+  // permissions it already had (commonly 0644/0664 under a typical umask).
+  // A chmod failure here (e.g. an FS that doesn't support it) does not roll
+  // back the write above: the entry and sidecar are already consistent
+  // with each other, just left at weaker-than-ideal permissions rather than
+  // an unrecoverable state.
   try {
     chmodSync(path, 0o600);
   } catch {

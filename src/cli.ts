@@ -26,7 +26,7 @@ import { runDetach } from './detach-cmd.js';
 import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
-import { startMcpProxy, mcpUrl, type McpProxyHandle } from './mcp-proxy.js';
+import { startMcpProxy, mcpUrl, SECRET_ENV_VAR, type McpProxyHandle } from './mcp-proxy.js';
 import { writeLocalMcpConfig, removeLocalMcpConfig } from './local-mcp-config.js';
 import { writeLocalMcpTrust, removeLocalMcpTrust } from './local-mcp-trust.js';
 
@@ -292,6 +292,17 @@ async function cmdAttach(args: string[]): Promise<number> {
           agentId: resolvedAgentId,
           log: (line) => process.stdout.write(`${line}\n`),
         });
+        // Exported on THIS process's env, before `startLocalAgent` spawns
+        // the local agent below (which inherits it) — the actual secret
+        // never touches `.mcp.json` itself (Codex review, 2026-08-24,
+        // round 12: that file is a `${SECRET_ENV_VAR}` template Claude Code
+        // expands against its own inherited env at load time, since many
+        // repos — including this one's own root — already track a
+        // `.mcp.json`, and a YOLO-mode agent committing/pushing it would
+        // publish a live full-workspace credential). Harmless to set even
+        // when `mcpProxyHandle` ends up unused (e.g. a non-claude agent
+        // below).
+        if (mcpProxyHandle) process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
         // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
         // conventions — Codex reads `~/.codex/config.toml`'s
         // `[mcp_servers.*]` instead (`containers/services/container-api/
@@ -311,7 +322,7 @@ async function cmdAttach(args: string[]): Promise<number> {
         if (mcpProxyHandle && resolvedAgentId !== 'claude') {
           process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
         } else if (mcpProxyHandle) {
-          const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url, mcpProxyHandle.secret);
+          const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
           if (!configResult.ok) {
             process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is unparseable or already has its own "yolo-studio" entry — leaving local MCP access unconfigured rather than overwrite it.\n`);
           } else {
@@ -411,15 +422,40 @@ async function cmdAttach(args: string[]): Promise<number> {
   stopLocalAgent();
   // Same "nothing left running detached" discipline for the local MCP
   // proxy: stop the server (drops the delegated token from memory) and
-  // remove the .mcp.json entry we added, if we added one.
-  if (mcpProxyHandle) await mcpProxyHandle.stop();
-  if (mcpTrustRemoval) removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
+  // remove the .mcp.json entry we added, if we added one. Each step is
+  // wrapped individually (Codex review, 2026-08-24, round 12): the removal
+  // helpers' own `writeFileSync`/`unlinkSync` calls are unguarded, and an
+  // exception from any one of them — a permission change or a full disk
+  // mid-session — would otherwise propagate out of this whole cleanup
+  // sequence and skip the SERVER-side detach below entirely, leaving the
+  // tile live on the server even though the local process is exiting. Local
+  // cleanup is best-effort; the server detach is not.
+  if (mcpProxyHandle) {
+    try {
+      await mcpProxyHandle.stop();
+    } catch (err) {
+      process.stdout.write(`yolo-bridge: local MCP proxy shutdown failed (${err instanceof Error ? err.message : String(err)}).\n`);
+    }
+  }
+  if (mcpTrustRemoval) {
+    try {
+      removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
+    } catch (err) {
+      process.stdout.write(`yolo-bridge: local MCP trust cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
+    }
+  }
   // removeLocalMcpConfig only deletes the entry if its CURRENT value still
   // matches the exact URL captured in mcpConfigCleanup, and only unlinks
   // the whole file if THIS attachment is the one that created it
   // (createdFile) -- an undefined mcpConfigCleanup (nothing was ever
   // successfully written) correctly skips the call.
-  if (mcpConfigCleanup) removeLocalMcpConfig(spawnCwd, mcpConfigCleanup.expectedProxyUrl, mcpConfigCleanup.createdFile);
+  if (mcpConfigCleanup) {
+    try {
+      removeLocalMcpConfig(spawnCwd, mcpConfigCleanup.expectedProxyUrl, mcpConfigCleanup.createdFile);
+    } catch (err) {
+      process.stdout.write(`yolo-bridge: local MCP config cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
+    }
+  }
 
   if (!result.ok) {
     if (result.reason === 'not-logged-in') {

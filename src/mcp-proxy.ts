@@ -50,12 +50,21 @@
  * namespace, can still reach a loopback port and would otherwise get a
  * full-workspace-scoped delegated token minted on its behalf with zero
  * credential of its own. `startMcpProxy` generates a random secret and
- * hands it back in `McpProxyHandle.secret`; the caller writes it into
- * `.mcp.json`'s `headers` for this entry (the same field Claude Code's own
- * http-transport config already supports — `mcp-config-writer.js`'s
- * pod-side writer documents the identical shape), so only a process that
- * can READ this project's `.mcp.json` — gated by normal filesystem
- * permissions, unlike the loopback port itself — can authenticate.
+ * hands it back in `McpProxyHandle.secret`.
+ *
+ * The secret itself is NEVER written into `.mcp.json` (round 12 — moved off
+ * round 10/11's original design, which wrote it directly into the entry's
+ * `headers`): many repos, including this one's own root, already track a
+ * `.mcp.json`, and a spawned coding agent running with YOLO-mode autonomy
+ * could commit/push it, publishing a live full-workspace credential.
+ * Instead `local-mcp-config.ts` writes a `${SECRET_ENV_VAR}` TEMPLATE string
+ * as the header value — safe to commit, since it resolves to nothing
+ * without the right environment — and `cli.ts` sets the real secret on
+ * `SECRET_ENV_VAR` in its OWN `process.env` right before spawning the local
+ * agent, which inherits it. Claude Code expands `${VAR}` in `.mcp.json`
+ * string fields against its own process env at load time, so the actual
+ * value only ever exists in memory: this server's, the daemon's, and the
+ * locally-spawned agent's.
  */
 
 import * as http from 'node:http';
@@ -123,6 +132,22 @@ export interface McpProxyHandle {
  *  `headers` for this server entry (Codex review, 2026-08-24, round 10).
  *  Exported so `local-mcp-config.ts` writes the exact same key it checks. */
 export const SECRET_HEADER = 'x-yolobridge-proxy-secret';
+
+/**
+ * Env var the per-attach secret is exported under before the local agent is
+ * spawned — `.mcp.json`'s `headers` value (Codex review, 2026-08-24,
+ * round 12) is `${YOLOBRIDGE_MCP_PROXY_SECRET}` (a literal template string,
+ * expanded by Claude Code's OWN `${VAR}` support for `.mcp.json` at load
+ * time using ITS process env, inherited from this daemon), never the raw
+ * secret. Round 10/11 wrote the actual random value straight into the
+ * entry — safe against another local OS user reading the file (round 11's
+ * chmod fix), but not against Git: many repos (including this one's own
+ * root) already track a `.mcp.json`, and a spawned coding agent running
+ * with YOLO-mode autonomy can commit/push a live full-workspace credential
+ * without anyone reviewing the diff. The secret itself now never touches
+ * any file this daemon writes into the project tree.
+ */
+export const SECRET_ENV_VAR = 'YOLOBRIDGE_MCP_PROXY_SECRET';
 
 interface MintResult {
   token: string;
