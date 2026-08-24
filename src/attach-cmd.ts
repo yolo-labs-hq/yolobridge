@@ -98,9 +98,18 @@ export interface AttachDaemonDeps {
     tileId: string;
     attachmentId: string;
     workspaceId: string;
-    /** The CURRENT (possibly just-refreshed) account access token — needed
-     *  to mint the local MCP proxy's own delegated token. */
+    /** The CURRENT (possibly just-refreshed) account access token, at the
+     *  moment `onAttached` fires — needed for the local MCP proxy's OWN
+     *  first mint. */
     accessToken: string;
+    /** Live getter for the account access token, reflecting this daemon's
+     *  own in-progress `ensureFreshToken` refreshes (Bug 2) — NOT a snapshot
+     *  like `accessToken` above. A long-running MCP proxy started here must
+     *  call this on every mint, not close over the initial `accessToken`:
+     *  the daemon rotates its token roughly every 24h and a proxy holding a
+     *  stale one would 401 on every mint forever once that happens (Codex
+     *  review, 2026-08-24). */
+    getAccessToken: () => string;
   }) => void | Promise<void>;
 }
 
@@ -188,7 +197,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   if (deps.onAttached) {
     try {
-      await deps.onAttached({ tileId, attachmentId, workspaceId, accessToken: currentAuth.accessToken });
+      await deps.onAttached({
+        tileId, attachmentId, workspaceId,
+        accessToken: currentAuth.accessToken,
+        getAccessToken: () => currentAuth.accessToken,
+      });
     } catch (err) {
       log(`onAttached hook failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -216,6 +229,14 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   let heartbeat: HeartbeatScheduler | undefined;
   let attempt = 0;
+  /** Guards clearScreen() to the FIRST 'connected' frame only (Codex review,
+   *  2026-08-24): every SSE reconnect (including a transient network blip
+   *  while the local agent is already mid-session) also delivers a fresh
+   *  'connected' frame, and clearing on each one would wipe the visible
+   *  terminal/scrollback on every reconnect even though the agent's own PTY
+   *  never stopped rendering — a real loss for a long session that just had
+   *  a flaky connection. */
+  let hasClearedOnConnect = false;
   /** Set when a proactive refresh (see ensureFreshToken) fails while a
    * stream is open — picked up right after the current for-await unwinds
    * (forced via the stop-poll below) so the daemon stops instead of
@@ -291,7 +312,10 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                   // once the agent's own UI paints over/past it a moment
                   // later.
                   log('Stream connected.');
-                  clearScreen();
+                  if (!hasClearedOnConnect) {
+                    clearScreen();
+                    hasClearedOnConnect = true;
+                  }
                   heartbeat?.stop();
                   heartbeat = startHeartbeat(
                     async () => {

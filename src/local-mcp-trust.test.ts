@@ -18,14 +18,18 @@ function settingsPath(): string {
   return join(dir, '.claude', 'settings.json');
 }
 
+/** Remove everything this attach added, for tests where the write happened
+ *  against an empty/no-conflicting-entries file (both flags true). */
+const REMOVE_ALL = { removeServerEntry: true, removePermissionEntry: true };
+
 describe('writeLocalMcpTrust', () => {
   it('creates .claude/settings.json from scratch with both approval layers', () => {
-    const ok = writeLocalMcpTrust(dir);
-    assert.equal(ok, true);
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true });
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['yolo-studio'],
-      permissions: { allow: ['mcp__yolo-studio__.*'] },
+      permissions: { allow: ['mcp__yolo-studio__*'] },
     });
   });
 
@@ -42,12 +46,12 @@ describe('writeLocalMcpTrust', () => {
       permissions: { allow: ['Bash(git *)'], deny: ['Bash(rm -rf *)'] },
       someOtherTopLevelKey: 'kept',
     }));
-    const ok = writeLocalMcpTrust(dir);
-    assert.equal(ok, true);
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true });
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['my-own-server', 'yolo-studio'],
-      permissions: { allow: ['Bash(git *)', 'mcp__yolo-studio__.*'], deny: ['Bash(rm -rf *)'] },
+      permissions: { allow: ['Bash(git *)', 'mcp__yolo-studio__*'], deny: ['Bash(rm -rf *)'] },
       someOtherTopLevelKey: 'kept',
     });
   });
@@ -57,14 +61,31 @@ describe('writeLocalMcpTrust', () => {
     writeLocalMcpTrust(dir);
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed.enabledMcpjsonServers, ['yolo-studio']);
-    assert.deepEqual(parsed.permissions.allow, ['mcp__yolo-studio__.*']);
+    assert.deepEqual(parsed.permissions.allow, ['mcp__yolo-studio__*']);
   });
 
-  it('returns false and does not overwrite a pre-existing file that is not valid JSON', () => {
+  it('reports addedServerEntry/addedPermissionEntry as false when those entries already existed, without duplicating them (Codex review, 2026-08-24)', () => {
+    // Simulates the operator having already trusted this server themselves
+    // (e.g. clicked through the prompt once) before ever running `attach`.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify({
+      enabledMcpjsonServers: ['yolo-studio'],
+      permissions: { allow: ['mcp__yolo-studio__*'] },
+    }));
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: true, addedServerEntry: false, addedPermissionEntry: false });
+    const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
+    assert.deepEqual(parsed, {
+      enabledMcpjsonServers: ['yolo-studio'],
+      permissions: { allow: ['mcp__yolo-studio__*'] },
+    });
+  });
+
+  it('returns ok:false and does not overwrite a pre-existing file that is not valid JSON', () => {
     mkdirSync(join(dir, '.claude'), { recursive: true });
     writeFileSync(settingsPath(), 'not json{{{');
-    const ok = writeLocalMcpTrust(dir);
-    assert.equal(ok, false);
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false });
     assert.equal(readFileSync(settingsPath(), 'utf-8'), 'not json{{{');
   });
 });
@@ -73,7 +94,7 @@ describe('removeLocalMcpTrust', () => {
   it('deletes the file entirely if we created it from scratch (no other content)', () => {
     writeLocalMcpTrust(dir);
     assert.ok(existsSync(settingsPath()));
-    removeLocalMcpTrust(dir);
+    removeLocalMcpTrust(dir, REMOVE_ALL);
     assert.equal(existsSync(settingsPath()), false);
   });
 
@@ -84,7 +105,7 @@ describe('removeLocalMcpTrust', () => {
       permissions: { allow: ['Bash(git *)'], deny: ['Bash(rm -rf *)'] },
     }));
     writeLocalMcpTrust(dir);
-    removeLocalMcpTrust(dir);
+    removeLocalMcpTrust(dir, REMOVE_ALL);
     assert.ok(existsSync(settingsPath()), 'file should survive since it had other content');
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
@@ -95,19 +116,38 @@ describe('removeLocalMcpTrust', () => {
 
   it('drops an emptied permissions object entirely rather than leaving {} behind', () => {
     writeLocalMcpTrust(dir);
-    removeLocalMcpTrust(dir);
+    removeLocalMcpTrust(dir, REMOVE_ALL);
     // File was created from scratch by us -> fully deleted, not left as {}.
     assert.equal(existsSync(settingsPath()), false);
   });
 
   it('is a safe no-op when no settings.json exists at all', () => {
-    assert.doesNotThrow(() => removeLocalMcpTrust(dir));
+    assert.doesNotThrow(() => removeLocalMcpTrust(dir, REMOVE_ALL));
   });
 
   it('leaves an unparseable file alone rather than deleting or rewriting it', () => {
     mkdirSync(join(dir, '.claude'), { recursive: true });
     writeFileSync(settingsPath(), 'not json{{{');
-    removeLocalMcpTrust(dir);
+    removeLocalMcpTrust(dir, REMOVE_ALL);
     assert.equal(readFileSync(settingsPath(), 'utf-8'), 'not json{{{');
+  });
+
+  it("does NOT revoke trust the operator granted independently before this attach (Codex review, 2026-08-24)", () => {
+    // The exact scenario the P2 finding described: the operator already had
+    // both entries; writeLocalMcpTrust correctly reports it added neither;
+    // detach must leave them standing, not strip them "by value."
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify({
+      enabledMcpjsonServers: ['yolo-studio'],
+      permissions: { allow: ['mcp__yolo-studio__*'] },
+    }));
+    const result = writeLocalMcpTrust(dir);
+    removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry });
+    assert.ok(existsSync(settingsPath()), 'the operator-granted file must survive detach');
+    const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
+    assert.deepEqual(parsed, {
+      enabledMcpjsonServers: ['yolo-studio'],
+      permissions: { allow: ['mcp__yolo-studio__*'] },
+    });
   });
 });

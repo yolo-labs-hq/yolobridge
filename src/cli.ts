@@ -233,7 +233,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   const spawnCwd = process.cwd();
   let mcpProxyHandle: McpProxyHandle | undefined;
   let wroteMcpConfig = false;
-  let wroteMcpTrust = false;
+  let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean } | undefined;
 
   const result = await runAttachFromDisk({
     workspaceId,
@@ -247,30 +247,64 @@ async function cmdAttach(args: string[]): Promise<number> {
     // skipped, not fatal — MCP access is an enhancement on a tile that
     // already works without it (send_to_tile/read_tile_output are
     // unaffected either way).
-    onAttached: async ({ accessToken }) => {
-      mcpProxyHandle = await startMcpProxy({
-        apiUrl: apiUrl(),
-        accessToken,
-        workspaceId,
-        agentId: agentBin ?? DEFAULT_AGENT_BIN,
-        log: (line) => process.stdout.write(`${line}\n`),
-      });
-      if (mcpProxyHandle) {
-        wroteMcpConfig = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
-        if (!wroteMcpConfig) {
-          process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is not valid JSON — leaving local MCP access unconfigured.\n`);
-        } else {
-          // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
-          // its own tool-call approvals) so Claude Code doesn't sit on an
-          // interactive "New MCP server found" / per-tool-call prompt with
-          // nobody watching. Best-effort: a failure here still leaves the
-          // MCP server configured and usable, just with the normal
-          // approval prompts, so it's logged rather than fatal.
-          wroteMcpTrust = writeLocalMcpTrust(spawnCwd);
-          if (!wroteMcpTrust) {
-            process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.claude/settings.json is not valid JSON — MCP tool calls will need manual approval.\n`);
+    onAttached: async ({ getAccessToken }) => {
+      // Isolated from `startLocalAgent` below on purpose (Codex review,
+      // 2026-08-24): `startMcpProxy` itself never throws, but
+      // `writeLocalMcpConfig`/`writeLocalMcpTrust` do plain synchronous
+      // `fs` writes (e.g. a read-only `spawnCwd` throws EACCES) — without
+      // this try/catch, that exception propagates out of the WHOLE
+      // `onAttached` callback (`runAttachDaemon`'s own best-effort wrapper
+      // only logs it), and `startLocalAgent` — later in this same
+      // callback — never runs. That leaves a daemon holding a live
+      // attachment + SSE stream with no local PTY to ever receive a
+      // prompt. MCP access is an enhancement on a tile that already works
+      // without it; the local agent spawning is not optional.
+      try {
+        mcpProxyHandle = await startMcpProxy({
+          apiUrl: apiUrl(),
+          getAccessToken,
+          workspaceId,
+          agentId: agentBin ?? DEFAULT_AGENT_BIN,
+          log: (line) => process.stdout.write(`${line}\n`),
+        });
+        // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
+        // conventions — Codex reads `~/.codex/config.toml`'s
+        // `[mcp_servers.*]` instead (`containers/services/container-api/
+        // mcp-config-writer.js:5-7`). Writing Claude's files for a
+        // non-Claude `--agent` would silently configure nothing that
+        // binary ever reads (Codex review, 2026-08-24) — the proxy still
+        // starts (harmless, agent-agnostic), but only Claude gets it
+        // wired in until a Codex-format writer exists.
+        const resolvedAgentBin = agentBin ?? DEFAULT_AGENT_BIN;
+        if (mcpProxyHandle && resolvedAgentBin !== 'claude') {
+          process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for --agent claude (got "${resolvedAgentBin}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
+        } else if (mcpProxyHandle) {
+          wroteMcpConfig = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
+          if (!wroteMcpConfig) {
+            process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is unparseable or already has its own "yolo-studio" entry — leaving local MCP access unconfigured rather than overwrite it.\n`);
+          } else {
+            // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
+            // its own tool-call approvals) so Claude Code doesn't sit on an
+            // interactive "New MCP server found" / per-tool-call prompt with
+            // nobody watching. Best-effort: a failure here still leaves the
+            // MCP server configured and usable, just with the normal
+            // approval prompts, so it's logged rather than fatal.
+            const trustResult = writeLocalMcpTrust(spawnCwd);
+            if (!trustResult.ok) {
+              process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.claude/settings.json is not valid JSON — MCP tool calls will need manual approval.\n`);
+            } else {
+              // Only remove on cleanup what THIS attach actually inserted —
+              // an entry the operator already had (added_*Entry: false)
+              // was their own standing trust grant, not ours to revoke.
+              mcpTrustRemoval = {
+                removeServerEntry: trustResult.addedServerEntry,
+                removePermissionEntry: trustResult.addedPermissionEntry,
+              };
+            }
           }
         }
+      } catch (err) {
+        process.stdout.write(`yolo-bridge: local MCP setup failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.\n`);
       }
 
       // Spawns the local coding agent under a real PTY — this is what
@@ -311,7 +345,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   // proxy: stop the server (drops the delegated token from memory) and
   // remove the .mcp.json entry we added, if we added one.
   if (mcpProxyHandle) await mcpProxyHandle.stop();
-  if (wroteMcpTrust) removeLocalMcpTrust(spawnCwd);
+  if (mcpTrustRemoval) removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
   if (wroteMcpConfig) removeLocalMcpConfig(spawnCwd);
 
   if (!result.ok) {

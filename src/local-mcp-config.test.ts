@@ -43,11 +43,23 @@ describe('writeLocalMcpConfig', () => {
     });
   });
 
-  it('overwrites a stale yolo-studio entry from a previous session (a new proxy port each attach)', () => {
+  it("refuses to overwrite an EXISTING yolo-studio entry, even a stale one from a crashed previous attach (Codex review, 2026-08-24)", () => {
+    // A `.mcp.json` shape gives no way to tell "yolo-bridge wrote this
+    // last time" apart from "the operator hand-authored their own
+    // yolo-studio server" -- they're byte-identical. Overwriting on that
+    // ambiguity (the original behavior here) meant a hand-authored entry
+    // got silently replaced, AND later deleted by removeLocalMcpConfig on
+    // detach, since that function only ever knows "delete the yolo-studio
+    // key," not "was this ours." Refusing to touch ANY pre-existing entry
+    // trades a rare, self-explaining failure mode (an attach after an
+    // earlier crash leaves local MCP access unconfigured until the stale
+    // entry is removed by hand) for never silently destroying a user's own
+    // config -- the same trade-off local-mcp-trust.ts makes.
     writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:9999/mcp' } } }));
-    writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(ok, false);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:4123/mcp');
+    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:9999/mcp', 'the existing entry must be left exactly as it was');
   });
 
   it('returns false and does not overwrite a pre-existing file that is not valid JSON', () => {

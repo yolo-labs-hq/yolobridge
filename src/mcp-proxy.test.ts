@@ -103,7 +103,7 @@ describe('startMcpProxy', () => {
 
     handle = await startMcpProxy({
       apiUrl: 'https://api.example.com',
-      accessToken: 'account-tok',
+      getAccessToken: () => 'account-tok',
       workspaceId: 'w1',
       agentId: 'claude',
       fetchImpl,
@@ -143,7 +143,7 @@ describe('startMcpProxy', () => {
     });
 
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
     });
     await fetch(handle!.url, {
       method: 'POST',
@@ -174,7 +174,7 @@ describe('startMcpProxy', () => {
     });
 
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
     });
     const res = await fetch(handle!.url, {
       method: 'POST',
@@ -220,7 +220,7 @@ describe('startMcpProxy', () => {
     });
 
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
     });
     const res = await fetch(handle!.url, {
       method: 'POST',
@@ -254,7 +254,7 @@ describe('startMcpProxy', () => {
     });
 
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
     });
     await fetch(handle!.url, {
       method: 'POST',
@@ -273,7 +273,7 @@ describe('startMcpProxy', () => {
     });
 
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
     });
     for (let i = 0; i < 3; i++) {
       await fetch(handle!.url, {
@@ -297,7 +297,7 @@ describe('startMcpProxy', () => {
 
     const logs: string[] = [];
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'whatever', fetchImpl, log: (l) => logs.push(l),
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'whatever', fetchImpl, log: (l) => logs.push(l),
     });
     assert.equal(handle, undefined);
     assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
@@ -312,7 +312,7 @@ describe('startMcpProxy', () => {
 
     const logs: string[] = [];
     handle = await startMcpProxy({
-      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: (l) => logs.push(l),
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: (l) => logs.push(l),
     });
     assert.equal(handle, undefined);
     assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));

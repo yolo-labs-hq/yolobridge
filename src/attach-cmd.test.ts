@@ -187,7 +187,47 @@ describe('runAttachDaemon', () => {
     assert.ok(clearIdx > connectedLogIdx, 'clearScreen must fire after the Stream connected. log line');
   });
 
-  it('calls onAttached exactly once, with the real tileId/attachmentId/accessToken, before the stream ever opens', async () => {
+  it("does NOT clear the terminal again on a RECONNECT's 'connected' frame -- only the first one (Codex review, 2026-08-24)", async () => {
+    // Two 'connected' frames in one stream stands in for a reconnect (a
+    // transient network blip while the local agent is already mid-session
+    // never actually drops this test's one fetch/stream, but the daemon's
+    // frame handling can't tell that apart from a real reconnect -- both
+    // just see another 'connected' event). Wiping the screen a second time
+    // would be a real loss of visible scrollback for content the agent's
+    // own PTY never actually stopped rendering.
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t2"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const calls: string[] = [];
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => calls.push(`log:${line}`),
+      clearScreen: () => calls.push('clear'),
+      deliverPrompt: async () => {},
+      captureOutput: async () => ({ output: 'unused', busy: false }),
+      shouldStop: () => false,
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(calls.filter((c) => c === 'log:Stream connected.').length, 2, 'sanity check: both connected frames were processed');
+    assert.deepEqual(calls.filter((c) => c === 'clear'), ['clear'], 'exactly one clear, from the FIRST connected frame only');
+  });
+
+  it('calls onAttached exactly once, with the real tileId/attachmentId/accessToken/getAccessToken, before the stream ever opens', async () => {
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
@@ -226,7 +266,10 @@ describe('runAttachDaemon', () => {
     });
 
     assert.equal(onAttachedCalls, 1);
-    assert.deepEqual(onAttachedInfo, { tileId: 'tile-1', attachmentId: 'a1', workspaceId: 'w1', accessToken: 'at' });
+    const { getAccessToken, ...rest } = onAttachedInfo as { getAccessToken: () => string; [k: string]: unknown };
+    assert.deepEqual(rest, { tileId: 'tile-1', attachmentId: 'a1', workspaceId: 'w1', accessToken: 'at' });
+    assert.equal(typeof getAccessToken, 'function');
+    assert.equal(getAccessToken(), 'at', 'getAccessToken must read the CURRENT token, not just echo the snapshot');
     assert.equal(streamOpenedBeforeOnAttached, false, 'onAttached must fire before the SSE stream opens');
   });
 
@@ -522,6 +565,65 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       tokenType: 'Bearer',
       expiresAtMs: 1_000_000 + 3600_000,
     });
+  });
+
+  it("onAttached's getAccessToken reflects a LATER mid-stream refresh, not just the token at attach time (Codex review, 2026-08-24)", async () => {
+    // Regression guard: onAttached fires once, early, with a snapshot
+    // `accessToken` — a caller (mcp-proxy.ts) that captured that string
+    // directly instead of calling getAccessToken() on every use would 401
+    // forever once this daemon's own proactive refresh rotated the token
+    // out from under it. getAccessToken must read the CURRENT value.
+    const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    let clock = 1_000_000;
+    const freshAuth: StoredAuth = { accessToken: 'at-1', refreshToken: 'rt-1', tokenType: 'Bearer', expiresAtMs: clock + 3600_000 };
+    const refreshAccessToken: RefreshTokenFn = async () => ({
+      status: 'ok',
+      tokens: { accessToken: 'at-2', refreshToken: 'rt-2', expiresInSec: 3600, expiresAtMs: clock + 7200_000 },
+    });
+
+    let capturedGetAccessToken: (() => string) | undefined;
+    let stopFlag = false;
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: freshAuth,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      now: () => clock,
+      refreshAccessToken,
+      timers,
+      shouldStop: () => stopFlag,
+      onAttached: async ({ getAccessToken }) => { capturedGetAccessToken = getAccessToken; },
+    });
+
+    await waitUntil(() => capturedGetAccessToken !== undefined);
+    assert.equal(capturedGetAccessToken!(), 'at-1', 'sanity check: reads the original token before any refresh');
+
+    await waitUntil(() => timers.intervals.length >= 2);
+    clock += 3600_000; // now within the refresh buffer of expiry
+    for (let i = 0; i < 20; i++) {
+      timers.tick(1);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    assert.equal(capturedGetAccessToken!(), 'at-2', 'getAccessToken must reflect the refreshed token, not the attach-time snapshot');
+
+    stopFlag = true;
+    timers.tick(1); // fires the stop-poll callback, which must destroy() the stream
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after mid-stream refresh + stop');
+    assert.deepEqual(result, { ok: true, reason: 'stopped' });
   });
 
   it('does not refresh when the access token still has plenty of validity left', async () => {

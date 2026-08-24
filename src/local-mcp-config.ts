@@ -42,9 +42,15 @@ function readConfig(path: string): Record<string, unknown> {
 }
 
 /**
- * Adds/updates the `yolo-studio` entry pointing at the local proxy. Returns
- * `false` (does nothing further) if an existing `.mcp.json` can't be parsed,
- * rather than overwriting a file the user may have hand-authored.
+ * Adds the `yolo-studio` entry pointing at the local proxy. Returns `false`
+ * (does nothing further) if an existing `.mcp.json` can't be parsed, OR if
+ * a `yolo-studio` entry is ALREADY there (Codex review, 2026-08-24): a
+ * hand-authored entry with that name is the user's own config, not ours to
+ * overwrite — and `removeLocalMcpConfig` only ever deletes this one key, so
+ * overwriting it here would mean detach later deletes the user's own entry,
+ * not just reverts ours. Refusing to touch it at write time is what makes
+ * "only ever delete what we added" true at cleanup time, without needing to
+ * snapshot/restore a prior value.
  */
 export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
   const path = mcpJsonPath(cwd);
@@ -55,6 +61,7 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
     return false;
   }
   const servers = (config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {}) as Record<string, unknown>;
+  if (SERVER_NAME in servers) return false;
   servers[SERVER_NAME] = { type: 'http', url: proxyUrl };
   config.mcpServers = servers;
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');

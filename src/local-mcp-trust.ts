@@ -12,12 +12,13 @@
  * current Claude Code docs, not assumed):
  *   1. Server discovery/trust ("New MCP server found") -- `enabledMcpjsonServers`.
  *   2. Per-tool-call approval -- `permissions.allow` with an
- *      `mcp__<server>__<tool>` pattern (`.*` wildcard for "every tool this
- *      server exposes").
+ *      `mcp__<server>__<tool>` pattern (`*` wildcard for "every tool this
+ *      server exposes"; Claude Code's own docs, matched independently
+ *      against a Codex review finding 2026-08-24 -- see below).
  *
  * Deliberately narrow, same reasoning as `local-mcp-config.ts`: this adds
  * ONLY `enabledMcpjsonServers: ["yolo-studio"]` and
- * `permissions.allow: ["mcp__yolo-studio__.*"]` -- never
+ * `permissions.allow: ["mcp__yolo-studio__*"]` -- never
  * `enableAllProjectMcpServers` (would trust future/unrelated MCP servers
  * too) and never `--dangerously-skip-permissions`-equivalent blanket rules.
  * Every other key in an existing `.claude/settings.json` (the user's own
@@ -41,7 +42,15 @@ import { join, dirname } from 'node:path';
  *  independent constant (not imported) since these two modules are meant to
  *  be usable/testable independently of each other. */
 const SERVER_NAME = 'yolo-studio';
-const TOOL_PATTERN = `mcp__${SERVER_NAME}__.*`;
+// Shell-glob wildcard, NOT regex -- Claude Code's permission matching treats
+// `*` as "any tool from this server" (docs.claude.com/en/docs/claude-code/
+// permissions, "tool name wildcards"). A `.*` here (as this constant
+// originally read) requires a literal dot before the wildcard, which no real
+// `mcp__yolo-studio__<tool>` id has -- so it silently matched NOTHING, and
+// pre-trust never actually worked: every tool call still prompted for manual
+// approval. Found by Codex review (2026-08-24), confirmed independently
+// against current docs before fixing (not just taken on faith).
+const TOOL_PATTERN = `mcp__${SERVER_NAME}__*`;
 
 function settingsPath(cwd: string): string {
   return join(cwd, '.claude', 'settings.json');
@@ -61,46 +70,70 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 }
 
+export interface McpTrustWriteResult {
+  ok: boolean;
+  /** True only if `SERVER_NAME` was NOT already in `enabledMcpjsonServers`
+   *  before this call -- i.e. we're the ones who added it. */
+  addedServerEntry: boolean;
+  /** True only if `TOOL_PATTERN` was NOT already in `permissions.allow`
+   *  before this call. */
+  addedPermissionEntry: boolean;
+}
+
 /**
  * Adds the `yolo-studio` MCP-trust entries to `.claude/settings.json`.
- * Returns `false` (does nothing further) if an existing settings file can't
- * be parsed, rather than overwriting a file the user hand-authored --
+ * Returns `ok: false` (does nothing further) if an existing settings file
+ * can't be parsed, rather than overwriting a file the user hand-authored --
  * matches `writeLocalMcpConfig`'s own refusal behavior exactly.
+ *
+ * Tracks which entries it ACTUALLY inserted vs. which were already present
+ * (Codex review, 2026-08-24): if the operator had already trusted this
+ * server themselves before ever running `attach`, that's their own
+ * standing choice, not something this attach owns -- `removeLocalMcpTrust`
+ * must be told which entries to remove rather than unconditionally
+ * stripping by value, or a detach would revoke trust the operator granted
+ * independently.
  */
-export function writeLocalMcpTrust(cwd: string): boolean {
+export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   const path = settingsPath(cwd);
   let settings: Record<string, unknown>;
   try {
     settings = readSettings(path);
   } catch {
-    return false;
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
   }
 
   const enabled = new Set(asStringArray(settings.enabledMcpjsonServers));
+  const addedServerEntry = !enabled.has(SERVER_NAME);
   enabled.add(SERVER_NAME);
   settings.enabledMcpjsonServers = [...enabled];
 
   const permissions = (settings.permissions && typeof settings.permissions === 'object' ? settings.permissions : {}) as Record<string, unknown>;
   const allow = new Set(asStringArray(permissions.allow));
+  const addedPermissionEntry = !allow.has(TOOL_PATTERN);
   allow.add(TOOL_PATTERN);
   permissions.allow = [...allow];
   settings.permissions = permissions;
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
-  return true;
+  return { ok: true, addedServerEntry, addedPermissionEntry };
 }
 
 /**
- * Removes exactly the `yolo-studio` entries this module added
- * (`enabledMcpjsonServers` entry, the one `permissions.allow` pattern) --
- * never touches any other server name, allow/deny rule, hook, or other
- * top-level key. Deletes `.claude/settings.json` (and its directory, if now
- * empty) only if we created it from scratch and nothing else was ever
- * added to it; a file with any other content is left in place, minus just
- * our two additions.
+ * Removes only the `yolo-studio` entries THIS attach actually added
+ * (`removeServerEntry`/`removePermissionEntry`, from `writeLocalMcpTrust`'s
+ * own return) -- never touches any other server name, allow/deny rule,
+ * hook, other top-level key, or an entry the operator had already granted
+ * before this attach. Deletes `.claude/settings.json` (and its directory,
+ * if now empty) only if we created it from scratch and nothing else was
+ * ever added to it; a file with any other content is left in place, minus
+ * just what this attach added.
  */
-export function removeLocalMcpTrust(cwd: string): void {
+export function removeLocalMcpTrust(
+  cwd: string,
+  opts: { removeServerEntry: boolean; removePermissionEntry: boolean },
+): void {
   const path = settingsPath(cwd);
   if (!existsSync(path)) return;
   let settings: Record<string, unknown>;
@@ -110,12 +143,14 @@ export function removeLocalMcpTrust(cwd: string): void {
     return;
   }
 
-  const enabled = asStringArray(settings.enabledMcpjsonServers).filter((s) => s !== SERVER_NAME);
-  if (enabled.length > 0) settings.enabledMcpjsonServers = enabled;
-  else delete settings.enabledMcpjsonServers;
+  if (opts.removeServerEntry) {
+    const enabled = asStringArray(settings.enabledMcpjsonServers).filter((s) => s !== SERVER_NAME);
+    if (enabled.length > 0) settings.enabledMcpjsonServers = enabled;
+    else delete settings.enabledMcpjsonServers;
+  }
 
   const permissions = (settings.permissions && typeof settings.permissions === 'object' ? settings.permissions : undefined) as Record<string, unknown> | undefined;
-  if (permissions) {
+  if (permissions && opts.removePermissionEntry) {
     const allow = asStringArray(permissions.allow).filter((p) => p !== TOOL_PATTERN);
     if (allow.length > 0) permissions.allow = allow;
     else delete permissions.allow;

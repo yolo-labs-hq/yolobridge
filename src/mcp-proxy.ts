@@ -68,8 +68,13 @@ export type FetchImpl = typeof fetch;
 export interface McpProxyOptions {
   /** common-api base URL (yolobridge's own apiUrl()) — where tokens are minted. */
   apiUrl: string;
-  /** The account access token already in ~/.config/yolobridge/auth.json. */
-  accessToken: string;
+  /** Live getter for the account access token (NOT a one-time snapshot) —
+   *  the attach daemon proactively refreshes this roughly every 24h
+   *  (Bug 2 in attach-cmd.ts's `ensureFreshToken`), and this proxy can
+   *  outlive many of those refreshes over a long-running attachment.
+   *  Called fresh on every mint; closing over a static token instead would
+   *  401 forever once the original one expired (Codex review, 2026-08-24). */
+  getAccessToken: () => string;
   workspaceId: string;
   /** The agent binary being spawned (e.g. 'claude', 'codex') — minted as-is;
    *  must be a registered agent with a spawnable binary (`isHttpMintableAgent`
@@ -112,7 +117,7 @@ async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl): Promise<str
  *  universe (see this file's header comment). */
 function makeTokenCache(
   apiUrl: string,
-  accessToken: string,
+  getAccessToken: () => string,
   workspaceId: string,
   agentId: string,
   fetchImpl: FetchImpl,
@@ -123,7 +128,7 @@ function makeTokenCache(
     const scopes = await fetchAllScopes(apiUrl, fetchImpl);
     const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${getAccessToken()}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         workspaceId,
         agentId,
@@ -172,7 +177,7 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
   const log = opts.log ?? (() => {});
   const fetchImpl = opts.fetchImpl ?? fetch;
 
-  const tokenCache = makeTokenCache(opts.apiUrl, opts.accessToken, opts.workspaceId, opts.agentId, fetchImpl);
+  const tokenCache = makeTokenCache(opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, fetchImpl);
 
   try {
     await tokenCache.getToken();
