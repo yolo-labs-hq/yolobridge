@@ -192,14 +192,32 @@ function makeTokenCache(
     return { token: body.token, expiresAtMs: new Date(body.expiresAt).getTime() };
   }
 
+  // Coalesces concurrent mints into ONE in-flight request (Codex review,
+  // 2026-08-24, round 6): agents commonly issue several tool calls at
+  // once, and without this every one of them that happened to observe an
+  // expired/near-expiry cache independently kicked off its own
+  // scope-discovery + mint round trip — a recurring burst against the
+  // mint endpoint that could trigger throttling, not just wasted work.
+  // `forceRefresh` shares the same gate: if a 401-triggered refresh
+  // overlaps a plain getToken() mint already in flight, they both just
+  // want "a fresh token," so reusing that one request is correct, not a
+  // shortcut.
+  let pendingMint: Promise<MintResult> | undefined;
+  function mintOnce(): Promise<MintResult> {
+    if (!pendingMint) {
+      pendingMint = mint().finally(() => { pendingMint = undefined; });
+    }
+    return pendingMint;
+  }
+
   return {
     async getToken(): Promise<string> {
       if (cached && Date.now() < cached.expiresAtMs - REFRESH_BUFFER_MS) return cached.token;
-      cached = await mint();
+      cached = await mintOnce();
       return cached.token;
     },
     async forceRefresh(): Promise<string> {
-      cached = await mint();
+      cached = await mintOnce();
       return cached.token;
     },
   };

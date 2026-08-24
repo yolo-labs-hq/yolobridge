@@ -20,12 +20,12 @@ function settingsPath(): string {
 
 /** Remove everything this attach added, for tests where the write happened
  *  against an empty/no-conflicting-entries file (both flags true). */
-const REMOVE_ALL = { removeServerEntry: true, removePermissionEntry: true };
+const REMOVE_ALL = { removeServerEntry: true, removePermissionEntry: true, createdFile: true };
 
 describe('writeLocalMcpTrust', () => {
   it('creates .claude/settings.json from scratch with both approval layers', () => {
     const result = writeLocalMcpTrust(dir);
-    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true });
+    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true, createdFile: true });
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['yolo-studio'],
@@ -47,7 +47,7 @@ describe('writeLocalMcpTrust', () => {
       someOtherTopLevelKey: 'kept',
     }));
     const result = writeLocalMcpTrust(dir);
-    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true });
+    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true, createdFile: false });
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['my-own-server', 'yolo-studio'],
@@ -73,7 +73,7 @@ describe('writeLocalMcpTrust', () => {
       permissions: { allow: ['mcp__yolo-studio__*'] },
     }));
     const result = writeLocalMcpTrust(dir);
-    assert.deepEqual(result, { ok: true, addedServerEntry: false, addedPermissionEntry: false });
+    assert.deepEqual(result, { ok: true, addedServerEntry: false, addedPermissionEntry: false, createdFile: false });
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['yolo-studio'],
@@ -85,7 +85,7 @@ describe('writeLocalMcpTrust', () => {
     mkdirSync(join(dir, '.claude'), { recursive: true });
     writeFileSync(settingsPath(), 'not json{{{');
     const result = writeLocalMcpTrust(dir);
-    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false });
+    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false });
     assert.equal(readFileSync(settingsPath(), 'utf-8'), 'not json{{{');
   });
 
@@ -94,7 +94,7 @@ describe('writeLocalMcpTrust', () => {
     for (const content of ['[1,2,3]', 'null', '42', '"a string"']) {
       writeFileSync(settingsPath(), content);
       const result = writeLocalMcpTrust(dir);
-      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false }, `expected refusal for root content: ${content}`);
+      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false }, `expected refusal for root content: ${content}`);
       assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for root content: ${content}`);
     }
   });
@@ -104,7 +104,7 @@ describe('writeLocalMcpTrust', () => {
     const content = '{"enabledMcpjsonServers":"not-an-array"}';
     writeFileSync(settingsPath(), content);
     const result = writeLocalMcpTrust(dir);
-    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false });
+    assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false });
     assert.equal(readFileSync(settingsPath(), 'utf-8'), content);
   });
 
@@ -120,7 +120,7 @@ describe('writeLocalMcpTrust', () => {
       const content = `{"permissions":${body}}`;
       writeFileSync(settingsPath(), content);
       const result = writeLocalMcpTrust(dir);
-      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false }, `expected refusal for permissions: ${body}`);
+      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false }, `expected refusal for permissions: ${body}`);
       assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for permissions: ${body}`);
     }
   });
@@ -141,7 +141,7 @@ describe('removeLocalMcpTrust', () => {
       permissions: { allow: ['Bash(git *)'], deny: ['Bash(rm -rf *)'] },
     }));
     writeLocalMcpTrust(dir);
-    removeLocalMcpTrust(dir, REMOVE_ALL);
+    removeLocalMcpTrust(dir, { removeServerEntry: true, removePermissionEntry: true, createdFile: false });
     assert.ok(existsSync(settingsPath()), 'file should survive since it had other content');
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
@@ -185,12 +185,22 @@ describe('removeLocalMcpTrust', () => {
       permissions: { allow: ['mcp__yolo-studio__*'] },
     }));
     const result = writeLocalMcpTrust(dir);
-    removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry });
+    removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry, createdFile: result.createdFile });
     assert.ok(existsSync(settingsPath()), 'the operator-granted file must survive detach');
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['yolo-studio'],
       permissions: { allow: ['mcp__yolo-studio__*'] },
     });
+  });
+
+  it('does NOT unlink a pre-existing (createdFile:false) settings.json even when removing our entries leaves it empty (Codex review, 2026-08-24, round 6)', () => {
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify({}));
+    const result = writeLocalMcpTrust(dir);
+    assert.equal(result.createdFile, false);
+    removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry, createdFile: result.createdFile });
+    assert.ok(existsSync(settingsPath()), 'the pre-existing file must survive, even though it is now empty');
+    assert.deepEqual(JSON.parse(readFileSync(settingsPath(), 'utf-8')), {});
   });
 });

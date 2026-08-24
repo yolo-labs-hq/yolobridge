@@ -257,8 +257,8 @@ async function cmdAttach(args: string[]): Promise<number> {
 
   const spawnCwd = process.cwd();
   let mcpProxyHandle: McpProxyHandle | undefined;
-  let wroteMcpConfig = false;
-  let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean } | undefined;
+  let mcpConfigCleanup: { expectedProxyUrl: string; createdFile: boolean } | undefined;
+  let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean } | undefined;
 
   const result = await runAttachFromDisk({
     workspaceId,
@@ -311,10 +311,11 @@ async function cmdAttach(args: string[]): Promise<number> {
         if (mcpProxyHandle && resolvedAgentId !== 'claude') {
           process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
         } else if (mcpProxyHandle) {
-          wroteMcpConfig = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
-          if (!wroteMcpConfig) {
+          const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
+          if (!configResult.ok) {
             process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is unparseable or already has its own "yolo-studio" entry — leaving local MCP access unconfigured rather than overwrite it.\n`);
           } else {
+            mcpConfigCleanup = { expectedProxyUrl: mcpProxyHandle.url, createdFile: configResult.createdFile };
             // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
             // its own tool-call approvals) so Claude Code doesn't sit on an
             // interactive "New MCP server found" / per-tool-call prompt with
@@ -331,6 +332,7 @@ async function cmdAttach(args: string[]): Promise<number> {
               mcpTrustRemoval = {
                 removeServerEntry: trustResult.addedServerEntry,
                 removePermissionEntry: trustResult.addedPermissionEntry,
+                createdFile: trustResult.createdFile,
               };
             }
           }
@@ -409,14 +411,14 @@ async function cmdAttach(args: string[]): Promise<number> {
   // Same "nothing left running detached" discipline for the local MCP
   // proxy: stop the server (drops the delegated token from memory) and
   // remove the .mcp.json entry we added, if we added one.
-  const proxyUrlForCleanup = mcpProxyHandle?.url;
   if (mcpProxyHandle) await mcpProxyHandle.stop();
   if (mcpTrustRemoval) removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
-  // Captured BEFORE stop() above (stop() itself doesn't clear .url, but this
-  // keeps the dependency explicit) -- removeLocalMcpConfig only deletes the
-  // entry if its CURRENT value still matches this exact URL, so a `false`
-  // wroteMcpConfig (nothing to verify against) correctly skips the call.
-  if (wroteMcpConfig && proxyUrlForCleanup) removeLocalMcpConfig(spawnCwd, proxyUrlForCleanup);
+  // removeLocalMcpConfig only deletes the entry if its CURRENT value still
+  // matches the exact URL captured in mcpConfigCleanup, and only unlinks
+  // the whole file if THIS attachment is the one that created it
+  // (createdFile) -- an undefined mcpConfigCleanup (nothing was ever
+  // successfully written) correctly skips the call.
+  if (mcpConfigCleanup) removeLocalMcpConfig(spawnCwd, mcpConfigCleanup.expectedProxyUrl, mcpConfigCleanup.createdFile);
 
   if (!result.ok) {
     if (result.reason === 'not-logged-in') {

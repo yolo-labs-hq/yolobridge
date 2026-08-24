@@ -20,19 +20,19 @@ function mcpJsonPath(): string {
 
 describe('writeLocalMcpConfig', () => {
   it('creates .mcp.json from scratch with the yolo-studio entry', () => {
-    const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    assert.equal(ok, true);
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed, { mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' } } });
   });
 
-  it('preserves other server entries and top-level keys already in the file', () => {
+  it('preserves other server entries and top-level keys already in the file, and reports createdFile:false', () => {
     writeFileSync(mcpJsonPath(), JSON.stringify({
       mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } },
       someOtherTopLevelKey: 'kept',
     }));
-    const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    assert.equal(ok, true);
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       mcpServers: {
@@ -43,45 +43,53 @@ describe('writeLocalMcpConfig', () => {
     });
   });
 
-  it("refuses to overwrite an EXISTING yolo-studio entry, even a stale one from a crashed previous attach (Codex review, 2026-08-24)", () => {
-    // A `.mcp.json` shape gives no way to tell "yolo-bridge wrote this
-    // last time" apart from "the operator hand-authored their own
-    // yolo-studio server" -- they're byte-identical. Overwriting on that
-    // ambiguity (the original behavior here) meant a hand-authored entry
-    // got silently replaced, AND later deleted by removeLocalMcpConfig on
-    // detach, since that function only ever knows "delete the yolo-studio
-    // key," not "was this ours." Refusing to touch ANY pre-existing entry
-    // trades a rare, self-explaining failure mode (an attach after an
-    // earlier crash leaves local MCP access unconfigured until the stale
-    // entry is removed by hand) for never silently destroying a user's own
-    // config -- the same trade-off local-mcp-trust.ts makes.
-    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:9999/mcp' } } }));
-    const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    assert.equal(ok, false);
+  it("refuses to overwrite an EXISTING yolo-studio entry that does NOT look like ours -- a real hand-authored config, not a stale loopback entry", () => {
+    // A real, hand-authored entry has no reason to point at 127.0.0.1 -- a
+    // human configuring MCP directly would point at the actual, stable
+    // yolo-studio-mcp endpoint. This is genuinely foreign config, not ours
+    // to touch.
+    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'https://services.yolo.studio/mcp' } } }));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:9999/mcp', 'the existing entry must be left exactly as it was');
+    assert.equal(parsed.mcpServers['yolo-studio'].url, 'https://services.yolo.studio/mcp', 'the existing entry must be left exactly as it was');
   });
 
-  it('returns false and does not overwrite a pre-existing file that is not valid JSON', () => {
+  it("overwrites a STALE loopback entry left behind by an uncleanly-terminated previous attach (Codex review, 2026-08-24, round 6)", () => {
+    // Distinct from the case above: this entry's shape IS what this module
+    // itself writes (http://127.0.0.1:<port>/mcp) -- almost certainly ours
+    // from a session that exited via SIGKILL/crash/reboot and never reached
+    // its own removeLocalMcpConfig call, not a hand-authored config.
+    // Refusing unconditionally (the original round-2 fix) would brick local
+    // MCP access on every subsequent attach until the operator manually
+    // edited the file.
+    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:9999/mcp' } } }));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: false });
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:4123/mcp');
+  });
+
+  it('returns ok:false and does not overwrite a pre-existing file that is not valid JSON', () => {
     writeFileSync(mcpJsonPath(), 'not json{{{');
-    const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    assert.equal(ok, false);
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: false, createdFile: false });
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), 'not json{{{');
   });
 
-  it('returns false and does not touch a pre-existing file whose JSON root is an array or other non-object (Codex review, 2026-08-24)', () => {
+  it('returns ok:false and does not touch a pre-existing file whose JSON root is an array or other non-object (Codex review, 2026-08-24)', () => {
     // `typeof [] === 'object'` -- a naive `typeof parsed === 'object'` check
     // (the original bug here) would have cast an array straight into
     // Record<string, unknown> and silently corrupted it on write.
     for (const content of ['[1,2,3]', 'null', '42', '"a string"']) {
       writeFileSync(mcpJsonPath(), content);
-      const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-      assert.equal(ok, false, `expected refusal for root content: ${content}`);
+      const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+      assert.equal(result.ok, false, `expected refusal for root content: ${content}`);
       assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), content, `file must be untouched for root content: ${content}`);
     }
   });
 
-  it('returns false and does not touch a pre-existing file whose mcpServers value is malformed (array or a primitive) (Codex review, 2026-08-24, round 2)', () => {
+  it('returns ok:false and does not touch a pre-existing file whose mcpServers value is malformed (array or a primitive) (Codex review, 2026-08-24, round 2)', () => {
     // Same class of bug one level deeper: `typeof [] === 'object'` also
     // passed the OLD nested-value check, so an array `mcpServers` would
     // have had SERVER_NAME assigned as a non-index property (silently
@@ -90,8 +98,8 @@ describe('writeLocalMcpConfig', () => {
     // replaced with a fresh {}, discarding it.
     for (const mcpServers of ['[1,2,3]', '"a string"', '42']) {
       writeFileSync(mcpJsonPath(), `{"mcpServers":${mcpServers}}`);
-      const ok = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-      assert.equal(ok, false, `expected refusal for mcpServers: ${mcpServers}`);
+      const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+      assert.equal(result.ok, false, `expected refusal for mcpServers: ${mcpServers}`);
       assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), `{"mcpServers":${mcpServers}}`, `file must be untouched for mcpServers: ${mcpServers}`);
     }
   });
@@ -101,7 +109,7 @@ describe('removeLocalMcpConfig', () => {
   it('deletes the file entirely if we created it from scratch (no other content)', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.ok(existsSync(mcpJsonPath()));
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     assert.equal(existsSync(mcpJsonPath()), false);
   });
 
@@ -110,25 +118,25 @@ describe('removeLocalMcpConfig', () => {
       mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } },
     }));
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', false);
     assert.ok(existsSync(mcpJsonPath()), 'file should survive since it had other content');
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed, { mcpServers: { 'my-own-server': { type: 'stdio', command: 'foo' } } });
   });
 
   it('is a safe no-op when no .mcp.json exists at all', () => {
-    assert.doesNotThrow(() => removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp'));
+    assert.doesNotThrow(() => removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true));
   });
 
   it('leaves an unparseable file alone rather than deleting or rewriting it', () => {
     writeFileSync(mcpJsonPath(), 'not json{{{');
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), 'not json{{{');
   });
 
   it('leaves a file with a non-object JSON root (array/null/scalar) alone too (Codex review, 2026-08-24)', () => {
     writeFileSync(mcpJsonPath(), '[1,2,3]');
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), '[1,2,3]');
   });
 
@@ -143,7 +151,7 @@ describe('removeLocalMcpConfig', () => {
     config.mcpServers['yolo-studio'] = { type: 'stdio', command: 'something-else-entirely' };
     writeFileSync(mcpJsonPath(), JSON.stringify(config));
 
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
 
     const after = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(after.mcpServers['yolo-studio'], { type: 'stdio', command: 'something-else-entirely' });
@@ -151,14 +159,28 @@ describe('removeLocalMcpConfig', () => {
 
   it('DOES delete the entry when its value still exactly matches what this attachment wrote', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     assert.equal(existsSync(mcpJsonPath()), false);
   });
 
   it('does NOT delete when a DIFFERENT proxy URL is passed than what was actually written (a new attach cycle must not clean up a stale one)', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    removeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp', true);
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:4123/mcp');
+  });
+
+  it('does NOT unlink a pre-existing (createdFile:false) file even when removing our entry leaves it empty (Codex review, 2026-08-24, round 6)', () => {
+    // The repo already had an empty .mcp.json (or {"mcpServers":{}}) before
+    // this attach ever touched it -- emptiness after removal looks
+    // identical to "we created this from scratch," but createdFile:false
+    // says otherwise, and the operator's (empty) file must survive.
+    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: {} }));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: false });
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', result.createdFile);
+    assert.ok(existsSync(mcpJsonPath()), 'the pre-existing file must survive, even though it is now empty');
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.deepEqual(parsed, { mcpServers: {} });
   });
 });

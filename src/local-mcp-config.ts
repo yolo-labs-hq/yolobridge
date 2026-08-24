@@ -53,24 +53,62 @@ function readConfig(path: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/** Matches ONLY the exact shape this module itself ever writes
+ *  (`http://127.0.0.1:<ephemeral-port>/mcp`) — see `looksLikeOurOwnEntry`'s
+ *  doc comment for why loopback-ness is the distinguishing signal. */
+const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
+
 /**
- * Adds the `yolo-studio` entry pointing at the local proxy. Returns `false`
- * (does nothing further) if an existing `.mcp.json` can't be parsed, OR if
- * a `yolo-studio` entry is ALREADY there (Codex review, 2026-08-24): a
- * hand-authored entry with that name is the user's own config, not ours to
- * overwrite — and `removeLocalMcpConfig` only ever deletes this one key, so
- * overwriting it here would mean detach later deletes the user's own entry,
- * not just reverts ours. Refusing to touch it at write time is what makes
- * "only ever delete what we added" true at cleanup time, without needing to
- * snapshot/restore a prior value.
+ * True if an existing `yolo-studio` entry has the EXACT shape this module
+ * writes — `{ type: 'http', url: 'http://127.0.0.1:<port>/mcp' }`. A
+ * hand-authored real entry has no reason to point at an ephemeral loopback
+ * port (a human configuring MCP directly would point at the real, stable
+ * `yolo-studio-mcp` endpoint) — so this is a safe, no-state-needed way to
+ * tell "probably ours, left over from an attachment that never got to run
+ * its own cleanup" apart from "genuinely the operator's own config."
  */
-export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
+function looksLikeOurOwnEntry(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as { type?: unknown; url?: unknown };
+  return v.type === 'http' && typeof v.url === 'string' && OWN_ENTRY_URL_PATTERN.test(v.url);
+}
+
+export interface McpConfigWriteResult {
+  ok: boolean;
+  /** True only if `.mcp.json` did NOT already exist on disk before this
+   *  call (Codex review, 2026-08-24, round 6) — needed at cleanup time:
+   *  a pre-existing file that HAPPENED to be empty (`{}` or
+   *  `{"mcpServers":{}}`) looks identical, after our entry is removed
+   *  again, to a file this module created from scratch. Without tracking
+   *  which one actually happened, cleanup would delete a file the
+   *  operator already had. */
+  createdFile: boolean;
+}
+
+/**
+ * Adds the `yolo-studio` entry pointing at the local proxy. `ok: false`
+ * (does nothing further) if an existing `.mcp.json` can't be parsed, OR if
+ * a `yolo-studio` entry is ALREADY there and does NOT look like our own
+ * (Codex review, 2026-08-24): a hand-authored entry with that name is the
+ * user's own config, not ours to overwrite — and `removeLocalMcpConfig`
+ * only ever deletes a value that still matches what was written, so
+ * overwriting a genuinely foreign entry here would mean detach later
+ * deletes the user's own entry, not just reverts ours. An entry that DOES
+ * look like ours (round 6: `looksLikeOurOwnEntry`) is instead treated as a
+ * stale leftover from an attachment that exited uncleanly (SIGKILL, crash,
+ * reboot — never reached its own `removeLocalMcpConfig` call) and is
+ * safely overwritten with the current proxy's URL; refusing unconditionally
+ * here would otherwise brick local MCP access on every subsequent attach
+ * until the operator manually edited the file.
+ */
+export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWriteResult {
   const path = mcpJsonPath(cwd);
+  const createdFile = !existsSync(path);
   let config: Record<string, unknown>;
   try {
     config = readConfig(path);
   } catch {
-    return false;
+    return { ok: false, createdFile: false };
   }
   // `config.mcpServers` gets the SAME root-validation treatment as the file
   // itself (Codex review, 2026-08-24): the old `typeof === 'object'` check
@@ -80,14 +118,14 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
   // (e.g. a string) with a fresh `{}`, discarding it. Present-but-invalid
   // is refused, same as an invalid root; only ABSENT defaults to `{}`.
   if ('mcpServers' in config && (config.mcpServers === null || typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers))) {
-    return false;
+    return { ok: false, createdFile: false };
   }
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-  if (SERVER_NAME in servers) return false;
+  if (SERVER_NAME in servers && !looksLikeOurOwnEntry(servers[SERVER_NAME])) return { ok: false, createdFile: false };
   servers[SERVER_NAME] = { type: 'http', url: proxyUrl };
   config.mcpServers = servers;
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
-  return true;
+  return { ok: true, createdFile };
 }
 
 /**
@@ -102,12 +140,17 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): boolean {
  * treatment — this function only ever removes the EXACT thing it added.
  *
  * If that leaves `.mcp.json` with no `mcpServers` entries and nothing else
- * in the file (i.e. we created it from scratch), deletes the file entirely
- * rather than leaving an empty shell behind. A file that had OTHER content
- * (either other server entries, or other top-level keys) is left in place
- * with just the one entry removed.
+ * in the file, deletes the file entirely — but ONLY when `createdFile`
+ * (from `writeLocalMcpConfig`'s own return) says THIS attachment is the one
+ * that created it. Codex review, 2026-08-24, round 6: emptiness alone isn't
+ * proof of that — a repo that already had an empty `.mcp.json` or
+ * `{"mcpServers":{}}` looks identical, once our entry is removed, to one
+ * this module created from scratch, and unlinking it would delete a file
+ * the operator already had. When it's empty but NOT ours to delete, the
+ * (now-empty-of-our-stuff) config is written back instead, same as any
+ * other "file had other content" case.
  */
-export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string): void {
+export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, createdFile: boolean): void {
   const path = mcpJsonPath(cwd);
   if (!existsSync(path)) return;
   let config: Record<string, unknown>;
@@ -125,7 +168,7 @@ export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string): voi
   const hasOtherServers = Object.keys(servers).length > 0;
   const otherTopLevelKeys = Object.keys(config).filter((k) => k !== 'mcpServers');
 
-  if (!hasOtherServers && otherTopLevelKeys.length === 0) {
+  if (createdFile && !hasOtherServers && otherTopLevelKeys.length === 0) {
     unlinkSync(path);
     return;
   }

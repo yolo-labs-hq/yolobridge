@@ -86,6 +86,12 @@ export interface McpTrustWriteResult {
   /** True only if `TOOL_PATTERN` was NOT already in `permissions.allow`
    *  before this call. */
   addedPermissionEntry: boolean;
+  /** True only if `.claude/settings.json` did NOT already exist on disk
+   *  before this call (Codex review, 2026-08-24, round 6) -- needed at
+   *  cleanup time: a pre-existing file that happened to already be `{}`
+   *  looks identical, once our entries are removed, to one this module
+   *  created from scratch. */
+  createdFile: boolean;
 }
 
 /**
@@ -104,11 +110,12 @@ export interface McpTrustWriteResult {
  */
 export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   const path = settingsPath(cwd);
+  const createdFile = !existsSync(path);
   let settings: Record<string, unknown>;
   try {
     settings = readSettings(path);
   } catch {
-    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
 
   // Present-but-invalid is refused, same reasoning as local-mcp-config.ts's
@@ -118,14 +125,14 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   // `permissions`) on write while still reporting success. Only genuinely
   // ABSENT fields default to empty.
   if ('enabledMcpjsonServers' in settings && !Array.isArray(settings.enabledMcpjsonServers)) {
-    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
   if ('permissions' in settings && (settings.permissions === null || typeof settings.permissions !== 'object' || Array.isArray(settings.permissions))) {
-    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
   const permissionsObj = (settings.permissions ?? {}) as Record<string, unknown>;
   if ('allow' in permissionsObj && !Array.isArray(permissionsObj.allow)) {
-    return { ok: false, addedServerEntry: false, addedPermissionEntry: false };
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
 
   const enabled = new Set(asStringArray(settings.enabledMcpjsonServers));
@@ -141,7 +148,7 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
-  return { ok: true, addedServerEntry, addedPermissionEntry };
+  return { ok: true, addedServerEntry, addedPermissionEntry, createdFile };
 }
 
 /**
@@ -149,14 +156,17 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
  * (`removeServerEntry`/`removePermissionEntry`, from `writeLocalMcpTrust`'s
  * own return) -- never touches any other server name, allow/deny rule,
  * hook, other top-level key, or an entry the operator had already granted
- * before this attach. Deletes `.claude/settings.json` (and its directory,
- * if now empty) only if we created it from scratch and nothing else was
- * ever added to it; a file with any other content is left in place, minus
- * just what this attach added.
+ * before this attach. Deletes `.claude/settings.json` only if `createdFile`
+ * (also from `writeLocalMcpTrust`'s return) says THIS attachment is the one
+ * that created it AND nothing else was ever added to it -- Codex review,
+ * 2026-08-24, round 6: emptiness alone isn't proof of that (a pre-existing
+ * `{}` looks identical once our entries are removed); a file with other
+ * content, or one that already existed before this attach touched it, is
+ * left in place, minus just what this attach added.
  */
 export function removeLocalMcpTrust(
   cwd: string,
-  opts: { removeServerEntry: boolean; removePermissionEntry: boolean },
+  opts: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean },
 ): void {
   const path = settingsPath(cwd);
   if (!existsSync(path)) return;
@@ -182,7 +192,7 @@ export function removeLocalMcpTrust(
     else delete settings.permissions;
   }
 
-  if (Object.keys(settings).length === 0) {
+  if (opts.createdFile && Object.keys(settings).length === 0) {
     unlinkSync(path);
     return;
   }
