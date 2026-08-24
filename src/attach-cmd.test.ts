@@ -150,7 +150,6 @@ describe('runAttachDaemon', () => {
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
-
     const fetchImpl = (async (url: any) => {
       const u = String(url);
       if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
@@ -186,6 +185,82 @@ describe('runAttachDaemon', () => {
     const connectedLogIdx = calls.indexOf('log:Stream connected.');
     assert.ok(connectedLogIdx >= 0, "sanity check: 'Stream connected.' was logged at all");
     assert.ok(clearIdx < connectedLogIdx, 'clearScreen must fire before the Stream connected. log line');
+  });
+
+  it('calls onAttached exactly once, with the real tileId/attachmentId/accessToken, before the stream ever opens', async () => {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const calls: string[] = [];
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      calls.push(u);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    let onAttachedCalls = 0;
+    let onAttachedInfo: unknown;
+    let streamOpenedBeforeOnAttached = false;
+
+    await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      deliverPrompt: async () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      shouldStop: () => false,
+      onAttached: async (info) => {
+        onAttachedCalls++;
+        onAttachedInfo = info;
+        if (calls.some((u) => u.includes('/yolobridge/stream'))) streamOpenedBeforeOnAttached = true;
+      },
+    });
+
+    assert.equal(onAttachedCalls, 1);
+    assert.deepEqual(onAttachedInfo, { tileId: 'tile-1', attachmentId: 'a1', workspaceId: 'w1', accessToken: 'at' });
+    assert.equal(streamOpenedBeforeOnAttached, false, 'onAttached must fire before the SSE stream opens');
+  });
+
+  it('a throwing onAttached is logged and does not abort the attach', async () => {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    const logs: string[] = [];
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: (line) => logs.push(line),
+      clearScreen: () => {},
+      deliverPrompt: async () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      shouldStop: () => false,
+      onAttached: async () => { throw new Error('boom'); },
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.ok(logs.some((l) => l.includes('onAttached hook failed') && l.includes('boom')));
   });
 
   it('reassembles a multibyte UTF-8 character split across a network chunk boundary (Codex review, 2026-08-23)', async () => {

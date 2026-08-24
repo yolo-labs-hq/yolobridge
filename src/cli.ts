@@ -26,6 +26,8 @@ import { runDetach } from './detach-cmd.js';
 import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
+import { startMcpProxy, mcpUrl, type McpProxyHandle } from './mcp-proxy.js';
+import { writeLocalMcpConfig, removeLocalMcpConfig } from './local-mcp-config.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
@@ -105,6 +107,7 @@ function printHelp(): void {
       '',
       `API base:   ${apiUrl()} (override: YOLOBRIDGE_API_URL)`,
       `Auth base:  ${authUrl()} (override: YOLOBRIDGE_AUTH_URL)`,
+      `MCP base:   ${mcpUrl()} (override: YOLOBRIDGE_MCP_URL)`,
       `Agent bin:  ${DEFAULT_AGENT_BIN} (override: --agent or YOLOBRIDGE_AGENT_BIN)`,
       '',
     ].join('\n'),
@@ -217,35 +220,63 @@ async function cmdAttach(args: string[]): Promise<number> {
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
 
-  // Spawns the local coding agent under a real PTY right away — this
-  // command is what launches the user's local session (see
-  // docs/YOLOBRIDGE_PLAN.md's "⚠ Not yet functional" section). The PTY's
-  // output streams live to this process's own stdout and this process's
-  // stdin is piped into the PTY, so the terminal running `attach` is a
-  // live view onto the exact session remote prompts land in.
-  startLocalAgent({
-    agentBin,
-    onExit: ({ exitCode, signal }) => {
-      localAgentExited = true;
-      stopRequested = true;
-      process.stdout.write(
-        `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
-      );
-      // Fire-and-forget: don't wait on the SSE loop to unwind on its own
-      // (it only re-checks shouldStop() at loop boundaries) to report the
-      // status change — tell the server immediately so the tile flips to
-      // `stopped` right away instead of riding out the heartbeat
-      // staleness window (~90s, Decision Q2). The daemon loop below still
-      // exits promptly too, via `shouldStop`.
-      runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
-    },
-  });
+  const spawnCwd = process.cwd();
+  let mcpProxyHandle: McpProxyHandle | undefined;
+  let wroteMcpConfig = false;
 
   const result = await runAttachFromDisk({
     workspaceId,
     commonApiBaseUrl: apiUrl(),
     hostLabel,
     shouldStop: () => stopRequested,
+    // Fires once the real tileId exists (docs/YOLOBRIDGE_PLAN.md's "Local
+    // MCP access" section) — starts the local MCP proxy and writes
+    // `.mcp.json` BEFORE spawning the local agent, since Claude Code reads
+    // that file at process launch. A proxy-start failure is logged and
+    // skipped, not fatal — MCP access is an enhancement on a tile that
+    // already works without it (send_to_tile/read_tile_output are
+    // unaffected either way).
+    onAttached: async ({ tileId, accessToken }) => {
+      mcpProxyHandle = await startMcpProxy({
+        apiUrl: apiUrl(),
+        accessToken,
+        workspaceId,
+        tileId,
+        agentId: agentBin ?? DEFAULT_AGENT_BIN,
+        log: (line) => process.stdout.write(`${line}\n`),
+      });
+      if (mcpProxyHandle) {
+        wroteMcpConfig = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
+        if (!wroteMcpConfig) {
+          process.stdout.write(`yolo-bridge: existing ${spawnCwd}/.mcp.json is not valid JSON — leaving local MCP access unconfigured.\n`);
+        }
+      }
+
+      // Spawns the local coding agent under a real PTY — this is what
+      // launches the user's local session (see docs/YOLOBRIDGE_PLAN.md's
+      // "⚠ Not yet functional" section). The PTY's output streams live to
+      // this process's own stdout and this process's stdin is piped into
+      // the PTY, so the terminal running `attach` is a live view onto the
+      // exact session remote prompts land in.
+      startLocalAgent({
+        agentBin,
+        cwd: spawnCwd,
+        onExit: ({ exitCode, signal }) => {
+          localAgentExited = true;
+          stopRequested = true;
+          process.stdout.write(
+            `\nyolo-bridge: local agent exited (code=${exitCode}${signal ? `, signal=${signal}` : ''}), detaching...\n`,
+          );
+          // Fire-and-forget: don't wait on the SSE loop to unwind on its own
+          // (it only re-checks shouldStop() at loop boundaries) to report the
+          // status change — tell the server immediately so the tile flips to
+          // `stopped` right away instead of riding out the heartbeat
+          // staleness window (~90s, Decision Q2). The daemon loop below still
+          // exits promptly too, via `shouldStop`.
+          runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+        },
+      });
+    },
   });
 
   process.removeListener('SIGINT', onSignal);
@@ -255,6 +286,11 @@ async function cmdAttach(args: string[]): Promise<number> {
   // `detached` frame, or the agent process exiting on its own — also ends
   // the PTY session `attach` spawned. Safe no-op if it already exited.
   stopLocalAgent();
+  // Same "nothing left running detached" discipline for the local MCP
+  // proxy: stop the server (drops the delegated token from memory) and
+  // remove the .mcp.json entry we added, if we added one.
+  if (mcpProxyHandle) await mcpProxyHandle.stop();
+  if (wroteMcpConfig) removeLocalMcpConfig(spawnCwd);
 
   if (!result.ok) {
     if (result.reason === 'not-logged-in') {

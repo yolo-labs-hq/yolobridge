@@ -84,6 +84,24 @@ export interface AttachDaemonDeps {
   /** Injectable auth-service refresh call. Defaults to device-auth.ts's
    * `refreshAccessToken` (the real `POST /api/v1/auth/refresh`). */
   refreshAccessToken?: RefreshTokenFn;
+  /**
+   * Fires once, right after `attach` succeeds (tileId/attachmentId now
+   * exist) and before the SSE stream loop begins. This is the ONLY point
+   * where the caller can act on a real tileId before the local agent spawns
+   * — cli.ts uses it to start the local MCP proxy (mcp-proxy.ts) and write
+   * `.mcp.json` before `startLocalAgent()`, since Claude Code reads that
+   * file at process launch. Awaited; a throw here is treated as best-effort
+   * (logged, does not abort the attach) since MCP access is an enhancement
+   * on top of a tile that already works without it.
+   */
+  onAttached?: (info: {
+    tileId: string;
+    attachmentId: string;
+    workspaceId: string;
+    /** The CURRENT (possibly just-refreshed) account access token — needed
+     *  to mint the local MCP proxy's own delegated token. */
+    accessToken: string;
+  }) => void | Promise<void>;
 }
 
 export type AttachDaemonResult =
@@ -167,6 +185,14 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   saveAttachment({ workspaceId, tileId, attachmentId, attachedAt: new Date().toISOString() }, env, io);
   log(`Attached. tileId=${tileId} attachmentId=${attachmentId}`);
+
+  if (deps.onAttached) {
+    try {
+      await deps.onAttached({ tileId, attachmentId, workspaceId, accessToken: currentAuth.accessToken });
+    } catch (err) {
+      log(`onAttached hook failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   // Codex-found race: if something already asked us to stop WHILE the
   // initial refresh/attach network round trip above was in flight (e.g. the
