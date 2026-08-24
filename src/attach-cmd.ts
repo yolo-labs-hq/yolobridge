@@ -259,6 +259,16 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       }
 
       let sawDetached = false;
+      /** Set when the SSE stream itself (or any other call in this attempt)
+       *  404s -- the attachment/workspace no longer exists server-side
+       *  (Codex review, 2026-08-24, round 4). Without this, a 404 fell
+       *  through to the SAME backoff-and-retry path as a transient network
+       *  error and looped FOREVER: `onAttached` now runs a bounded but real
+       *  MCP-setup delay (up to STARTUP_MINT_TIMEOUT_MS) BEFORE the first
+       *  `openStream` call, wide enough for the tile to be removed/detached
+       *  server-side in that window with no stream open yet to receive the
+       *  `detached` frame that would normally end this loop cleanly. */
+      let sawGone = false;
       try {
         const res = await apiClient.openStream(cfg, workspaceId, attachmentId);
         attempt = 0; // reset backoff on a successful connect
@@ -368,12 +378,13 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         }
       } catch (err) {
         log(`Stream error: ${err instanceof Error ? err.message : String(err)}`);
+        if (err instanceof apiClient.YoloBridgeApiError && err.status === 404) sawGone = true;
       }
 
       heartbeat?.stop();
       heartbeat = undefined;
 
-      if (sawDetached) {
+      if (sawDetached || sawGone) {
         clearAttachment(env, io);
         return { ok: true, reason: 'detached-by-server' };
       }

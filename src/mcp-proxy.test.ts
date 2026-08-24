@@ -154,6 +154,27 @@ describe('startMcpProxy', () => {
     assert.equal(forwardedBody.params._delegatedToken, undefined);
   });
 
+  it("injects the token into a tools/call that omits params.arguments entirely (a zero-input tool -- Codex review, 2026-08-24, round 4)", async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardedBody: any;
+    const fetchImpl = makeFetch({
+      upstream: (init) => {
+        forwardedBody = JSON.parse(init.body);
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles' } }),
+    });
+    assert.equal(forwardedBody.params.arguments?._delegatedToken, 'tok-1');
+  });
+
   it('force-refreshes and retries once on a 401 from upstream', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     let mintCount = 0;

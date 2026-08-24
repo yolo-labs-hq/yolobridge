@@ -354,6 +354,43 @@ describe('runAttachDaemon', () => {
     assert.deepEqual(delivered, ['say \u{1F680} now']);
   });
 
+  it("treats a 404 from openStream as a terminal detach, not a retry-forever transient error (Codex review, 2026-08-24, round 4)", async () => {
+    // Reproduces: attach succeeds and creates the tile/attachment, but by
+    // the time this attempt calls GET .../stream, the attachment/workspace
+    // no longer exists server-side (e.g. removed during onAttached's own
+    // MCP-setup delay, which runs BEFORE the first openStream call).
+    // Without the fix, this 404 fell into the SAME backoff-and-retry path
+    // as a transient network error and looped forever, leaving whatever
+    // onAttached already started (a spawned local agent, in cli.ts)
+    // running with no way for the daemon to ever end on its own.
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return jsonResponse(404, { error: 'Attachment not found', code: 'NOT_FOUND' });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    const result = await withTimeout(
+      runAttachDaemon({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        auth: AUTH,
+        env: ENV,
+        io,
+        fetchImpl,
+        log: () => {},
+        clearScreen: () => {},
+        shouldStop: () => false,
+      }),
+      2000,
+      'runAttachDaemon after a 404 from openStream',
+    );
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(loadAttachment(ENV, io), undefined, 'attachment record should be cleared, same as a real detached frame');
+  });
+
   it('returns attach-failed without opening a stream when attach itself fails', async () => {
     const fetchImpl = (async (url: any) => {
       if (String(url).endsWith('/yolobridge/attach')) {

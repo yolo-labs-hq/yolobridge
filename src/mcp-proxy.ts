@@ -288,24 +288,32 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
  *  — the exact shape `mcp-proxy.js`'s own `injectToken()` uses, not
  *  reinvented. Returns the body unchanged if it isn't a tools/call (or isn't
  *  valid JSON — the upstream can reject that on its own terms). */
+/** Injects `_delegatedToken` into one `tools/call` message, creating
+ *  `params.arguments` first if it's absent (Codex review, 2026-08-24,
+ *  round 4) -- MCP allows a zero-input tool's call to omit `arguments`
+ *  entirely, and the original `msg.params?.arguments` truthiness check
+ *  skipped injection for exactly that shape, so any zero-input tool always
+ *  reached the upstream with no token and came back UNAUTHORIZED. Mutates
+ *  and returns true if this message needed the token, so callers can tell
+ *  whether anything actually changed. */
+function injectTokenIntoMessage(msg: any, token: string): boolean {
+  if (msg?.method !== 'tools/call' || typeof msg.params !== 'object' || msg.params === null) return false;
+  if (typeof msg.params.arguments !== 'object' || msg.params.arguments === null) msg.params.arguments = {};
+  msg.params.arguments._delegatedToken = token;
+  return true;
+}
+
 function injectToken(rawBody: string, token: string): string {
   try {
     const parsed = JSON.parse(rawBody);
     if (Array.isArray(parsed)) {
       let changed = false;
       for (const msg of parsed) {
-        if (msg?.method === 'tools/call' && msg.params?.arguments) {
-          msg.params.arguments._delegatedToken = token;
-          changed = true;
-        }
+        if (injectTokenIntoMessage(msg, token)) changed = true;
       }
       return changed ? JSON.stringify(parsed) : rawBody;
     }
-    if (parsed?.method === 'tools/call' && parsed.params?.arguments) {
-      parsed.params.arguments._delegatedToken = token;
-      return JSON.stringify(parsed);
-    }
-    return rawBody;
+    return injectTokenIntoMessage(parsed, token) ? JSON.stringify(parsed) : rawBody;
   } catch {
     return rawBody;
   }
