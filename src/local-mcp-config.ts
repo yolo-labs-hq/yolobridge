@@ -53,24 +53,31 @@ function readConfig(path: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-/** Matches ONLY the exact shape this module itself ever writes
- *  (`http://127.0.0.1:<ephemeral-port>/mcp`) — see `looksLikeOurOwnEntry`'s
- *  doc comment for why loopback-ness is the distinguishing signal. */
-const OWN_ENTRY_URL_PATTERN = /^http:\/\/127\.0\.0\.1:\d+\/mcp$/;
+/**
+ * Marker key written into the `yolo-studio` entry itself so a LATER attach
+ * can tell "we wrote this, safe to reclaim after a crash" apart from
+ * "genuinely the operator's own config" with certainty, not a guess.
+ *
+ * Round 6 tried a URL-shape heuristic instead (loopback-looking URL = ours)
+ * — Codex review, 2026-08-24, round 7 correctly pointed out a legitimate
+ * hand-authored entry for LOCAL development can have that exact shape too
+ * (`http://127.0.0.1:<port>/mcp` is a completely normal thing for a human
+ * to point a real local MCP server at), so URL shape alone can't establish
+ * ownership. An explicit marker can: no hand-authored entry has any reason
+ * to carry this exact key, and Claude Code's MCP client only reads
+ * `type`/`url`/etc. from a server entry — an extra unknown key is inert to
+ * it, the same way `.mcp.json`'s own unrelated top-level keys already are.
+ */
+const OWNERSHIP_MARKER = '_yolobridge';
 
 /**
- * True if an existing `yolo-studio` entry has the EXACT shape this module
- * writes — `{ type: 'http', url: 'http://127.0.0.1:<port>/mcp' }`. A
- * hand-authored real entry has no reason to point at an ephemeral loopback
- * port (a human configuring MCP directly would point at the real, stable
- * `yolo-studio-mcp` endpoint) — so this is a safe, no-state-needed way to
- * tell "probably ours, left over from an attachment that never got to run
- * its own cleanup" apart from "genuinely the operator's own config."
+ * True if an existing `yolo-studio` entry carries `OWNERSHIP_MARKER` — i.e.
+ * THIS module wrote it (in some earlier, possibly uncleanly-terminated,
+ * attach), not the operator by hand.
  */
 function looksLikeOurOwnEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const v = value as { type?: unknown; url?: unknown };
-  return v.type === 'http' && typeof v.url === 'string' && OWN_ENTRY_URL_PATTERN.test(v.url);
+  return (value as Record<string, unknown>)[OWNERSHIP_MARKER] === true;
 }
 
 export interface McpConfigWriteResult {
@@ -122,7 +129,7 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   }
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
   if (SERVER_NAME in servers && !looksLikeOurOwnEntry(servers[SERVER_NAME])) return { ok: false, createdFile: false };
-  servers[SERVER_NAME] = { type: 'http', url: proxyUrl };
+  servers[SERVER_NAME] = { type: 'http', url: proxyUrl, [OWNERSHIP_MARKER]: true };
   config.mcpServers = servers;
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
   return { ok: true, createdFile };
@@ -162,7 +169,7 @@ export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, crea
   }
   const servers = (config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {}) as Record<string, unknown>;
   const current = servers[SERVER_NAME] as { type?: unknown; url?: unknown } | undefined;
-  if (!current || current.type !== 'http' || current.url !== expectedProxyUrl) return;
+  if (!current || current.type !== 'http' || current.url !== expectedProxyUrl || !looksLikeOurOwnEntry(current)) return;
   delete servers[SERVER_NAME];
 
   const hasOtherServers = Object.keys(servers).length > 0;

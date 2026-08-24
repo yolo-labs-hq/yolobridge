@@ -19,11 +19,11 @@ function mcpJsonPath(): string {
 }
 
 describe('writeLocalMcpConfig', () => {
-  it('creates .mcp.json from scratch with the yolo-studio entry', () => {
+  it('creates .mcp.json from scratch with the yolo-studio entry, marked as ours', () => {
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: true });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.deepEqual(parsed, { mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' } } });
+    assert.deepEqual(parsed, { mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true } } });
   });
 
   it('preserves other server entries and top-level keys already in the file, and reports createdFile:false', () => {
@@ -37,37 +37,40 @@ describe('writeLocalMcpConfig', () => {
     assert.deepEqual(parsed, {
       mcpServers: {
         'my-own-server': { type: 'stdio', command: 'foo' },
-        'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' },
+        'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true },
       },
       someOtherTopLevelKey: 'kept',
     });
   });
 
-  it("refuses to overwrite an EXISTING yolo-studio entry that does NOT look like ours -- a real hand-authored config, not a stale loopback entry", () => {
-    // A real, hand-authored entry has no reason to point at 127.0.0.1 -- a
-    // human configuring MCP directly would point at the actual, stable
-    // yolo-studio-mcp endpoint. This is genuinely foreign config, not ours
-    // to touch.
-    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'https://services.yolo.studio/mcp' } } }));
-    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
-    assert.deepEqual(result, { ok: false, createdFile: false });
-    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.equal(parsed.mcpServers['yolo-studio'].url, 'https://services.yolo.studio/mcp', 'the existing entry must be left exactly as it was');
+  it("refuses to overwrite an EXISTING yolo-studio entry with no ownership marker -- real hand-authored config, including one that happens to use a loopback URL (Codex review, 2026-08-24, round 7)", () => {
+    // Round 6 tried a URL-shape heuristic (loopback URL = probably ours).
+    // Round 7 correctly pointed out a legitimate hand-authored entry for
+    // LOCAL DEVELOPMENT can have that exact shape too -- URL shape alone
+    // can't establish ownership. Only the explicit `_yolobridge` marker
+    // can, and a hand-authored entry has no reason to carry it, regardless
+    // of what URL it points at.
+    for (const url of ['https://services.yolo.studio/mcp', 'http://127.0.0.1:9999/mcp']) {
+      writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url } } }));
+      const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+      assert.deepEqual(result, { ok: false, createdFile: false }, `expected refusal for unmarked url: ${url}`);
+      const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+      assert.equal(parsed.mcpServers['yolo-studio'].url, url, 'the existing entry must be left exactly as it was');
+    }
   });
 
-  it("overwrites a STALE loopback entry left behind by an uncleanly-terminated previous attach (Codex review, 2026-08-24, round 6)", () => {
-    // Distinct from the case above: this entry's shape IS what this module
-    // itself writes (http://127.0.0.1:<port>/mcp) -- almost certainly ours
-    // from a session that exited via SIGKILL/crash/reboot and never reached
-    // its own removeLocalMcpConfig call, not a hand-authored config.
-    // Refusing unconditionally (the original round-2 fix) would brick local
-    // MCP access on every subsequent attach until the operator manually
-    // edited the file.
-    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:9999/mcp' } } }));
+  it("overwrites a STALE entry left behind by an uncleanly-terminated previous attach, identified by its _yolobridge marker (Codex review, 2026-08-24, round 6 + round 7)", () => {
+    // The entry carries the marker THIS module itself writes -- almost
+    // certainly ours, from a session that exited via SIGKILL/crash/reboot
+    // and never reached its own removeLocalMcpConfig call, not a
+    // hand-authored config. Refusing unconditionally (the original round-2
+    // fix) would brick local MCP access on every subsequent attach until
+    // the operator manually edited the file.
+    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:9999/mcp', _yolobridge: true } } }));
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: false });
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
-    assert.equal(parsed.mcpServers['yolo-studio'].url, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp', _yolobridge: true });
   });
 
   it('returns ok:false and does not overwrite a pre-existing file that is not valid JSON', () => {
@@ -182,5 +185,15 @@ describe('removeLocalMcpConfig', () => {
     assert.ok(existsSync(mcpJsonPath()), 'the pre-existing file must survive, even though it is now empty');
     const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
     assert.deepEqual(parsed, { mcpServers: {} });
+  });
+
+  it('does NOT delete an entry that matches the URL but lacks the ownership marker (a foreign entry someone else pointed at the same port coincidentally)', () => {
+    // Belt-and-suspenders: even an exact URL match isn't enough by itself
+    // (Codex review, 2026-08-24, round 7's reasoning applied symmetrically
+    // to the remove path) -- require the marker too.
+    writeFileSync(mcpJsonPath(), JSON.stringify({ mcpServers: { 'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp' } } }));
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', false);
+    const parsed = JSON.parse(readFileSync(mcpJsonPath(), 'utf-8'));
+    assert.deepEqual(parsed.mcpServers['yolo-studio'], { type: 'http', url: 'http://127.0.0.1:4123/mcp' });
   });
 });

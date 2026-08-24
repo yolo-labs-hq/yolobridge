@@ -23,13 +23,14 @@ function settingsPath(): string {
 const REMOVE_ALL = { removeServerEntry: true, removePermissionEntry: true, createdFile: true };
 
 describe('writeLocalMcpTrust', () => {
-  it('creates .claude/settings.json from scratch with both approval layers', () => {
+  it('creates .claude/settings.json from scratch with both approval layers, marked as ours', () => {
     const result = writeLocalMcpTrust(dir);
     assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true, createdFile: true });
     const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['yolo-studio'],
       permissions: { allow: ['mcp__yolo-studio__*'] },
+      _yolobridge: { enabledServerEntry: true, permissionEntry: true },
     });
   });
 
@@ -53,6 +54,7 @@ describe('writeLocalMcpTrust', () => {
       enabledMcpjsonServers: ['my-own-server', 'yolo-studio'],
       permissions: { allow: ['Bash(git *)', 'mcp__yolo-studio__*'], deny: ['Bash(rm -rf *)'] },
       someOtherTopLevelKey: 'kept',
+      _yolobridge: { enabledServerEntry: true, permissionEntry: true },
     });
   });
 
@@ -64,7 +66,7 @@ describe('writeLocalMcpTrust', () => {
     assert.deepEqual(parsed.permissions.allow, ['mcp__yolo-studio__*']);
   });
 
-  it('reports addedServerEntry/addedPermissionEntry as false when those entries already existed, without duplicating them (Codex review, 2026-08-24)', () => {
+  it('reports addedServerEntry/addedPermissionEntry as false when those entries already existed with NO ownership marker (a genuine operator pre-trust, not ours) (Codex review, 2026-08-24)', () => {
     // Simulates the operator having already trusted this server themselves
     // (e.g. clicked through the prompt once) before ever running `attach`.
     mkdirSync(join(dir, '.claude'), { recursive: true });
@@ -78,7 +80,29 @@ describe('writeLocalMcpTrust', () => {
     assert.deepEqual(parsed, {
       enabledMcpjsonServers: ['yolo-studio'],
       permissions: { allow: ['mcp__yolo-studio__*'] },
+      _yolobridge: { enabledServerEntry: false, permissionEntry: false },
     });
+  });
+
+  it("reclaims entries left behind by an uncleanly-terminated previous attach, identified by the _yolobridge marker (Codex review, 2026-08-24, round 7)", () => {
+    // Distinct from the case above: this file ALREADY carries the marker
+    // this module itself writes, from a session that exited via
+    // SIGKILL/crash/reboot and never reached its own removeLocalMcpTrust
+    // call -- not a genuine operator pre-trust. Without reclaiming, cleanup
+    // would leave mcp__yolo-studio__* permanently auto-approved forever,
+    // since every subsequent attach would see the entries as "already
+    // present" and report addedServerEntry/addedPermissionEntry as false.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify({
+      enabledMcpjsonServers: ['yolo-studio'],
+      permissions: { allow: ['mcp__yolo-studio__*'] },
+      _yolobridge: { enabledServerEntry: true, permissionEntry: true },
+    }));
+    const result = writeLocalMcpTrust(dir);
+    assert.deepEqual(result, { ok: true, addedServerEntry: true, addedPermissionEntry: true, createdFile: false });
+    removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry, createdFile: result.createdFile });
+    const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
+    assert.deepEqual(parsed, {}, 'the reclaimed entries must actually be removable on cleanup, not stuck forever');
   });
 
   it('returns ok:false and does not overwrite a pre-existing file that is not valid JSON', () => {
@@ -177,8 +201,9 @@ describe('removeLocalMcpTrust', () => {
 
   it("does NOT revoke trust the operator granted independently before this attach (Codex review, 2026-08-24)", () => {
     // The exact scenario the P2 finding described: the operator already had
-    // both entries; writeLocalMcpTrust correctly reports it added neither;
-    // detach must leave them standing, not strip them "by value."
+    // both entries with no ownership marker; writeLocalMcpTrust correctly
+    // reports it added neither; detach must leave them standing, not strip
+    // them "by value."
     mkdirSync(join(dir, '.claude'), { recursive: true });
     writeFileSync(settingsPath(), JSON.stringify({
       enabledMcpjsonServers: ['yolo-studio'],
@@ -202,5 +227,17 @@ describe('removeLocalMcpTrust', () => {
     removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry, createdFile: result.createdFile });
     assert.ok(existsSync(settingsPath()), 'the pre-existing file must survive, even though it is now empty');
     assert.deepEqual(JSON.parse(readFileSync(settingsPath(), 'utf-8')), {});
+  });
+
+  it('always removes the ownership marker itself, even on a genuine operator pre-trust where nothing else is removed', () => {
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify({
+      enabledMcpjsonServers: ['yolo-studio'],
+      permissions: { allow: ['mcp__yolo-studio__*'] },
+    }));
+    const result = writeLocalMcpTrust(dir);
+    removeLocalMcpTrust(dir, { removeServerEntry: result.addedServerEntry, removePermissionEntry: result.addedPermissionEntry, createdFile: result.createdFile });
+    const parsed = JSON.parse(readFileSync(settingsPath(), 'utf-8'));
+    assert.equal('_yolobridge' in parsed, false, 'internal bookkeeping must never linger in the operator-visible file');
   });
 });

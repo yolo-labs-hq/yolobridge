@@ -78,6 +78,30 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 }
 
+/**
+ * Top-level marker key recording exactly which entries THIS module added,
+ * so a LATER attach (after a crash) can tell "this is ours to reclaim" with
+ * certainty instead of guessing (Codex review, 2026-08-24, round 7 —
+ * mirrors `local-mcp-config.ts`'s `OWNERSHIP_MARKER`, same reasoning: a
+ * content-only heuristic can't distinguish our own leftover state from the
+ * operator's genuinely independent choice, since both look identical once
+ * written). Claude Code's settings schema tolerates unrelated top-level
+ * keys the same way `.mcp.json` does — this module already preserves the
+ * operator's own such keys untouched.
+ */
+const OWNERSHIP_MARKER = '_yolobridge';
+
+interface OwnershipMarker {
+  enabledServerEntry?: boolean;
+  permissionEntry?: boolean;
+}
+
+function readOwnershipMarker(settings: Record<string, unknown>): OwnershipMarker {
+  const raw = settings[OWNERSHIP_MARKER];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return raw as OwnershipMarker;
+}
+
 export interface McpTrustWriteResult {
   ok: boolean;
   /** True only if `SERVER_NAME` was NOT already in `enabledMcpjsonServers`
@@ -135,16 +159,25 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
     return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
 
+  // Consulted BEFORE mutating anything below (Codex review, 2026-08-24,
+  // round 7): if the entry is already present but OUR OWN marker from a
+  // previous (possibly crashed) attach claims it, this is a reclaim, not a
+  // fresh addition or a foreign one -- addedServerEntry/addedPermissionEntry
+  // report `true` either way, since both mean "safe for cleanup to remove."
+  const priorMarker = readOwnershipMarker(settings);
+
   const enabled = new Set(asStringArray(settings.enabledMcpjsonServers));
-  const addedServerEntry = !enabled.has(SERVER_NAME);
+  const addedServerEntry = !enabled.has(SERVER_NAME) || priorMarker.enabledServerEntry === true;
   enabled.add(SERVER_NAME);
   settings.enabledMcpjsonServers = [...enabled];
 
   const allow = new Set(asStringArray(permissionsObj.allow));
-  const addedPermissionEntry = !allow.has(TOOL_PATTERN);
+  const addedPermissionEntry = !allow.has(TOOL_PATTERN) || priorMarker.permissionEntry === true;
   allow.add(TOOL_PATTERN);
   permissionsObj.allow = [...allow];
   settings.permissions = permissionsObj;
+
+  settings[OWNERSHIP_MARKER] = { enabledServerEntry: addedServerEntry, permissionEntry: addedPermissionEntry } satisfies OwnershipMarker;
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
@@ -191,6 +224,11 @@ export function removeLocalMcpTrust(
     if (Object.keys(permissions).length > 0) settings.permissions = permissions;
     else delete settings.permissions;
   }
+
+  // Never leave the ownership marker behind — it's internal bookkeeping,
+  // not something the operator should see lingering in their settings once
+  // this attach is done with it (Codex review, 2026-08-24, round 7).
+  delete settings[OWNERSHIP_MARKER];
 
   if (opts.createdFile && Object.keys(settings).length === 0) {
     unlinkSync(path);
