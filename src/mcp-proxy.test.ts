@@ -156,6 +156,90 @@ describe('startMcpProxy', () => {
     assert.equal(forwardCount, 2, 'initial forward (401) + one retry');
   });
 
+  it('force-refreshes and retries on an in-band UNAUTHORIZED tool result (HTTP 200, not 401) -- the real shape this upstream actually uses', async () => {
+    // Regression guard for a real bug found live (2026-08-24): a thrown
+    // McpToolError('Invalid delegated token', 'UNAUTHORIZED') comes back as
+    // a normal 200 JSON-RPC result with the error embedded in
+    // result.content[0].text -- confirmed empirically against the real
+    // upstream with curl before this fix (see isUnauthorizedToolResult's
+    // doc comment). The 401-based test above covers a status code that has
+    // never actually been observed from this upstream in practice; this one
+    // covers the shape that actually fires.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/tokens')) {
+        mintCount++;
+        return mintResponse(`tok-${mintCount}`);
+      }
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwardCount++;
+        const body = JSON.parse(init.body);
+        if (body.params.arguments._delegatedToken === 'tok-1') {
+          return new Response(JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: { content: [{ type: 'text', text: JSON.stringify({ error: 'Invalid delegated token', code: 'UNAUTHORIZED' }) }] },
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { usedToken: body.params.arguments._delegatedToken } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', tileId: 't1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as any;
+    assert.equal(body.result.usedToken, 'tok-2');
+    assert.equal(mintCount, 2, 'initial mint + one force-refresh');
+    assert.equal(forwardCount, 2, 'initial forward (in-band UNAUTHORIZED) + one retry');
+  });
+
+  it('does NOT retry on a real tool error that happens to be HTTP 200 but is not UNAUTHORIZED (e.g. a legitimate FORBIDDEN scope error)', async () => {
+    // The fix above must be specific to UNAUTHORIZED -- retrying a
+    // FORBIDDEN (correctly-enforced, not-in-scope) call would just waste a
+    // mint and get the identical FORBIDDEN response again.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/tokens')) { mintCount++; return mintResponse(`tok-${mintCount}`); }
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwardCount++;
+        return new Response(JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          result: { content: [{ type: 'text', text: JSON.stringify({ error: "Scope 'studio.remove_tile' not granted", code: 'FORBIDDEN' }) }] },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', tileId: 't1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remove_tile', arguments: {} } }),
+    });
+    assert.equal(mintCount, 1, 'no force-refresh for a FORBIDDEN error');
+    assert.equal(forwardCount, 1, 'no retry for a FORBIDDEN error');
+  });
+
   it('caches the token across calls within the refresh buffer window (no re-mint per request)', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     let mintCount = 0;

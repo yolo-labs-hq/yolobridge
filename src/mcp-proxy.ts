@@ -21,8 +21,12 @@
  * `ttlSeconds` is requested (`RESTRICTED_SCOPE_TTL_SECONDS`) — this is NOT
  * the 300s default a wider-scoped mint would get. `getToken()` below refreshes
  * proactively well before that (see `REFRESH_BUFFER_MS`), and the request
- * handler force-refreshes and retries once on a live 401 as a backstop —
- * mirroring `mcp-proxy.js:456-460`'s exact shape, not reinvented.
+ * handler force-refreshes and retries once as a backstop — on a real HTTP
+ * 401 (mirroring `mcp-proxy.js:456-460`'s shape) AND on the in-band
+ * UNAUTHORIZED shape this upstream actually uses in practice (an expired
+ * token is reported as a normal 200 JSON-RPC tool result, not a 401 — see
+ * `isUnauthorizedToolResult`'s doc comment for how this was found and
+ * confirmed, not assumed).
  */
 
 import * as http from 'node:http';
@@ -212,6 +216,48 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf-8');
 }
 
+/**
+ * Detects an UNAUTHORIZED tool error IN-BAND, not via HTTP status.
+ *
+ * Real bug found live (2026-08-24): the MCP SDK reports a thrown tool error
+ * (`McpToolError('Invalid delegated token', 'UNAUTHORIZED')`,
+ * `yolo-studio-mcp/src/auth/token-validator.ts:55`) as a normal JSON-RPC
+ * SUCCESS response -- HTTP 200, `result.content[0].text` holding the error
+ * as a JSON string -- standard MCP behavior (tool execution errors are
+ * in-band content, not a transport-level failure). Confirmed empirically
+ * against the real upstream with a deliberately invalid token before fixing
+ * this, not assumed: `curl` returned `HTTP 200` with
+ * `{"result":{"content":[{"type":"text","text":"{\"error\":\"Invalid
+ * delegated token\",\"code\":\"UNAUTHORIZED\"}"}]}, ...}`. The original
+ * `result.status === 401` check below can therefore never fire for the
+ * exact case it exists to catch -- a token that expired between mint and
+ * use (the 60s `RESTRICTED_SCOPE_TTL_SECONDS` clamp this file's header
+ * comment describes makes this a real, not theoretical, window). Parses
+ * defensively (a malformed/unexpected shape is treated as "not this error",
+ * never thrown) -- this must not become a new way to crash the proxy.
+ */
+function isUnauthorizedToolResult(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text);
+    const content = parsed?.result?.content;
+    if (!Array.isArray(content)) return false;
+    for (const item of content) {
+      if (typeof item?.text !== 'string') continue;
+      try {
+        const inner = JSON.parse(item.text);
+        if (inner?.code === 'UNAUTHORIZED') return true;
+      } catch {
+        // item.text wasn't JSON -- not this error shape, keep checking
+        // other content items rather than guessing from a substring match
+        // (a legitimate tool result could coincidentally contain the word).
+      }
+    }
+  } catch {
+    // Top-level body wasn't JSON at all -- not this error shape.
+  }
+  return false;
+}
+
 async function forwardOnce(
   upstream: string,
   method: string,
@@ -258,8 +304,12 @@ async function handleRequest(
 
   // Retry once on 401, force-refreshing first — mirrors mcp-proxy.js's own
   // retry shape exactly (containers/services/container-api/mcp-proxy.js:456-460).
-  if (method === 'POST' && result.status === 401 && body) {
-    log('yolo-bridge: got 401 from MCP upstream, force-refreshing token');
+  // ALSO retry on a 200-with-in-band-UNAUTHORIZED (see
+  // isUnauthorizedToolResult's doc comment) — a real 401 from this upstream
+  // has never actually been observed; the in-band case is the one that
+  // matters in practice.
+  if (method === 'POST' && body && (result.status === 401 || isUnauthorizedToolResult(result.text))) {
+    log(`yolo-bridge: MCP upstream reported an invalid/expired token (status ${result.status}), force-refreshing`);
     try {
       const refreshed = await forceRefresh();
       const reinjected = injectToken(body, refreshed);
