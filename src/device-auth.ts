@@ -13,15 +13,16 @@
  *       'authorization_pending' | 'access_denied' | 'expired_token'
  *       | 'Invalid device code' | 'Invalid device code state'
  *
- * NOTE (discrepancy from docs/YOLOBRIDGE_PLAN.md): the plan's Architecture
- * section says login "opens the browser to the verification URL with the
- * code pre-filled". The actual `initiateDeviceFlow` controller returns a
- * bare `verification_uri` (`${FRONTEND_URL}/device`, no query string) —
- * there is no code-prefill parameter in the real response. The CLI below
- * prints the user_code alongside the URL and expects the user to type it
- * in manually, same as GitHub's device flow UX. If prefill lands later on
- * the webapp `/device` page, this client doesn't need to change — it just
- * won't benefit from it.
+ * NOTE (was a discrepancy from docs/YOLOBRIDGE_PLAN.md, now resolved): the
+ * `initiateDeviceFlow` controller returns a bare `verification_uri`
+ * (`${FRONTEND_URL}/device`, no query string) — there is no code-prefill
+ * parameter in the raw response, and no auth-service change was needed to
+ * fix this. `webapp/app/device/page.tsx` already reads a `code` query
+ * param and pre-fills its input from it (an existing convention this CLI
+ * simply wasn't using yet). `login-cmd.ts` builds the pre-filled URL
+ * client-side (`verificationUri` + `?code=<userCode>`) before opening the
+ * browser — this module still hands back the bare `verificationUri`
+ * unchanged; the prefill is entirely the caller's concern.
  */
 
 export interface DeviceCodeResponse {

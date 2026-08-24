@@ -35,13 +35,22 @@ export async function runLogin(deps: LoginDeps): Promise<LoginResult> {
 
   const code = await requestDeviceCode(authBaseUrl, fetchImpl);
 
+  // auth-service's own device/code response has no query string on
+  // verification_uri (see device-auth.ts's header comment) -- but the
+  // webapp's /device page (webapp/app/device/page.tsx) DOES read a `code`
+  // query param and pre-fills the input from it, a convention this CLI
+  // simply wasn't using. Building the pre-filled URL is client-side only
+  // (no auth-service change needed) -- the user still has to click
+  // Approve, so this doesn't skip any consent step, it just saves them
+  // re-typing a code they can already see in this terminal.
+  const prefilledUri = `${code.verificationUri}${code.verificationUri.includes('?') ? '&' : '?'}code=${encodeURIComponent(code.userCode)}`;
+
   log('To finish logging in, open this URL in your browser:');
-  log(`  ${code.verificationUri}`);
-  log('and enter this code when prompted:');
-  log(`  ${code.userCode}`);
+  log(`  ${prefilledUri}`);
+  log(`(the code ${code.userCode} is pre-filled -- if it doesn't open automatically, enter it by hand)`);
   log('');
   log('Waiting for approval...');
-  openBrowser(code.verificationUri);
+  openBrowser(prefilledUri);
 
   const deadline = Date.now() + code.expiresInSec * 1000;
   const intervalMs = Math.max(1, code.intervalSec) * 1000;

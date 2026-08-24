@@ -52,9 +52,35 @@ describe('runLogin', () => {
 
     assert.deepEqual(result, { ok: true });
     assert.equal(pollCount, 3);
-    assert.deepEqual(opened, ['https://x/device']);
+    // The browser opens with the code PRE-FILLED (webapp/app/device/page.tsx
+    // reads a `code` query param) -- login-cmd.ts builds this client-side,
+    // auth-service's own response has no query string on verification_uri.
+    assert.deepEqual(opened, ['https://x/device?code=ABCD']);
     assert.deepEqual(loadAuth(ENV, io), { accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 999 });
     assert.ok(logs.some((l) => l.includes('ABCD')));
+  });
+
+  it('appends the code with & instead of ? if verification_uri somehow already has a query string', async () => {
+    const fetchImpl = (async (url: any) => {
+      if (String(url).endsWith('/device/code')) {
+        return jsonResponse(200, {
+          device_code: 'dc', user_code: 'ABCD', verification_uri: 'https://x/device?ref=cli', expires_in: 600, interval: 5,
+        });
+      }
+      return jsonResponse(200, { access_token: 'at', refresh_token: 'rt', token_type: 'Bearer', expires_in: 3600, expires_at: 999 });
+    }) as any;
+    const io = fakeIO();
+    const opened: string[] = [];
+    await runLogin({
+      authBaseUrl: 'https://auth.example.com',
+      fetchImpl,
+      env: ENV,
+      io,
+      sleep: noopSleep,
+      openBrowser: (url) => opened.push(url),
+      log: () => {},
+    });
+    assert.deepEqual(opened, ['https://x/device?ref=cli&code=ABCD']);
   });
 
   it('returns denied without saving tokens', async () => {
