@@ -13,6 +13,8 @@ import assert from 'node:assert/strict';
 
 import { startMcpProxy, NARROW_MCP_SCOPES, type McpProxyHandle } from './mcp-proxy.js';
 
+const REMOVE_TILE_SCOPE = 'studio.remove_tile';
+
 const ORIGINAL_MCP_URL = process.env.YOLOBRIDGE_MCP_URL;
 const FAKE_UPSTREAM = 'http://fake-upstream.test';
 
@@ -39,7 +41,7 @@ function mintResponse(token: string, expiresInSec = 60): Response {
 }
 
 describe('startMcpProxy', () => {
-  it('binds to 127.0.0.1 only, mints once up front, and injects the token into a forwarded tools/call', async () => {
+  it('binds to 127.0.0.1 only, mints both tokens up front, and injects the narrow token into a forwarded tools/call', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     const mintCalls: any[] = [];
     const forwardCalls: any[] = [];
@@ -71,12 +73,16 @@ describe('startMcpProxy', () => {
     assert.ok(handle, 'proxy should start on a successful mint');
     assert.match(handle!.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
 
-    // Mint request shape — narrow scope, bound to this attachment's own tileId.
-    assert.equal(mintCalls.length, 1);
+    // Two mints up front, in order: narrow (bound to this attachment's own
+    // tileId), then cleanup (studio.remove_tile, workspace-wide -- no
+    // tileIds at all, not even this tile's own id).
+    assert.equal(mintCalls.length, 2);
     assert.deepEqual(mintCalls[0].scopes, NARROW_MCP_SCOPES);
     assert.deepEqual(mintCalls[0].tileIds, ['tile-1']);
     assert.equal(mintCalls[0].workspaceId, 'w1');
     assert.equal(mintCalls[0].agentId, 'claude');
+    assert.deepEqual(mintCalls[1].scopes, [REMOVE_TILE_SCOPE]);
+    assert.equal('tileIds' in mintCalls[1], false, 'cleanup mint must not carry a tileIds restriction');
 
     // A real loopback call to the local proxy.
     const res = await fetch(handle!.url, {
@@ -90,6 +96,59 @@ describe('startMcpProxy', () => {
 
     assert.equal(forwardCalls.length, 1);
     assert.equal(forwardCalls[0].body.params.arguments._delegatedToken, 'tok-1');
+  });
+
+  it('routes a studio.remove_tile call through the separate workspace-wide cleanup token, not the narrow one', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const mintCalls: any[] = [];
+    let forwardedToken: string | undefined;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/tokens')) {
+        const req = JSON.parse(init.body);
+        mintCalls.push(req);
+        // Narrow mint (has tileIds) gets 'narrow-tok'; cleanup mint (no tileIds) gets 'cleanup-tok'.
+        return mintResponse('tileIds' in req ? 'narrow-tok' : 'cleanup-tok');
+      }
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwardedToken = JSON.parse(init.body).params.arguments._delegatedToken;
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', tileId: 'tile-1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: REMOVE_TILE_SCOPE, arguments: { tileId: 'some-other-stale-tile' } } }),
+    });
+    assert.equal(forwardedToken, 'cleanup-tok');
+  });
+
+  it('a cleanup (remove_tile) mint failure at startup logs a warning but does not abort the proxy', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/tokens')) {
+        const req = JSON.parse(init.body);
+        if ('tileIds' in req) return mintResponse('narrow-tok');
+        return new Response(JSON.stringify({ error: 'boom' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    const logs: string[] = [];
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', accessToken: 'at', workspaceId: 'w1', tileId: 'tile-1', agentId: 'claude', fetchImpl, log: (l) => logs.push(l),
+    });
+    assert.ok(handle, 'a broken cleanup mint must not take down the whole proxy');
+    assert.ok(logs.some((l) => l.includes('local MCP tile-cleanup access unavailable')));
   });
 
   it('does not inject a token into a non-tools/call request (e.g. initialize)', async () => {
@@ -151,8 +210,9 @@ describe('startMcpProxy', () => {
     });
     assert.equal(res.status, 200);
     const body = (await res.json()) as any;
-    assert.equal(body.result.usedToken, 'tok-2');
-    assert.equal(mintCount, 2, 'initial mint + one force-refresh');
+    // mint #1 = narrow (startup), #2 = cleanup (startup), #3 = narrow force-refresh.
+    assert.equal(body.result.usedToken, 'tok-3');
+    assert.equal(mintCount, 3, 'two startup mints (narrow + cleanup) + one force-refresh');
     assert.equal(forwardCount, 2, 'initial forward (401) + one retry');
   });
 
@@ -202,8 +262,9 @@ describe('startMcpProxy', () => {
     });
     assert.equal(res.status, 200);
     const body = (await res.json()) as any;
-    assert.equal(body.result.usedToken, 'tok-2');
-    assert.equal(mintCount, 2, 'initial mint + one force-refresh');
+    // mint #1 = narrow (startup), #2 = cleanup (startup), #3 = narrow force-refresh.
+    assert.equal(body.result.usedToken, 'tok-3');
+    assert.equal(mintCount, 3, 'two startup mints (narrow + cleanup) + one force-refresh');
     assert.equal(forwardCount, 2, 'initial forward (in-band UNAUTHORIZED) + one retry');
   });
 
@@ -236,7 +297,7 @@ describe('startMcpProxy', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remove_tile', arguments: {} } }),
     });
-    assert.equal(mintCount, 1, 'no force-refresh for a FORBIDDEN error');
+    assert.equal(mintCount, 2, 'two startup mints (narrow + cleanup), no force-refresh for a FORBIDDEN error');
     assert.equal(forwardCount, 1, 'no retry for a FORBIDDEN error');
   });
 
@@ -262,7 +323,7 @@ describe('startMcpProxy', () => {
         body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
       });
     }
-    assert.equal(mintCount, 1, 'a long-lived (300s) token should not be re-minted for every call');
+    assert.equal(mintCount, 2, 'two startup mints (narrow + cleanup); a long-lived (300s) narrow token should not be re-minted per call');
   });
 
   it('returns undefined (never throws) when the initial mint fails, so attach is not aborted', async () => {

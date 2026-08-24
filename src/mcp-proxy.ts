@@ -27,6 +27,16 @@
  * token is reported as a normal 200 JSON-RPC tool result, not a 401 — see
  * `isUnauthorizedToolResult`'s doc comment for how this was found and
  * confirmed, not assumed).
+ *
+ * `studio.remove_tile` (operator-approved 2026-08-24, permanent fix for
+ * stopped yolobridge tiles never being deleted — see docs/YOLOBRIDGE_PLAN.md)
+ * is deliberately a SEPARATE, second minted token, not folded into the
+ * narrow one above: it's the one scope this proxy needs workspace-wide (to
+ * delete a PAST attachment's stale tile, not just its own), and the mint
+ * route's `tileIds` restriction applies to the whole token, not per-scope —
+ * widening it for `remove_tile` would have silently widened `send_to_tile`/
+ * `read_tile_output` to every tile in the workspace too. Two tokens, two
+ * caches, keeps the peer-tile-parity scopes exactly as narrow as before.
  */
 
 import * as http from 'node:http';
@@ -45,6 +55,12 @@ export const NARROW_MCP_SCOPES = [
   'studio.list_tiles',
   'studio.get_workspace_context',
 ] as const;
+
+/** The one scope minted workspace-wide instead of tile-restricted — see this
+ *  file's header comment. Also the MCP tool name (`remove-tile.ts`'s
+ *  `TOOL_NAME`/`SCOPE` are the same literal), so it doubles as the
+ *  `params.name` this proxy watches for to pick which cached token to use. */
+const REMOVE_TILE_SCOPE = 'studio.remove_tile';
 
 // Requested as the max ordinary (non-restricted-exposure) TTL the mint route
 // accepts; the server silently clamps to 60s anyway for this scope set
@@ -87,27 +103,29 @@ interface MintResult {
 
 class TokenUnavailableError extends Error {}
 
-/**
- * Starts the local proxy. Returns `undefined` (never throws) if the FIRST
- * mint fails — MCP access is a best-effort enhancement on top of a tile
- * that already works without it (send_to_tile/read_tile_output into the
- * daemon's own PTY are unaffected either way), so a mint failure (e.g. an
- * unregistered --agent binary) must not abort the whole `attach`.
- */
-export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHandle | undefined> {
-  const log = opts.log ?? (() => {});
-  const fetchImpl = opts.fetchImpl ?? fetch;
+/** One cached, self-refreshing token for a fixed (scopes, tileIds) pair.
+ *  Two independent instances back the proxy — see this file's header
+ *  comment for why `remove_tile` can't just join the narrow scope list. */
+function makeTokenCache(
+  apiUrl: string,
+  accessToken: string,
+  workspaceId: string,
+  agentId: string,
+  scopes: readonly string[],
+  tileIds: string[] | undefined,
+  fetchImpl: FetchImpl,
+) {
   let cached: MintResult | undefined;
 
   async function mint(): Promise<MintResult> {
-    const res = await fetchImpl(`${opts.apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
+    const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${opts.accessToken}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        workspaceId: opts.workspaceId,
-        agentId: opts.agentId,
-        scopes: NARROW_MCP_SCOPES,
-        tileIds: [opts.tileId],
+        workspaceId,
+        agentId,
+        scopes,
+        ...(tileIds ? { tileIds } : {}),
         ttlSeconds: REQUESTED_TTL_SECONDS,
       }),
     });
@@ -128,22 +146,76 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
     return { token: body.token, expiresAtMs: new Date(body.expiresAt).getTime() };
   }
 
-  async function getToken(): Promise<string> {
-    if (cached && Date.now() < cached.expiresAtMs - REFRESH_BUFFER_MS) return cached.token;
-    cached = await mint();
-    return cached.token;
-  }
+  return {
+    async getToken(): Promise<string> {
+      if (cached && Date.now() < cached.expiresAtMs - REFRESH_BUFFER_MS) return cached.token;
+      cached = await mint();
+      return cached.token;
+    },
+    async forceRefresh(): Promise<string> {
+      cached = await mint();
+      return cached.token;
+    },
+  };
+}
 
-  async function forceRefresh(): Promise<string> {
-    cached = await mint();
-    return cached.token;
+/** Picks `params.name` out of a `tools/call` JSON-RPC request body, so the
+ *  caller can choose which cached token to inject. `undefined` for anything
+ *  else (batch requests, non-tools/call methods, unparseable bodies) —
+ *  those all fall back to the narrow token, same as before this split. */
+function toolNameFromBody(rawBody: string): string | undefined {
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (parsed?.method === 'tools/call' && typeof parsed.params?.name === 'string') {
+      return parsed.params.name;
+    }
+  } catch {
+    /* not JSON — treat as "no tool name", same as any other non-tools/call body */
   }
+  return undefined;
+}
+
+/**
+ * Starts the local proxy. Returns `undefined` (never throws) if the FIRST
+ * (narrow-scope) mint fails — MCP access is a best-effort enhancement on top
+ * of a tile that already works without it (send_to_tile/read_tile_output
+ * into the daemon's own PTY are unaffected either way), so a mint failure
+ * (e.g. an unregistered --agent binary) must not abort the whole `attach`.
+ * The second (remove_tile) mint is a smaller enhancement on top of that
+ * enhancement — its own failure only disables tile cleanup, logged but not
+ * fatal to the proxy itself.
+ */
+export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHandle | undefined> {
+  const log = opts.log ?? (() => {});
+  const fetchImpl = opts.fetchImpl ?? fetch;
+
+  const narrow = makeTokenCache(
+    opts.apiUrl, opts.accessToken, opts.workspaceId, opts.agentId,
+    NARROW_MCP_SCOPES, [opts.tileId], fetchImpl,
+  );
+  const cleanup = makeTokenCache(
+    opts.apiUrl, opts.accessToken, opts.workspaceId, opts.agentId,
+    [REMOVE_TILE_SCOPE], undefined, fetchImpl,
+  );
 
   try {
-    await getToken();
+    await narrow.getToken();
   } catch (err) {
     log(`yolo-bridge: local MCP access unavailable (${err instanceof Error ? err.message : String(err)}) — continuing without it.`);
     return undefined;
+  }
+
+  try {
+    await cleanup.getToken();
+  } catch (err) {
+    log(`yolo-bridge: local MCP tile-cleanup access unavailable (${err instanceof Error ? err.message : String(err)}) — remove_tile will fail if attempted.`);
+  }
+
+  function getToken(toolName: string | undefined): Promise<string> {
+    return toolName === REMOVE_TILE_SCOPE ? cleanup.getToken() : narrow.getToken();
+  }
+  function forceRefresh(toolName: string | undefined): Promise<string> {
+    return toolName === REMOVE_TILE_SCOPE ? cleanup.forceRefresh() : narrow.forceRefresh();
   }
 
   const upstream = mcpUrl().replace(/\/+$/, '');
@@ -274,13 +346,14 @@ async function handleRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   upstream: string,
-  getToken: () => Promise<string>,
-  forceRefresh: () => Promise<string>,
+  getToken: (toolName: string | undefined) => Promise<string>,
+  forceRefresh: (toolName: string | undefined) => Promise<string>,
   fetchImpl: FetchImpl,
   log: (line: string) => void,
 ): Promise<void> {
   const method = req.method ?? 'POST';
   const body = method === 'POST' || method === 'DELETE' ? await readBody(req) : undefined;
+  const toolName = body ? toolNameFromBody(body) : undefined;
 
   const headers: Record<string, string> = { Accept: 'application/json, text/event-stream' };
   const incomingContentType = req.headers['content-type'];
@@ -290,7 +363,7 @@ async function handleRequest(
   let forwardedBody = body;
   if (method === 'POST' && body) {
     try {
-      const token = await getToken();
+      const token = await getToken(toolName);
       forwardedBody = injectToken(body, token);
     } catch (err) {
       log(`yolo-bridge: MCP token unavailable: ${err instanceof Error ? err.message : String(err)}`);
@@ -311,7 +384,7 @@ async function handleRequest(
   if (method === 'POST' && body && (result.status === 401 || isUnauthorizedToolResult(result.text))) {
     log(`yolo-bridge: MCP upstream reported an invalid/expired token (status ${result.status}), force-refreshing`);
     try {
-      const refreshed = await forceRefresh();
+      const refreshed = await forceRefresh(toolName);
       const reinjected = injectToken(body, refreshed);
       result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl);
     } catch (err) {
