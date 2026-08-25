@@ -157,15 +157,15 @@ describe('ensureTempSiblingExcluded', () => {
     writeFileSync(tempSibling, '{}');
     assert.equal(riskyToCommit(dir, tempSibling), true, 'sanity check: the temp sibling name is NOT covered before the fix runs');
 
-    ensureTempSiblingExcluded(dir, '.mcp.json');
+    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
 
     assert.equal(riskyToCommit(dir, tempSibling), false, 'the temp sibling must now be confirmed git-ignored');
   });
 
   it('is idempotent — calling it twice does not duplicate the exclude line', () => {
     initGitRepo();
-    ensureTempSiblingExcluded(dir, '.mcp.json');
-    ensureTempSiblingExcluded(dir, '.mcp.json');
+    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
+    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
     const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
     const occurrences = excludeContent.split('\n').filter((line) => line.trim() === '.mcp.json.tmp-*').length;
     assert.equal(occurrences, 1);
@@ -176,7 +176,7 @@ describe('ensureTempSiblingExcluded', () => {
     mkdirSync(join(dir, '.git', 'info'), { recursive: true });
     writeFileSync(join(dir, '.git', 'info', 'exclude'), '# operator-authored line\nsome-other-pattern\n');
 
-    ensureTempSiblingExcluded(dir, '.mcp.json');
+    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
 
     const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
     assert.ok(excludeContent.includes('# operator-authored line'));
@@ -185,6 +185,6 @@ describe('ensureTempSiblingExcluded', () => {
   });
 
   it('is a silent no-op outside a git repo entirely', () => {
-    assert.doesNotThrow(() => ensureTempSiblingExcluded(dir, '.mcp.json'));
+    assert.doesNotThrow(() => ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*'));
   });
 });

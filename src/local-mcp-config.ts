@@ -575,8 +575,27 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   // symlink's own basename would cover a temp filename that's never
   // actually created, leaving the REAL one (at the resolved target's name)
   // just as uncovered as before this fix.
-  ensureTempSiblingExcluded(cwd, basename(resolveWriteTarget(path)));
-  ensureTempSiblingExcluded(cwd, basename(resolveWriteTarget(sidecarPath(cwd))));
+  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(path))}.tmp-*`);
+  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(sidecarPath(cwd)))}.tmp-*`);
+  // The LOCK ITSELF (and its own `.claim-*`/`.reclaim-*` ephemeral siblings,
+  // round 26/27) got NONE of this treatment before round 28 — reasoned at
+  // the time that it "only exists for the duration of a single synchronous
+  // critical section." That reasoning doesn't hold: a crash can leave it
+  // behind INDEFINITELY (the exact scenario rounds 20-27 built extensive
+  // stale-reclaim logic to handle), and even during the brief NORMAL
+  // window, a concurrently-running YOLO-mode agent can `git add -A` at any
+  // moment. Deliberately NOT a `riskyToCommit` refusal gate like `path`/the
+  // sidecar above — that would require the OPERATOR to have already
+  // gitignored a lock filename nobody documents them ever needing to,
+  // bricking local MCP config in every repo that hasn't (the same
+  // reasoning `ensureTempSiblingExcluded`'s own doc comment already gives
+  // for not refusing on an uncovered temp-sibling name). Proactively making
+  // the lock's exact name (and its own ephemeral siblings) actually
+  // git-ignored, the same way the temp-sibling gap was closed, needs no
+  // such refusal at all.
+  ensureTempSiblingExcluded(cwd, basename(lockPath(cwd)));
+  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.claim-*`);
+  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.reclaim-*`);
   // Serializes the whole read-check-write sequence below across PROCESSES,
   // not just within one (Codex review, 2026-08-24, round 20) — see
   // `acquireConfigLock`'s doc comment for the race this closes.
@@ -721,6 +740,18 @@ function writeLocalMcpConfigLocked(cwd: string, proxyUrl: string, path: string):
  * overwrote the sidecar with ITS OWN newer URL is never clobbered here.
  */
 export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, createdFile: boolean): void {
+  // Best-effort — never a refusal gate here, unlike `writeLocalMcpConfig`'s
+  // OWN `riskyToCommit` checks (Codex review, 2026-08-24, round 28): this
+  // function's whole job is best-effort CLEANUP, so blocking it over a
+  // risky lock path would be strictly worse than proceeding without this
+  // extra protection (a stale `.mcp.json` entry left behind is recoverable;
+  // skipping cleanup entirely isn't a safer outcome). Idempotent regardless
+  // — a repo where `writeLocalMcpConfig` already succeeded once already has
+  // these patterns; this only matters for the (unlikely but possible) case
+  // where this lock gets created for the very first time via a detach path.
+  ensureTempSiblingExcluded(cwd, basename(lockPath(cwd)));
+  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.claim-*`);
+  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.reclaim-*`);
   // Same cross-process lock `writeLocalMcpConfig` takes (Codex review,
   // 2026-08-24, round 20) — a concurrent attach's read-check-write could
   // otherwise interleave with this read-modify-write of the same file. A

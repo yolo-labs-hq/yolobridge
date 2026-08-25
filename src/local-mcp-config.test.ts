@@ -736,4 +736,26 @@ describe('removeLocalMcpConfig', () => {
       "the symlink's OWN basename must not be what gets excluded -- that temp filename is never actually created",
     );
   });
+
+  it("makes the LOCK's own name and its .claim-*/.reclaim-* ephemeral siblings actually git-ignored, even in a repo that only thought to ignore .mcp.json and the sidecar (Codex review, 2026-08-24, round 28)", () => {
+    // The lock only "exists for the duration of a single synchronous
+    // critical section" in the common case -- but a crash can leave it
+    // behind INDEFINITELY (the exact scenario rounds 20-27 built extensive
+    // stale-reclaim logic to handle), and even during the brief normal
+    // window a concurrently-running YOLO-mode agent can `git add -A` at
+    // any moment. A repo that only gitignored `.mcp.json` and the sidecar
+    // (the documented, expected shape) has never been told this lock
+    // filename exists at all.
+    initGitRepo();
+    writeFileSync(join(dir, '.gitignore'), '.mcp.json\n.yolobridge-mcp-state.json\n');
+
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true, 'must NOT refuse over the lock path being unignored -- that would brick every repo nobody told about this filename');
+
+    const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
+    const lines = excludeContent.split('\n').map((l) => l.trim());
+    assert.ok(lines.includes('.yolobridge-mcp-state.json.lock'), `expected the lock's own exact name in .git/info/exclude, got: ${excludeContent}`);
+    assert.ok(lines.includes('.yolobridge-mcp-state.json.lock.claim-*'), `expected the claim-temp pattern in .git/info/exclude, got: ${excludeContent}`);
+    assert.ok(lines.includes('.yolobridge-mcp-state.json.lock.reclaim-*'), `expected the reclaim-temp pattern in .git/info/exclude, got: ${excludeContent}`);
+  });
 });

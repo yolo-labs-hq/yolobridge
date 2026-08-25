@@ -210,4 +210,35 @@ describe('atomicWriteFileSync', () => {
 
     assert.equal(readFileSync(unrelated, 'utf-8'), 'keep me');
   });
+
+  it("never sweeps an OPERATOR-OWNED sibling that merely shares the '.tmp-' prefix but not the exact generated shape (Codex review, 2026-08-24, round 28)", () => {
+    // A prefix-only check would misclassify a hand-made file like this as
+    // this module's own leftover and irreversibly delete it -- the exact
+    // generated shape is `<name>.tmp-<pid>-<8 hex chars>`, which
+    // `.mcp.json.tmp-backup` doesn't match at all.
+    const path = join(dir, 'target3.json');
+    const operatorBackup = join(dir, 'target3.json.tmp-backup');
+    writeFileSync(operatorBackup, 'my own backup, not yours to touch');
+
+    atomicWriteFileSync(path, '{"new":true}');
+
+    assert.equal(readFileSync(operatorBackup, 'utf-8'), 'my own backup, not yours to touch');
+  });
+
+  it('never sweeps a sibling whose embedded pid is confirmed ALIVE, even though it matches the generated shape exactly (Codex review, 2026-08-24, round 28)', () => {
+    // The sweep runs at the START of every call, including on an unguarded
+    // path (local-mcp-trust.ts's writes aren't behind local-mcp-config.ts's
+    // own cross-process lock) -- without a liveness check, one process's
+    // sweep could delete ANOTHER genuinely concurrent process's
+    // still-being-written temp file out from under it. This test process's
+    // own pid is, trivially, alive -- standing in for a live concurrent
+    // writer.
+    const path = join(dir, 'target4.json');
+    const liveWritersTemp = join(dir, `target4.json.tmp-${process.pid}-deadbeef`);
+    writeFileSync(liveWritersTemp, 'still being written by a live process');
+
+    atomicWriteFileSync(path, '{"new":true}');
+
+    assert.equal(readFileSync(liveWritersTemp, 'utf-8'), 'still being written by a live process');
+  });
 });

@@ -197,7 +197,7 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   // see `ensureTempSiblingExcluded`'s own doc comment. Derived from
   // `resolveWriteTarget`, not the lexical path (Codex review, 2026-08-24,
   // round 27) — see local-mcp-config.ts's identical fix for why.
-  ensureTempSiblingExcluded(cwd, basename(resolveWriteTarget(path)));
+  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(path))}.tmp-*`);
   const createdFile = !existsSync(path);
   let settings: Record<string, unknown>;
   try {

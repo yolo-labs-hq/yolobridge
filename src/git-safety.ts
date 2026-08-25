@@ -57,27 +57,35 @@ function isConfirmedNotIgnored(cwd: string, path: string): boolean {
 /**
  * Idempotently adds a LOCAL-ONLY exclude pattern — `.git/info/exclude`, the
  * git-native mechanism for machine-specific excludes that are never shared
- * via `.gitignore` — covering `atomicWriteFileSync`'s own `.tmp-*` sibling
- * for `destinationBasename` (Codex review, 2026-08-24, round 25).
+ * via `.gitignore` — covering an ephemeral sibling this module's callers
+ * create next to a destination path (Codex review, 2026-08-24, round 25;
+ * generalized to an explicit `pattern` in round 28 — see below).
  *
- * `riskyToCommit` validates the DESTINATION path, but the temp sibling
- * `atomicWriteFileSync` writes through first has a DIFFERENT literal name
- * (`<name>.tmp-<pid>-<hex>`) — an operator's typical EXACT-match
- * `.gitignore` entry for `.mcp.json` (the common, expected shape — verified
- * empirically, round 15) does NOT also cover `.mcp.json.tmp-1234abcd`. A
- * crash in the narrow window between creating that temp file and either
- * renaming or cleaning it up (round 24's sweep narrows, but a SIGKILL can
- * still land there) would leave an untracked-but-not-ignored copy of the
- * full destination content sitting in the working tree, ready for a
- * spawned YOLO-mode agent's next `git add -A && commit` to publish.
+ * `riskyToCommit` validates the DESTINATION path, but a sibling this code
+ * itself creates (`atomicWriteFileSync`'s `<name>.tmp-<pid>-<hex>`, or
+ * `acquireConfigLock`'s `<lock>`/`<lock>.claim-*`/`<lock>.reclaim-*`) has a
+ * DIFFERENT literal name — an operator's typical EXACT-match `.gitignore`
+ * entry for `.mcp.json` (the common, expected shape — verified empirically,
+ * round 15) does NOT also cover a suffixed sibling. A crash in the narrow
+ * window between creating one of these and either renaming/unlinking it or
+ * cleaning it up on the next call would leave an untracked-but-not-ignored
+ * copy of live local state sitting in the working tree, ready for a
+ * spawned YOLO-mode agent's next `git add -A && commit` to publish — and
+ * even OUTSIDE a crash, a concurrently-running agent can `git add -A` at
+ * any moment while one of these briefly exists mid-operation.
  *
- * Refusing the write outright whenever the temp name isn't covered was
+ * Refusing the write outright whenever a sibling name isn't covered was
  * considered and rejected: an exact-match `.gitignore` pattern NEVER covers
  * a suffixed sibling, so that would break local MCP configuration for
  * every correctly-configured repo, not just a misconfigured one. Making the
- * temp name actually covered — once, per repo, via the same mechanism
+ * name actually covered — once, per repo, via the same mechanism
  * `.gitignore` itself uses under the hood — closes the gap without that
  * regression.
+ *
+ * `pattern` is the LITERAL exclude-file line to add (a plain name, or a
+ * `*`-glob — round 28 generalized this from always appending `.tmp-*` onto
+ * a passed-in basename, since `acquireConfigLock`'s own siblings don't fit
+ * that one fixed shape).
  *
  * Best-effort and silent on any failure (no `.git` dir, a worktree/
  * submodule shape `git rev-parse` can't resolve cleanly, a read-only
@@ -85,14 +93,13 @@ function isConfirmedNotIgnored(cwd: string, path: string): boolean {
  * checked," exactly the pre-round-25 behavior — never blocks the write
  * itself over this.
  */
-export function ensureTempSiblingExcluded(cwd: string, destinationBasename: string): void {
+export function ensureTempSiblingExcluded(cwd: string, pattern: string): void {
   try {
     const gitDirResult = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd, encoding: 'utf-8' });
     if (gitDirResult.status !== 0) return;
     const gitDir = gitDirResult.stdout.trim();
     if (!gitDir) return;
     const excludePath = join(isAbsolute(gitDir) ? gitDir : join(cwd, gitDir), 'info', 'exclude');
-    const pattern = `${destinationBasename}.tmp-*`;
     const existing = existsSync(excludePath) ? readFileSync(excludePath, 'utf-8') : '';
     if (existing.split('\n').some((line) => line.trim() === pattern)) return; // Already present.
     mkdirSync(dirname(excludePath), { recursive: true });

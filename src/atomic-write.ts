@@ -144,15 +144,50 @@ export function unlinkWriteTarget(path: string): void {
   unlinkSync(target);
 }
 
-/** Best-effort removal of any `.tmp-*` sibling this function itself could
- *  have left behind from a PRIOR call that crashed between creating it and
- *  either renaming or cleaning it up (Codex review, 2026-08-24, round 24) —
- *  see the temp-file-permissions doc comment on `atomicWriteFileSync` for
- *  the exposure this narrows. Scoped to siblings of THIS exact target so it
- *  never touches an unrelated file merely sharing the directory. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Mirrors `local-mcp-config.ts`'s own `isPidAlive` (kept as an independent
+ *  copy — see that module's own doc comment on why these stay separately
+ *  usable/testable): `process.kill(pid, 0)` sends no actual signal, just
+ *  probes. ESRCH = no such process (dead); EPERM = exists but no
+ *  permission to signal (still alive); anything else fails closed as
+ *  "alive," since this function's only job is to catch a CONFIRMED-dead
+ *  writer, never to guess one into existence. */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Best-effort removal of a temp sibling THIS function itself could have
+ * left behind from a PRIOR call that crashed between creating it and
+ * either renaming or cleaning it up (Codex review, 2026-08-24, round 24) —
+ * see the temp-file-permissions doc comment on `atomicWriteFileSync` for
+ * the exposure this narrows.
+ *
+ * Matches the EXACT generated shape (`<name>.tmp-<pid>-<8 hex chars>`), not
+ * a bare prefix (Codex review, 2026-08-24, round 28): a prefix-only check
+ * would misclassify an OPERATOR-OWNED sibling that merely happens to start
+ * the same way (e.g. a hand-made `.mcp.json.tmp-backup`) as this module's
+ * own leftover and irreversibly delete it.
+ *
+ * Also extracts the embedded pid from a shape-matching name and skips it
+ * when that pid is still ALIVE (round 28): this same sweep runs at the
+ * start of every `atomicWriteFileSync` call, including one from a
+ * GENUINELY CONCURRENT writer to the same destination on an unguarded path
+ * (`local-mcp-trust.ts`'s writes aren't behind `local-mcp-config.ts`'s own
+ * cross-process lock) — without this, one process's sweep could delete
+ * ANOTHER process's still-being-written temp file out from under it.
+ */
 function sweepStaleTempSiblings(targetPath: string): void {
   const dir = dirname(targetPath);
-  const prefix = `${basename(targetPath)}.tmp-`;
+  const pattern = new RegExp(`^${escapeRegExp(basename(targetPath))}\\.tmp-(\\d+)-[0-9a-f]{8}$`);
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -160,7 +195,10 @@ function sweepStaleTempSiblings(targetPath: string): void {
     return; // Directory doesn't exist (nothing written here yet) — nothing to sweep.
   }
   for (const name of entries) {
-    if (!name.startsWith(prefix)) continue;
+    const match = pattern.exec(name);
+    if (!match) continue;
+    const writerPid = Number(match[1]);
+    if (Number.isInteger(writerPid) && writerPid >= 1 && isPidAlive(writerPid)) continue; // Still being written by a live process — never touch it.
     try {
       unlinkSync(join(dir, name));
     } catch {
