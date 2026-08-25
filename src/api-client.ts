@@ -41,11 +41,37 @@ async function parseErrorBody(res: Response): Promise<{ message: string; code?: 
   }
 }
 
+/**
+ * `POST /v1/workspaces/:workspaceId/yolobridge/attach`.
+ *
+ * `scopedToken` / `scopedTokenExpiresAt` are the workspace-scoped daemon
+ * credential common-api mints at attach
+ * (`docs/YOLOBRIDGE_SCOPED_CREDENTIAL_PLAN.md`): a token confined to THIS
+ * workspace's YoloBridge surface, which the post-attach calls
+ * (`detach`/`openStream`/`postHeartbeat`/`postReadOutputReply`) use instead of
+ * the full-account token. `scopedTokenExpiresAt` is absolute epoch-ms computed
+ * server-side at mint, so the refresh schedule never requires decoding the JWT.
+ *
+ * OPTIONAL, deliberately. This client is the FROZEN side of the seam — a daemon
+ * binary sits on someone's laptop for months — so a build that talks to a
+ * common-api predating the mint must degrade, not throw on shape validation.
+ * The enforcement that makes the scoped token mandatory is server-side
+ * (Boundary B), where it can actually be reasoned about; a hard client-side
+ * requirement here would only turn an old server into a mystery attach failure.
+ * Every other exported function's signature is unchanged: they still take "the
+ * bearer token to send" via `ApiClientConfig`, and which token that is remains
+ * the caller's decision.
+ */
 export async function attach(
   cfg: ApiClientConfig,
   workspaceId: string,
   hostLabel?: string,
-): Promise<{ tileId: string; attachmentId: string }> {
+): Promise<{
+  tileId: string;
+  attachmentId: string;
+  scopedToken?: string;
+  scopedTokenExpiresAt?: number;
+}> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const res = await fetchImpl(`${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach`, {
     method: 'POST',
@@ -60,7 +86,14 @@ export async function attach(
   if (typeof body?.tileId !== 'string' || typeof body?.attachmentId !== 'string') {
     throw new YoloBridgeApiError('attach returned an unexpected shape', res.status);
   }
-  return { tileId: body.tileId, attachmentId: body.attachmentId };
+  // Both-or-neither: a token with no expiry cannot be refreshed on time, and an
+  // expiry with no token is nothing. Carrying half of the pair forward would
+  // hand the caller a credential it cannot schedule around.
+  const scoped =
+    typeof body?.scopedToken === 'string' && typeof body?.scopedTokenExpiresAt === 'number'
+      ? { scopedToken: body.scopedToken as string, scopedTokenExpiresAt: body.scopedTokenExpiresAt as number }
+      : {};
+  return { tileId: body.tileId, attachmentId: body.attachmentId, ...scoped };
 }
 
 export interface SelectableWorkspace {
