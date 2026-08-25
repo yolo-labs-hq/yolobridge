@@ -31,12 +31,12 @@
  * a hard failure.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync, linkSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync, linkSync, renameSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { uptime } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
-import { atomicWriteFileSync, unlinkWriteTarget } from './atomic-write.js';
+import { atomicWriteFileSync, unlinkWriteTarget, resolveWriteTarget } from './atomic-write.js';
 import { riskyToCommit, ensureTempSiblingExcluded } from './git-safety.js';
 
 /** The literal string written into `.mcp.json`'s `headers` value — a
@@ -277,16 +277,6 @@ function parseLockContent(raw: string): { pid?: number; bootUptimeSec?: number }
   return { pid: isValidPid(legacyPid) ? legacyPid : undefined };
 }
 
-/** True when `a` and `b` record the IDENTICAL owner — both `pid` and
- *  `bootUptimeSec` equal, including both being `undefined` together (the
- *  "malformed/no valid pid at all" case, round 24's other fix below). Used
- *  to prove nothing changed underneath a stale-lock reclaim between the
- *  initial read and the delete (Codex review, 2026-08-24, round 24,
- *  tightening round 22's pid-only re-check — see `acquireConfigLock`'s own
- *  comment for the exact race a pid-only comparison missed). */
-function sameLockIdentity(a: { pid?: number; bootUptimeSec?: number }, b: { pid?: number; bootUptimeSec?: number }): boolean {
-  return a.pid === b.pid && a.bootUptimeSec === b.bootUptimeSec;
-}
 
 function acquireConfigLock(cwd: string): (() => void) | null {
   const path = lockPath(cwd);
@@ -351,30 +341,63 @@ function acquireConfigLock(cwd: string): (() => void) | null {
       // genuine is ever at risk of being reclaimed here.
       const isStaleOrInvalid = holder.pid === undefined || isDefinitivelyStale(holder.pid, holder.bootUptimeSec);
       if (isStaleOrInvalid) {
-        // Re-verify the FULL recorded identity — pid AND bootUptimeSec
-        // TOGETHER, not pid alone — immediately before deleting (Codex
-        // review, 2026-08-24, round 24, tightening round 22's fix): after a
-        // reboot recycles a stale lock's exact pid number, two processes can
-        // both judge it stale and race to reclaim. If the WINNER's own live
-        // pid happens to equal that same recycled number, a pid-only
-        // re-check would see "same pid" and let the loser delete the
-        // winner's brand-new LIVE lock anyway — comparing the full
-        // (pid, bootUptimeSec) pair is what actually proves nothing changed
-        // underneath us. A mismatch (or the content going from "malformed"
-        // to "a real record") means someone else already reclaimed it; skip
-        // deleting and loop back to re-evaluate from scratch.
+        // Atomically CLAIM `path` for inspection via `renameSync`, rather
+        // than re-read-then-compare-then-unlink (Codex review, 2026-08-24,
+        // round 27, replacing round 22/24's check-then-unlink entirely): no
+        // matter how many times a separate read is compared before the
+        // unlink, there's ALWAYS a residual gap between the LAST comparison
+        // and the actual delete syscall — one process can pause there while
+        // another deletes the same stale lock and acquires its own live
+        // one, and the first then resumes and unlinks THAT live lock too.
+        // `renameSync(path, reclaimTmpPath)` is atomic and exclusive by
+        // construction: at most ONE process can ever successfully rename a
+        // given source path away at a given moment (a second attempt gets
+        // ENOENT, since the source is already gone) — there is no gap to
+        // pause in between "decided to claim it" and "actually claimed it,"
+        // because those are the SAME syscall.
+        const reclaimTmpPath = `${path}.reclaim-${process.pid}-${randomBytes(4).toString('hex')}`;
+        try {
+          renameSync(path, reclaimTmpPath);
+        } catch {
+          continue; // Someone else already reclaimed or released it; retry.
+        }
+        // We now EXCLUSIVELY possess whatever was at `path` — re-inspect
+        // FRESH content (not the earlier `holder` peek, which could be
+        // stale relative to what we just claimed).
         let current: { pid?: number; bootUptimeSec?: number };
         try {
-          current = parseLockContent(readFileSync(path, 'utf-8'));
+          current = parseLockContent(readFileSync(reclaimTmpPath, 'utf-8'));
         } catch {
-          continue; // Already gone — someone else's reclaim or release; retry.
+          current = {};
         }
-        if (!sameLockIdentity(current, holder)) continue;
+        const stillStaleOrInvalid = current.pid === undefined || isDefinitivelyStale(current.pid, current.bootUptimeSec);
+        if (stillStaleOrInvalid) {
+          try {
+            unlinkSync(reclaimTmpPath);
+          } catch {
+            // Best-effort — see the surrounding cleanup's own philosophy.
+          }
+          continue;
+        }
+        // Turned out to be LIVE after all (changed between our initial peek
+        // and the rename) — put it back via an EXCLUSIVE `linkSync`, never
+        // a blind rename-back: a THIRD process could have already created
+        // a brand-new lock at `path` while we held it claimed, and
+        // overwriting that would reintroduce the exact class of bug this
+        // whole rewrite exists to close. If `path` is occupied again, our
+        // extracted copy is simply redundant — discard it.
         try {
-          unlinkSync(path);
+          linkSync(reclaimTmpPath, path);
         } catch {
-          // Raced with the holder's own (late) release — fine, loop retries.
+          // `path` already has something again — nothing to restore.
         }
+        try {
+          unlinkSync(reclaimTmpPath);
+        } catch {
+          // Best-effort.
+        }
+        if (Date.now() >= deadline) return null;
+        sleepSync(20);
         continue;
       }
       if (Date.now() >= deadline) return null;
@@ -433,7 +456,13 @@ function deleteSidecar(cwd: string): void {
   const path = sidecarPath(cwd);
   if (existsSync(path)) {
     try {
-      unlinkSync(path);
+      // `unlinkWriteTarget`, not a bare `unlinkSync(path)` (Codex review,
+      // 2026-08-24, round 27) — `writeSidecar` writes THROUGH a symlink at
+      // this path via `atomicWriteFileSync` (round 16), same as `.mcp.json`
+      // itself; a bare unlink here would destroy the operator's symlink
+      // instead of the healed/written target, the same regression round 26
+      // fixed for `.mcp.json` and `settings.local.json` but missed here.
+      unlinkWriteTarget(path);
     } catch {
       // Best-effort cleanup; a leftover sidecar only ever makes the NEXT
       // write more conservative (it just won't match a differing URL), it
@@ -538,8 +567,16 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   // `.gitignore` entry doesn't cover (Codex review, 2026-08-24, round 25) —
   // see `ensureTempSiblingExcluded`'s own doc comment for why refusing the
   // write instead would break every correctly-configured repo.
-  ensureTempSiblingExcluded(cwd, basename(path));
-  ensureTempSiblingExcluded(cwd, basename(sidecarPath(cwd)));
+  //
+  // Derived from `resolveWriteTarget`, not the lexical path (Codex review,
+  // 2026-08-24, round 27): when `path`/the sidecar is a symlink to a
+  // DIFFERENTLY-NAMED target, `atomicWriteFileSync` creates its temp
+  // sibling next to the RESOLVED target, not the symlink — excluding the
+  // symlink's own basename would cover a temp filename that's never
+  // actually created, leaving the REAL one (at the resolved target's name)
+  // just as uncovered as before this fix.
+  ensureTempSiblingExcluded(cwd, basename(resolveWriteTarget(path)));
+  ensureTempSiblingExcluded(cwd, basename(resolveWriteTarget(sidecarPath(cwd))));
   // Serializes the whole read-check-write sequence below across PROCESSES,
   // not just within one (Codex review, 2026-08-24, round 20) — see
   // `acquireConfigLock`'s doc comment for the race this closes.

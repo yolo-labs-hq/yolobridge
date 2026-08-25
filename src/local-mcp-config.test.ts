@@ -484,6 +484,26 @@ describe('cross-process config lock (Codex review, 2026-08-24, round 20)', () =>
     assert.ok(entries.every((name) => !name.includes('.claim-')), `expected no leftover claim-temp file, found: ${JSON.stringify(entries)}`);
   });
 
+  it('reclaims a stale lock via an atomic rename-claim, leaving no stray .reclaim-* temp file behind (Codex review, 2026-08-24, round 27)', () => {
+    // Round 22/24's check-then-unlink (re-read, compare, THEN unlink) always
+    // left a residual gap between the last comparison and the actual delete
+    // syscall -- one process could pause there while another deleted the
+    // same stale lock and acquired its own live one, and the first then
+    // resumed and unlinked THAT live lock too. renameSync(path,
+    // reclaimTmpPath) makes "decide to claim" and "actually claim" the SAME
+    // atomic syscall instead of two separate steps with a gap between them.
+    // This test proves the mechanism leaves no `.reclaim-*` litter behind
+    // on the successful path, not the race itself (same limitation as
+    // round 26's own claim-mechanism test — a genuine two-process race at
+    // machine speed isn't reproducible deterministically without mocking
+    // `node:fs`, which this package's tests never do).
+    writeFileSync(lockPath(), String(spawnAndExit()));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
+    const entries = readdirSync(dir);
+    assert.ok(entries.every((name) => !name.includes('.reclaim-')), `expected no leftover reclaim-temp file, found: ${JSON.stringify(entries)}`);
+  });
+
   it('reclaims a lock containing GARBAGE that parses to no valid pid at all, rather than waiting out the full deadline on every future attach (Codex review, 2026-08-24, round 24)', () => {
     writeFileSync(lockPath(), 'not-json-and-not-a-number-either');
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
@@ -675,5 +695,45 @@ describe('removeLocalMcpConfig', () => {
 
     assert.ok(lstatSync(mcpJsonPath()).isSymbolicLink(), 'the symlink itself must survive cleanup');
     assert.equal(existsSync(realTarget), false, 'the healed target this module actually created must be the thing that gets deleted');
+  });
+
+  it('deletes the HEALED TARGET, not the symlink itself, when cleaning up a SIDECAR that was a broken symlink at write time (Codex review, 2026-08-24, round 27)', () => {
+    // Same gap as the .mcp.json fix above, but in deleteSidecar -- Codex
+    // independently flagged this one too after round 26 fixed .mcp.json
+    // and settings.local.json but left the sidecar's own cleanup untouched.
+    const realSidecarTarget = join(dir, 'real-sidecar.json');
+    symlinkSync(realSidecarTarget, sidecarPath());
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true);
+    assert.ok(lstatSync(sidecarPath()).isSymbolicLink(), 'sanity check: still a symlink right after the healing write');
+
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', result.createdFile);
+
+    assert.ok(lstatSync(sidecarPath()).isSymbolicLink(), 'the sidecar symlink itself must survive cleanup');
+    assert.equal(existsSync(realSidecarTarget), false, 'the healed sidecar target must be the thing that gets deleted');
+  });
+
+  it("excludes the RESOLVED TARGET's temp-sibling name, not the symlink's own, from Git when .mcp.json is a symlink to a differently-named target (Codex review, 2026-08-24, round 27)", () => {
+    // atomicWriteFileSync creates its temp sibling next to the RESOLVED
+    // target (round 16), not the symlink -- excluding the symlink's own
+    // basename would cover a temp filename that's never actually created,
+    // leaving the REAL one just as uncovered as before round 25's fix.
+    initGitRepo();
+    writeFileSync(join(dir, '.gitignore'), '.mcp.json\ndifferently-named.json\n.yolobridge-mcp-state.json\n');
+    const realTarget = join(dir, 'differently-named.json');
+    symlinkSync(realTarget, mcpJsonPath());
+
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true);
+
+    const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
+    assert.ok(
+      excludeContent.split('\n').some((line) => line.trim() === 'differently-named.json.tmp-*'),
+      `expected the RESOLVED target's temp pattern in .git/info/exclude, got: ${excludeContent}`,
+    );
+    assert.ok(
+      !excludeContent.split('\n').some((line) => line.trim() === '.mcp.json.tmp-*'),
+      "the symlink's OWN basename must not be what gets excluded -- that temp filename is never actually created",
+    );
   });
 });

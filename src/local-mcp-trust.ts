@@ -64,7 +64,7 @@
 
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
-import { atomicWriteFileSync, unlinkWriteTarget } from './atomic-write.js';
+import { atomicWriteFileSync, unlinkWriteTarget, resolveWriteTarget } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
 import { riskyToCommit, ensureTempSiblingExcluded } from './git-safety.js';
 
@@ -194,8 +194,10 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   // The DESTINATION is confirmed safe above, but `atomicWriteFileSync`'s own
   // `.tmp-*` temp sibling has a DIFFERENT literal name an exact-match
   // `.gitignore` entry doesn't cover (Codex review, 2026-08-24, round 25) —
-  // see `ensureTempSiblingExcluded`'s own doc comment.
-  ensureTempSiblingExcluded(cwd, basename(path));
+  // see `ensureTempSiblingExcluded`'s own doc comment. Derived from
+  // `resolveWriteTarget`, not the lexical path (Codex review, 2026-08-24,
+  // round 27) — see local-mcp-config.ts's identical fix for why.
+  ensureTempSiblingExcluded(cwd, basename(resolveWriteTarget(path)));
   const createdFile = !existsSync(path);
   let settings: Record<string, unknown>;
   try {
