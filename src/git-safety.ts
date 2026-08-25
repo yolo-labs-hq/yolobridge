@@ -46,6 +46,11 @@ import { resolveWriteTarget } from './atomic-write.js';
 export function riskyToCommit(cwd: string, path: string): boolean {
   if (isConfirmedNotIgnored(cwd, path)) return true;
   const realTarget = resolveWriteTarget(path);
+  // `null` (Codex review, 2026-08-24, round 31) means `atomicWriteFileSync`
+  // would THROW rather than write anything through this symlink at all —
+  // nothing will be created, so there's nothing for a future commit to
+  // pick up either.
+  if (realTarget === null) return false;
   return realTarget !== path && isConfirmedNotIgnored(cwd, realTarget);
 }
 

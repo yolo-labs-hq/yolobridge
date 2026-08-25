@@ -645,8 +645,13 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   // symlink's own basename would cover a temp filename that's never
   // actually created, leaving the REAL one (at the resolved target's name)
   // just as uncovered as before this fix.
-  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(path))}.tmp-*`);
-  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(sidecarPath(cwd)))}.tmp-*`);
+  // `?? path`/`?? sidecarPath(cwd)` (Codex review, 2026-08-24, round 31):
+  // `resolveWriteTarget` returning `null` means the write is about to
+  // THROW instead of creating anything at all (see its own doc comment) —
+  // nothing will exist to need excluding either way, so the lexical path
+  // is a harmless fallback here.
+  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(path) ?? path)}.tmp-*`);
+  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(sidecarPath(cwd)) ?? sidecarPath(cwd))}.tmp-*`);
   // The LOCK ITSELF (and its own `.claim-*`/`.reclaim-*` ephemeral siblings,
   // round 26/27) got NONE of this treatment before round 28 — reasoned at
   // the time that it "only exists for the duration of a single synchronous

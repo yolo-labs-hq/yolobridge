@@ -69,7 +69,23 @@ import { randomBytes } from 'node:crypto';
  *  parent-resolved path. A parent that doesn't exist yet (nothing has been
  *  written here before) has no symlink layer to resolve either — falls
  *  back to the lexical path, same as before this fix, not a regression. */
-export function resolveWriteTarget(path: string): string {
+/**
+ * Returns `null` specifically when `path` is a BROKEN symlink whose
+ * intended target's own parent directory ALSO doesn't exist — Codex
+ * review, 2026-08-24, round 31, correcting round 25's own fix: a real
+ * `writeFileSync` through such a symlink THROWS `ENOENT` and leaves the
+ * symlink completely untouched (verified empirically, not assumed — a
+ * symlink to `<missing-dir>/target.json` really does fail to open rather
+ * than silently falling back to writing at the symlink's own path).
+ * Falling back to the symlink's OWN path here (round 25's original
+ * behavior) instead let the caller's subsequent `renameSync` REPLACE the
+ * symlink with a plain file — worse than what this is supposed to
+ * degrade to, and the exact symlink-destroying regression round 16 exists
+ * to prevent, reintroduced for this one sub-case. Every other caller
+ * (`atomicWriteFileSync`, `riskyToCommit`, `unlinkWriteTarget`) must treat
+ * `null` as "cannot resolve — do not write through this symlink."
+ */
+export function resolveWriteTarget(path: string): string | null {
   let realDir: string;
   try {
     realDir = realpathSync(dirname(path));
@@ -90,28 +106,22 @@ export function resolveWriteTarget(path: string): string {
     // the symlink itself (Codex review, 2026-08-24, round 25): the
     // ORIGINAL, pre-round-13 direct `writeFileSync` followed a symlink and
     // CREATED its missing target when the target's own parent directory
-    // existed — falling back to `parentResolvedPath` here instead means
-    // the subsequent `renameSync` REPLACES the symlink itself with a plain
-    // file, destroying it — the exact regression round 16 exists to
-    // prevent, just for this one sub-case (a target that's merely ABSENT,
-    // not a symlink pointing nowhere sensible at all). A relative link
-    // target is resolved against the symlink's OWN directory, matching
-    // `readlink`'s documented semantics.
+    // existed. A relative link target is resolved against the symlink's
+    // OWN directory, matching `readlink`'s documented semantics.
     try {
       const linkTarget = readlinkSync(parentResolvedPath);
       const healedTarget = isAbsolute(linkTarget) ? linkTarget : join(dirname(parentResolvedPath), linkTarget);
       // Only "heal" it if the intended target's OWN parent directory
       // exists — the same constraint a plain `writeFileSync` would have
       // been bound by too (it can't create a file in a directory that
-      // doesn't exist either). Otherwise fall through to the same
-      // write-over-the-symlink degrade as any other unresolvable case.
+      // doesn't exist either).
       if (existsSync(dirname(healedTarget))) return healedTarget;
     } catch {
       // `readlinkSync` failing means `parentResolvedPath` isn't actually a
       // symlink after all (raced since the `lstatSync` check above) — fall
-      // through to the same degrade.
+      // through to the same "cannot resolve" signal.
     }
-    return parentResolvedPath;
+    return null;
   }
 }
 
@@ -135,7 +145,14 @@ export function resolveWriteTarget(path: string): string {
 export function unlinkWriteTarget(path: string): void {
   let target = path;
   try {
-    if (lstatSync(path).isSymbolicLink()) target = resolveWriteTarget(path);
+    if (lstatSync(path).isSymbolicLink()) {
+      // `null` (Codex review, 2026-08-24, round 31) means
+      // `resolveWriteTarget` couldn't resolve a real target to delete
+      // instead — degrade to the symlink's own path, the same as every
+      // other "can't figure it out" case this function already falls
+      // back to below.
+      target = resolveWriteTarget(path) ?? path;
+    }
   } catch {
     // Race: `path` vanished before this lstat — fall through to the
     // original `path` (unlinkSync then simply no-ops/throws ENOENT, same
@@ -210,6 +227,15 @@ function sweepStaleTempSiblings(targetPath: string): void {
 
 export function atomicWriteFileSync(path: string, content: string): void {
   const targetPath = resolveWriteTarget(path);
+  if (targetPath === null) {
+    // Matches what a plain `writeFileSync` through this exact symlink
+    // shape would do (Codex review, 2026-08-24, round 31) — see
+    // `resolveWriteTarget`'s own doc comment. Throwing here, rather than
+    // writing through/over the symlink, is what keeps it untouched.
+    const err = new Error(`ENOENT: no such file or directory, open '${path}'`) as NodeJS.ErrnoException;
+    err.code = 'ENOENT';
+    throw err;
+  }
   // Clears out anything a PRIOR crashed call left behind before adding a
   // new one — see `sweepStaleTempSiblings`'s own doc comment.
   sweepStaleTempSiblings(targetPath);

@@ -156,15 +156,21 @@ describe('atomicWriteFileSync', () => {
     assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}', 'reading through the still-intact symlink sees the new content too');
   });
 
-  it('falls back to writing OVER a broken symlink whose target directory ALSO does not exist (nothing to heal into)', () => {
+  it('THROWS (ENOENT) rather than writing OVER a broken symlink whose target directory ALSO does not exist (Codex review, 2026-08-24, round 31)', () => {
+    // A real writeFileSync through this exact symlink shape throws ENOENT
+    // and leaves the symlink completely untouched (verified empirically —
+    // see resolveWriteTarget's own doc comment) -- silently degrading to
+    // "write over the symlink instead" (this function's OWN prior
+    // behavior, round 25) was WORSE than that real failure mode, and the
+    // exact symlink-destroying regression round 16 exists to prevent.
     const missingTarget = join(dir, 'no-such-subdir', 'does-not-exist.json');
     const linkPath = join(dir, 'broken-link-2.json');
     symlinkSync(missingTarget, linkPath);
 
-    atomicWriteFileSync(linkPath, '{"new":true}');
+    assert.throws(() => atomicWriteFileSync(linkPath, '{"new":true}'), /ENOENT/);
 
-    assert.equal(lstatSync(linkPath).isSymbolicLink(), false, "there's no parent directory to heal the target into, so this degrades to the pre-existing 'write over it' behavior");
-    assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}');
+    assert.equal(lstatSync(linkPath).isSymbolicLink(), true, 'the symlink itself must survive untouched');
+    assert.equal(existsSync(linkPath), false, 'reading through it still sees nothing, since the target genuinely never existed');
   });
 
   it('resolves a symlinked PARENT DIRECTORY, not just the final path component (Codex review, 2026-08-24, round 24)', () => {
