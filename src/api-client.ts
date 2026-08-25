@@ -119,6 +119,49 @@ export async function attach(
   return { tileId: body.tileId, attachmentId: body.attachmentId, ...scoped };
 }
 
+/**
+ * `POST /v1/workspaces/:workspaceId/yolobridge/attach/:attachmentId/refresh` —
+ * renew the workspace-scoped daemon credential (card 07,
+ * docs/YOLOBRIDGE_SCOPED_CREDENTIAL_PLAN.md, D1).
+ *
+ * `cfg.accessToken` MUST be the scoped token being renewed: this endpoint
+ * authenticates by the presented credential itself ("proof of recent prior
+ * possession"), so the token IS the request's identity. There is no refresh
+ * credential — deliberately. The daemon never holds a long-lived one, which is
+ * the entire point of the scoping work: a stolen laptop yields a credential
+ * that expires in an hour and can only be renewed while it is still fresh.
+ *
+ * The server accepts a token that has JUST expired, within a narrow grace
+ * window (15 minutes server-side), so a clock skew or a short sleep across the
+ * scheduled renewal recovers instead of forcing a re-attach. Past that, the
+ * refusal is terminal and the remedy is `yolo-bridge attach`.
+ *
+ * Unlike `attach`, the response shape is validated STRICTLY: this call only
+ * ever reaches a server that already issued a scoped token, so a reply missing
+ * one is a genuine protocol disagreement, not an old-server degrade. Returning
+ * a half-pair would leave the caller unable to schedule the next renewal.
+ */
+export async function refreshScopedToken(
+  cfg: ApiClientConfig,
+  workspaceId: string,
+  attachmentId: string,
+): Promise<{ scopedToken: string; scopedTokenExpiresAt: number }> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(
+    `${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${encodeURIComponent(attachmentId)}/refresh`,
+    { method: 'POST', headers: authHeaders(cfg) },
+  );
+  if (!res.ok) {
+    const { message, code } = await parseErrorBody(res);
+    throw new YoloBridgeApiError(`scoped credential refresh failed: ${message}`, res.status, code);
+  }
+  const body = (await res.json()) as any;
+  if (typeof body?.scopedToken !== 'string' || typeof body?.scopedTokenExpiresAt !== 'number') {
+    throw new YoloBridgeApiError('scoped credential refresh returned an unexpected shape', res.status);
+  }
+  return { scopedToken: body.scopedToken, scopedTokenExpiresAt: body.scopedTokenExpiresAt };
+}
+
 export interface SelectableWorkspace {
   id: string;
   name: string;

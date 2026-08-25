@@ -1209,6 +1209,404 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
   });
 });
 
+/** An SSE response the test drives frame by frame: unlike
+ *  `neverEndingSseStreamResponse` it stays open AND lets the test push more
+ *  frames later, which is what a "the session keeps streaming ACROSS a
+ *  credential renewal" assertion needs — the renewal has to happen while the
+ *  same connection is still live. */
+function controllableSseResponse(initial = ''): {
+  response: Response;
+  push(text: string): void;
+} {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+      if (initial) c.enqueue(encoder.encode(initial));
+    },
+  });
+  return {
+    response: new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    push: (text: string) => controller.enqueue(encoder.encode(text)),
+  };
+}
+
+/** Drives the injected timers repeatedly with a short real yield between
+ *  passes, so the async work a tick kicks off (the refresh POST, the
+ *  heartbeat POST) has room to settle — same pattern the account-refresh
+ *  tests above use — and stops as soon as `until` is satisfied. */
+async function tickUntil(
+  timers: ReturnType<typeof fakeTimers>,
+  until: () => boolean,
+  passes = 40,
+): Promise<void> {
+  for (let i = 0; i < passes && !until(); i++) {
+    timers.tick(1);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  if (!until()) throw new Error('tickUntil: condition never became true');
+}
+
+/** Unconditional timer passes. Needed after a terminal failure is triggered:
+ *  the daemon tears the open stream down from its own stop-poll INTERVAL, so
+ *  with injected timers nothing happens until the test keeps ticking. */
+async function drainTicks(timers: ReturnType<typeof fakeTimers>, passes = 20): Promise<void> {
+  for (let i = 0; i < passes; i++) {
+    timers.tick(1);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+describe('runAttachDaemon — scoped-credential refresh (card 07)', () => {
+  const CONNECTION_NARRATION =
+    /stream (connected|error)|reconnect|disconnect|detached by server|heartbeat error|token refreshed|unrecognized frame|credential/i;
+
+  const TTL_MS = 3600_000;
+  const T0 = 1_800_000_000_000;
+  /** Far enough out that the ACCOUNT-token refresh never fires and cannot be
+   *  mistaken for the scoped one under test. */
+  const LONG_LIVED_AUTH: StoredAuth = {
+    accessToken: 'account-at',
+    refreshToken: 'account-rt',
+    tokenType: 'Bearer',
+    expiresAtMs: T0 + 30 * 24 * 3600_000,
+  };
+
+  it('renews the scoped credential mid-session and keeps streaming on the SAME connection', async () => {
+    let clock = T0;
+    const seen: Array<{ path: string; auth: string }> = [];
+    let streamCalls = 0;
+    let refreshCalls = 0;
+    const stream = controllableSseResponse(
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n',
+    );
+
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const path = u.replace('https://api.example.com', '');
+      seen.push({ path, auth: String(init?.headers?.Authorization ?? '') });
+      if (path.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          scopedToken: 'scoped-1',
+          scopedTokenExpiresAt: clock + TTL_MS,
+        });
+      }
+      if (path.includes('/refresh')) {
+        refreshCalls += 1;
+        return jsonResponse(200, { scopedToken: 'scoped-2', scopedTokenExpiresAt: clock + TTL_MS });
+      }
+      if (path.includes('/yolobridge/stream')) {
+        streamCalls += 1;
+        return stream.response;
+      }
+      if (path.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    const logs: string[] = [];
+    const events: ConnectionEvent[] = [];
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: LONG_LIVED_AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => logs.push(line),
+      onConnectionEvent: (event) => events.push(event),
+      clearScreen: () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      now: () => clock,
+      timers,
+    });
+
+    await waitUntil(() => timers.intervals.length >= 2); // stop-poll + heartbeat
+
+    // Before the renewal point: heartbeats ride the ORIGINAL scoped token.
+    await tickUntil(timers, () => seen.some((c) => c.path.endsWith('/yolobridge/events')));
+    const beforeRefresh = seen.filter((c) => c.path.endsWith('/yolobridge/events'));
+    assert.ok(beforeRefresh.length > 0, 'sanity: at least one heartbeat before the renewal');
+    for (const call of beforeRefresh) {
+      assert.equal(call.auth, 'Bearer scoped-1', 'pre-renewal calls must use the original scoped token');
+    }
+    assert.equal(refreshCalls, 0, 'must NOT renew before 75% of the TTL has elapsed');
+
+    // Cross the 75%-of-TTL renewal point.
+    clock = T0 + Math.floor(TTL_MS * 0.75) + 1;
+    await tickUntil(timers, () => refreshCalls > 0);
+
+    const refreshCall = seen.find((c) => c.path.includes('/refresh'));
+    assert.ok(refreshCall, 'the daemon must have called the refresh route');
+    assert.equal(
+      refreshCall.path,
+      '/v1/workspaces/w1/yolobridge/attach/a1/refresh',
+      'refresh must target this workspace + attachment',
+    );
+    assert.equal(
+      refreshCall.auth,
+      'Bearer scoped-1',
+      'the renewal presents the SCOPED token itself — never the account token',
+    );
+    assert.ok(
+      !seen.some((c) => c.path.includes('/refresh') && c.auth === `Bearer ${LONG_LIVED_AUTH.accessToken}`),
+      'the account token must never reach the refresh route',
+    );
+
+    // ...and everything after it rides the RENEWED token.
+    const refreshIdx = seen.findIndex((c) => c.path.includes('/refresh'));
+    await tickUntil(
+      timers,
+      () => seen.slice(refreshIdx + 1).some((c) => c.path.endsWith('/yolobridge/events')),
+    );
+    const afterRefresh = seen.slice(refreshIdx + 1).filter((c) => c.path.endsWith('/yolobridge/events'));
+    assert.ok(afterRefresh.length > 0, 'sanity: the daemon really did keep heartbeating after the renewal');
+    for (const call of afterRefresh) {
+      assert.equal(call.auth, 'Bearer scoped-2', 'post-renewal calls must use the RENEWED scoped token');
+    }
+
+    // The renewal happened INSIDE one live connection: no reconnect, no
+    // re-attach. This is the property the card asks for.
+    assert.equal(streamCalls, 1, 'the session must survive the renewal on the same stream');
+    assert.equal(
+      seen.filter((c) => c.path.endsWith('/yolobridge/attach')).length,
+      1,
+      'renewing must never re-attach',
+    );
+
+    // The stream is still live and still delivering frames.
+    stream.push('event: detached\ndata: {"attachmentId":"a1"}\n\n');
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon across a scoped-credential renewal');
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+
+    // Reported out-of-band, never into the stream the agent's TUI owns.
+    assert.deepEqual(logs.filter((l) => CONNECTION_NARRATION.test(l)), []);
+    const refreshed = events.filter((e) => e.state === 'refreshed');
+    assert.ok(refreshed.length > 0, 'the renewal must be visible on the structured channel');
+    assert.match(refreshed[0].detail ?? '', /workspace-scoped credential renewed/);
+  });
+
+  it('stops with a re-attach remedy — out of band — once the renewal window has closed', async () => {
+    let clock = T0;
+    let refreshCalls = 0;
+    const stream = controllableSseResponse(
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n',
+    );
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          scopedToken: 'scoped-1',
+          scopedTokenExpiresAt: clock + TTL_MS,
+        });
+      }
+      if (u.includes('/refresh')) {
+        refreshCalls += 1;
+        return jsonResponse(401, {
+          error: 'Scoped credential could not be verified or is too old to renew',
+          code: 'UNAUTHENTICATED',
+        });
+      }
+      if (u.includes('/yolobridge/stream')) return stream.response;
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    const logs: string[] = [];
+    const events: ConnectionEvent[] = [];
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: LONG_LIVED_AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => logs.push(line),
+      onConnectionEvent: (event) => events.push(event),
+      clearScreen: () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      now: () => clock,
+      timers,
+      sleep: async () => {},
+    });
+
+    await waitUntil(() => timers.intervals.length >= 2);
+
+    // Past expiry AND past the 15-minute grace: no renewal can succeed.
+    clock = T0 + TTL_MS + 15 * 60_000 + 1;
+    await tickUntil(timers, () => refreshCalls > 0);
+    await drainTicks(timers);
+
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after a blown renewal window');
+    assert.equal(result.ok, false);
+    assert.equal((result as { reason: string }).reason, 'refresh-failed');
+    assert.match((result as { message: string }).message, /yolo-bridge attach/);
+
+    // THE POINT: the operator-facing remedy never touches the output stream
+    // the local agent's TUI is rendering into.
+    assert.deepEqual(
+      logs.filter((l) => CONNECTION_NARRATION.test(l) || /yolo-bridge attach/.test(l)),
+      [],
+      `the re-attach remedy must not reach stdout, got: ${JSON.stringify(logs)}`,
+    );
+    const interrupted = events.filter((e) => e.state === 'interrupted');
+    assert.ok(interrupted.length > 0, 'the failure must be reported on the structured channel');
+    assert.ok(
+      interrupted.some((e) => /yolo-bridge attach/.test(e.detail ?? '')),
+      `expected the remedy in an interrupted event, got: ${JSON.stringify(events)}`,
+    );
+    // Never `degraded` for the TERMINAL failure — that state means the LINK is
+    // struggling, and using it here would make `yolo-bridge status` misreport
+    // the session.
+    assert.ok(
+      !events.some((e) => e.state === 'degraded' && /yolo-bridge attach/.test(e.detail ?? '')),
+      'the terminal failure must not be recorded as `degraded`',
+    );
+  });
+
+  it('treats a 403 (attachment detached server-side) as terminal even INSIDE the window', async () => {
+    let clock = T0;
+    let refreshCalls = 0;
+    const stream = controllableSseResponse(
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n',
+    );
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          scopedToken: 'scoped-1',
+          scopedTokenExpiresAt: clock + TTL_MS,
+        });
+      }
+      if (u.includes('/refresh')) {
+        refreshCalls += 1;
+        return jsonResponse(403, {
+          error: 'This YoloBridge attachment is no longer active — run `yolo-bridge attach` again',
+          code: 'FORBIDDEN',
+        });
+      }
+      if (u.includes('/yolobridge/stream')) return stream.response;
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    const events: ConnectionEvent[] = [];
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: LONG_LIVED_AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      onConnectionEvent: (event) => events.push(event),
+      clearScreen: () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      now: () => clock,
+      timers,
+      sleep: async () => {},
+    });
+
+    await waitUntil(() => timers.intervals.length >= 2);
+    // Renewal point reached, but the credential is still VALID for another
+    // ~15 minutes — only the server-side 403 makes this terminal.
+    clock = T0 + Math.floor(TTL_MS * 0.75) + 1;
+    await tickUntil(timers, () => refreshCalls > 0);
+    await drainTicks(timers);
+
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after a 403 renewal');
+    assert.equal(result.ok, false);
+    assert.match((result as { message: string }).message, /yolo-bridge attach/);
+    assert.equal(refreshCalls, 1, 'a 403 must not be retried');
+  });
+
+  it('rides out a TRANSIENT renewal failure while the credential is still renewable', async () => {
+    let clock = T0;
+    let refreshCalls = 0;
+    const seen: Array<{ path: string; auth: string }> = [];
+    const stream = controllableSseResponse(
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n',
+    );
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const path = u.replace('https://api.example.com', '');
+      seen.push({ path, auth: String(init?.headers?.Authorization ?? '') });
+      if (path.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          scopedToken: 'scoped-1',
+          scopedTokenExpiresAt: clock + TTL_MS,
+        });
+      }
+      if (path.includes('/refresh')) {
+        refreshCalls += 1;
+        // One 502 (an upstream blip), then success.
+        if (refreshCalls === 1) return jsonResponse(502, { error: 'Bad gateway' });
+        return jsonResponse(200, { scopedToken: 'scoped-2', scopedTokenExpiresAt: clock + TTL_MS });
+      }
+      if (path.includes('/yolobridge/stream')) return stream.response;
+      if (path.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    const events: ConnectionEvent[] = [];
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: LONG_LIVED_AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      onConnectionEvent: (event) => events.push(event),
+      clearScreen: () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      now: () => clock,
+      timers,
+      sleep: async () => {},
+    });
+
+    await waitUntil(() => timers.intervals.length >= 2);
+    clock = T0 + Math.floor(TTL_MS * 0.75) + 1;
+    await tickUntil(timers, () => refreshCalls >= 2);
+
+    // The blip was recorded as `degraded` (an individual call failed) and the
+    // daemon carried on rather than ending the session.
+    const degraded = events.filter((e) => e.state === 'degraded');
+    assert.ok(degraded.length > 0, 'the transient failure must be visible somewhere');
+    assert.ok(
+      degraded.some((e) => /scoped credential refresh failed/.test(e.detail ?? '')),
+      `expected a degraded event naming the refresh blip, got: ${JSON.stringify(events)}`,
+    );
+    assert.ok(
+      events.some((e) => e.state === 'refreshed'),
+      'the retry must have eventually succeeded',
+    );
+
+    await tickUntil(
+      timers,
+      () => seen.some((c) => c.path.endsWith('/yolobridge/events') && c.auth === 'Bearer scoped-2'),
+    );
+
+    stream.push('event: detached\ndata: {"attachmentId":"a1"}\n\n');
+    const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after a transient renewal failure');
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+  });
+});
+
 describe('pickWorkspaceFromDisk', () => {
   it('fails fast when not logged in, without ever calling the fake prompt', async () => {
     const io = fakeIO();

@@ -55,6 +55,38 @@ const DEFAULT_REFRESH_BUFFER_MS = 5 * 60_000;
  * cheap enough to not matter (a no-op comparison on every tick). */
 const STOP_POLL_INTERVAL_MS = 250;
 
+/**
+ * Fraction of the SCOPED credential's lifetime to spend before renewing it
+ * (card 07, docs/YOLOBRIDGE_SCOPED_CREDENTIAL_PLAN.md D1). At the server's 1h
+ * TTL this renews ~45 minutes in.
+ *
+ * Deliberately BEFORE expiry, not after: the server's grace window for a
+ * just-expired token is a SKEW allowance, not a refresh interval. Spending it
+ * on the normal path would leave nothing in reserve for the cases it exists
+ * for — a laptop that slept, a clock that drifted, a network outage that
+ * happened to straddle the scheduled renewal. On the happy path the daemon
+ * never presents an expired credential at all.
+ *
+ * Derived from the expiry the SERVER reported (`scopedTokenExpiresAt`), never
+ * from a TTL constant duplicated here: this binary sits frozen on a laptop for
+ * months and must follow whatever lifetime the server it is talking to today
+ * actually issued.
+ */
+const SCOPED_REFRESH_AT_FRACTION = 0.75;
+
+/**
+ * The daemon's own copy of the server's `YOLOBRIDGE_REFRESH_MAX_EXPIRED_MS`
+ * (15 minutes) — how long past expiry a renewal can still succeed.
+ *
+ * A copy, not an import: the two live on opposite sides of a frozen-binary
+ * seam. It is used ONLY to decide when to stop retrying and tell the operator
+ * to re-attach; the server is the authority on whether any given renewal is
+ * accepted. A copy that drifted SHORT makes this daemon give up slightly early
+ * (an honest re-attach), and one that drifted LONG makes it retry a few
+ * doomed requests — neither can widen the server's actual window.
+ */
+const SCOPED_REFRESH_GRACE_MS = 15 * 60_000;
+
 export interface AttachDaemonDeps {
   workspaceId: string;
   commonApiBaseUrl: string;
@@ -202,7 +234,25 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * call presents this instead of the account token, so a stolen laptop yields
    * a credential confined to ONE workspace's YoloBridge surface.
    */
-  const scopedCredential: { token?: string; expiresAtMs?: number } = {};
+  const scopedCredential: { token?: string; expiresAtMs?: number; refreshAtMs?: number } = {};
+
+  /**
+   * Record a freshly-issued scoped credential and schedule its renewal.
+   *
+   * `refreshAtMs` is computed from THIS moment plus 75% of the remaining
+   * lifetime the server just advertised, so a credential handed over already
+   * part-used (a slow attach round trip, a clock a little ahead) still renews
+   * with margin rather than at a fixed offset from an issue time this daemon
+   * never observed. A non-positive remaining lifetime schedules the renewal
+   * immediately rather than in the past.
+   */
+  function rememberScopedCredential(token: string, expiresAtMs: number): void {
+    const at = now();
+    const remaining = Math.max(0, expiresAtMs - at);
+    scopedCredential.token = token;
+    scopedCredential.expiresAtMs = expiresAtMs;
+    scopedCredential.refreshAtMs = at + Math.floor(remaining * SCOPED_REFRESH_AT_FRACTION);
+  }
 
   /**
    * Deliberately a FACTORY over a separate holder, not a second mutable config
@@ -289,6 +339,108 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     return { ok: true };
   }
 
+  type ScopedRefreshOutcome = { ok: true } | { ok: false; message: string };
+
+  /**
+   * SINGLE-FLIGHT guard for the renewal below.
+   *
+   * The heartbeat scheduler fires on a plain interval and does NOT wait for
+   * the previous tick's async work to finish, so a renewal that takes longer
+   * than one tick would otherwise be started again by the next one. Two
+   * concurrent renewals are not merely wasteful: they can resolve out of
+   * order, and the loser would overwrite the live credential with the older of
+   * the two tokens — a bug that only ever appears on a slow network, and one
+   * whose symptom (heartbeats 401ing a few minutes later) points nowhere near
+   * here. Overlapping callers await the SAME renewal instead.
+   */
+  let scopedRefreshInFlight: Promise<ScopedRefreshOutcome> | undefined;
+
+  /**
+   * Latched terminal outcome. Once a credential is unrenewable it never
+   * becomes renewable again, so every later caller gets the same answer
+   * without another doomed round trip — which matters because the heartbeat
+   * interval keeps firing for the fraction of a second between the failure
+   * and the stream loop actually unwinding.
+   */
+  let scopedRefreshTerminal: { ok: false; message: string } | undefined;
+
+  /**
+   * Renew the WORKSPACE-SCOPED credential before it expires (card 07).
+   *
+   * Checked in the same two places `ensureFreshToken` is — before opening or
+   * reopening the stream, and on every heartbeat tick while connected — so no
+   * new timer is introduced and the whole thing is driven by the already-
+   * injected `timers`/`now` seams. At a 10s heartbeat the renewal lands within
+   * ~10s of its scheduled moment, which against a 15-minute grace window is
+   * noise.
+   *
+   * Returns `{ ok: false }` ONLY when the situation is terminal — the grace
+   * window has closed, or the server said the attachment is gone. A transient
+   * failure while the credential is still renewable returns `ok` and simply
+   * lets the next tick try again (`refreshAtMs` is left where it was, so the
+   * retry is immediate rather than deferred another 45 minutes).
+   */
+  function ensureFreshScopedToken(): Promise<ScopedRefreshOutcome> {
+    // No scoped credential at all: a common-api predating the mint. Nothing to
+    // renew, and nothing to fail — the account-token degrade already reported
+    // itself once, pre-spawn.
+    if (scopedRefreshTerminal) return Promise.resolve(scopedRefreshTerminal);
+    if (!scopedCredential.token || scopedCredential.refreshAtMs === undefined) {
+      return Promise.resolve({ ok: true });
+    }
+    if (now() < scopedCredential.refreshAtMs) return Promise.resolve({ ok: true });
+    if (scopedRefreshInFlight) return scopedRefreshInFlight;
+
+    const attempt = renewScopedCredential();
+    scopedRefreshInFlight = attempt;
+    // `renewScopedCredential` never rejects (it converts every failure into an
+    // outcome), so one settle handler is enough. Cleared only if this attempt
+    // is still the current one, so a later attempt is never dropped by an
+    // earlier one's completion.
+    void attempt.then(() => {
+      if (scopedRefreshInFlight === attempt) scopedRefreshInFlight = undefined;
+    });
+    return attempt;
+  }
+
+  async function renewScopedCredential(): Promise<ScopedRefreshOutcome> {
+    try {
+      const renewed = await apiClient.refreshScopedToken(scopedCfg(), workspaceId, attachmentId);
+      rememberScopedCredential(renewed.scopedToken, renewed.scopedTokenExpiresAt);
+      // Same out-of-band channel the account rotation uses, for the same
+      // reason: this fires mid-session, while the local agent's TUI owns the
+      // terminal.
+      noteConnection('refreshed', { detail: 'workspace-scoped credential renewed' });
+      return { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // 403 means the SERVER has ended this attachment (detached, or the
+      // workspace is gone). Retrying cannot help and waiting out the grace
+      // window only delays the truth.
+      const attachmentGone = err instanceof apiClient.YoloBridgeApiError && err.status === 403;
+      const expiresAtMs = scopedCredential.expiresAtMs ?? 0;
+      const windowBlown = now() >= expiresAtMs + SCOPED_REFRESH_GRACE_MS;
+      if (attachmentGone || windowBlown) {
+        scopedRefreshTerminal = {
+          ok: false,
+          message:
+            'YoloBridge session credential could not be renewed '
+            + `(${message}). Run \`yolo-bridge attach\` again to reconnect this machine.`,
+        };
+        return scopedRefreshTerminal;
+      }
+      // Still renewable. `degraded` is exactly what this vocabulary means by
+      // "still connected, but an individual call failed" — the same state a
+      // failed heartbeat POST records — and it is transient by construction:
+      // the next tick either succeeds (→ `refreshed`) or the window closes
+      // (→ the terminal `interrupted` below). It is NOT used for the terminal
+      // failure, which would otherwise leave `yolo-bridge status` reporting a
+      // healthy session as degraded.
+      noteConnection('degraded', { detail: `scoped credential refresh failed: ${message}` });
+      return { ok: true };
+    }
+  }
+
   // Cover the case where the daemon is (re)started against a token that's
   // already within the refresh buffer of expiry (e.g. `attach` run right
   // after a long-down period) — refresh before the very first network
@@ -304,10 +456,12 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     const result = await apiClient.attach(accountCfg, workspaceId, hostLabel, remoteHost);
     attachmentId = result.attachmentId;
     tileId = result.tileId;
-    // `api-client` validates both-or-neither, so a half-pair never arrives here.
-    if (result.scopedToken) {
-      scopedCredential.token = result.scopedToken;
-      scopedCredential.expiresAtMs = result.scopedTokenExpiresAt;
+    // `api-client` validates both-or-neither, so a half-pair never arrives
+    // here — narrowed on both anyway rather than asserted away, since a
+    // non-null assertion is exactly the kind of hidden mismatch this file's
+    // credential separation exists to make impossible.
+    if (result.scopedToken !== undefined && result.scopedTokenExpiresAt !== undefined) {
+      rememberScopedCredential(result.scopedToken, result.scopedTokenExpiresAt);
     }
   } catch (err) {
     return { ok: false, reason: 'attach-failed', message: err instanceof Error ? err.message : String(err) };
@@ -403,12 +557,29 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * (forced via the stop-poll below) so the daemon stops instead of
    * looping forever reconnecting with a dead token. */
   let refreshFailed: { message: string } | undefined;
+  /** The same, for the WORKSPACE-SCOPED credential: set when its renewal
+   * window has closed (or the server ended the attachment), so the daemon
+   * stops instead of streaming on with a credential that is about to start
+   * 401ing every heartbeat. Kept separate from `refreshFailed` because the
+   * two have different remedies — `yolo-bridge login` vs `yolo-bridge attach`
+   * — and different reporting rules: the account failure is the daemon's exit
+   * message and may use stdout, this one fires mid-session while the local
+   * agent's TUI owns the terminal and must not. */
+  let scopedRefreshFailed: { message: string } | undefined;
 
   try {
     while (!shouldStop()) {
       const preStreamRefresh = await ensureFreshToken();
       if (!preStreamRefresh.ok) {
         refreshFailed = preStreamRefresh;
+        break;
+      }
+      // Also before every (re)connect, not only on the heartbeat tick: a long
+      // backoff with no stream open is exactly when a scoped credential can
+      // cross its renewal point unnoticed.
+      const preStreamScopedRefresh = await ensureFreshScopedToken();
+      if (!preStreamScopedRefresh.ok) {
+        scopedRefreshFailed = preStreamScopedRefresh;
         break;
       }
 
@@ -455,7 +626,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         // above) instead of riding out the connection to its next natural
         // event.
         const stopPollHandle = timers.setInterval(() => {
-          if (shouldStop() || refreshFailed) {
+          if (shouldStop() || refreshFailed || scopedRefreshFailed) {
             nodeStream.destroy();
           }
         }, STOP_POLL_INTERVAL_MS);
@@ -494,6 +665,15 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                       const refreshCheck = await ensureFreshToken();
                       if (!refreshCheck.ok) {
                         refreshFailed = refreshCheck;
+                        return;
+                      }
+                      // Renew the scoped credential BEFORE the heartbeat that
+                      // would use it, so a tick that crosses the renewal point
+                      // heartbeats with the new token rather than spending one
+                      // more tick on the old one.
+                      const scopedCheck = await ensureFreshScopedToken();
+                      if (!scopedCheck.ok) {
+                        scopedRefreshFailed = scopedCheck;
                         return;
                       }
                       await apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId);
@@ -557,7 +737,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         clearAttachment(env, io);
         return { ok: true, reason: 'detached-by-server' };
       }
-      if (refreshFailed) break;
+      if (refreshFailed || scopedRefreshFailed) break;
       if (shouldStop()) break;
 
       attempt += 1;
@@ -567,6 +747,25 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     }
   } finally {
     heartbeat?.stop();
+  }
+
+  if (scopedRefreshFailed) {
+    // OUT-OF-BAND ONLY — no `log()` here, unlike the account-token path below.
+    // That path is reached from the daemon's own pre-attach startup or as its
+    // terminal exit line; this one fires from inside a live session, where the
+    // local agent's PTY is piped to this process's stdout and any human-
+    // readable line lands in the middle of a frame its TUI believes it drew
+    // (connection-state.ts's module header). `interrupted` is the honest
+    // state: the session is ending abnormally — deliberately not `degraded`,
+    // which means the LINK is struggling and would make `yolo-bridge status`
+    // misreport a healthy session. The remedy travels two ways regardless: in
+    // the `detail` here, and as the returned `message`, which cli.ts prints on
+    // STDERR after the PTY is already gone.
+    noteConnection('interrupted', { detail: scopedRefreshFailed.message });
+    // `refresh-failed` (not a new reason) on purpose: cli.ts keys off it to run
+    // the best-effort `runDetach()` cleanup that stops a stale attachment being
+    // left behind, which is exactly what should happen here too.
+    return { ok: false, reason: 'refresh-failed', message: scopedRefreshFailed.message };
   }
 
   if (refreshFailed) {
