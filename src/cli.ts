@@ -19,10 +19,12 @@
 
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
+import { hostname } from 'node:os';
 
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runDetach } from './detach-cmd.js';
+import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
@@ -186,6 +188,47 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
   return { workspaceId, hostLabel, agentBin, agentId };
 }
 
+/**
+ * Everything the attach handshake tells the workspace about this machine,
+ * resolved from already-known values — pure, so it's unit-testable without
+ * touching a real `os`/`process` (the caller passes the real ones in).
+ *
+ * Two things happen here:
+ *
+ *  - **`hostLabel` gains a default.** It was previously set ONLY by an
+ *    explicit `--label`, so the overwhelmingly common `yolo-bridge attach`
+ *    with no flags produced a tile named a bare "YoloBridge" with nothing
+ *    identifying WHICH machine had attached — actively confusing for an
+ *    operator running a daemon on more than one. The machine's own hostname
+ *    is the obvious default and is already what `--label` is usually set to
+ *    by hand. An explicit `--label` still wins.
+ *  - **`remoteHost` is assembled**: the launch directory, the OS platform
+ *    string, and which agent binary this attach drives.
+ *
+ * What is deliberately NOT collected, and should not be added without its
+ * own consent story: environment variables, anything listing the contents
+ * of `cwd`, the OS username or any other account identity, network
+ * addresses, or installed-software inventory. This is the operator's own
+ * machine being described back to the operator; it is not a survey of it.
+ */
+export function resolveAttachHostInfo(input: {
+  label?: string;
+  hostname: string;
+  cwd: string;
+  platform: string;
+  agent: string;
+}): { hostLabel: string | undefined; remoteHost: RemoteHostInfo } {
+  const label = input.label?.trim();
+  return {
+    hostLabel: label || input.hostname.trim() || undefined,
+    remoteHost: {
+      cwd: input.cwd,
+      platform: input.platform,
+      agent: input.agent,
+    },
+  };
+}
+
 async function cmdAttach(args: string[]): Promise<number> {
   // Printed unconditionally, first thing, regardless of how the rest of
   // this command goes — a self-diagnosing fix for a real, repeated support
@@ -256,6 +299,16 @@ async function cmdAttach(args: string[]): Promise<number> {
   process.on('SIGTERM', onSignal);
 
   const spawnCwd = process.cwd();
+  // Everything the workspace tile shows about WHERE this session runs, all
+  // resolved here in one place (see resolveAttachHostInfo's doc comment for
+  // what is and isn't collected).
+  const attachHostInfo = resolveAttachHostInfo({
+    label: hostLabel,
+    hostname: hostname(),
+    cwd: spawnCwd,
+    platform: process.platform,
+    agent: resolvedAgentId,
+  });
   let mcpProxyHandle: McpProxyHandle | undefined;
   let mcpConfigCleanup: { expectedProxyUrl: string; createdFile: boolean } | undefined;
   let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean; attachId?: string } | undefined;
@@ -265,7 +318,8 @@ async function cmdAttach(args: string[]): Promise<number> {
     result = await runAttachFromDisk({
       workspaceId,
       commonApiBaseUrl: apiUrl(),
-      hostLabel,
+      hostLabel: attachHostInfo.hostLabel,
+      remoteHost: attachHostInfo.remoteHost,
       shouldStop: () => stopRequested,
       // Fires once the real tileId exists (docs/YOLOBRIDGE_PLAN.md's "Local
       // MCP access" section) — starts the local MCP proxy and writes

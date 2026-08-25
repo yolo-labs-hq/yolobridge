@@ -59,6 +59,11 @@ export interface AttachDaemonDeps {
   workspaceId: string;
   commonApiBaseUrl: string;
   hostLabel?: string;
+  /** Non-sensitive facts about this machine, sent once in the attach
+   *  handshake so the workspace tile can show where the session is running
+   *  (see api-client.ts's `RemoteHostInfo`). Optional and purely
+   *  informational — nothing in this loop reads it back. */
+  remoteHost?: apiClient.RemoteHostInfo;
   auth: StoredAuth;
   env?: Record<string, string | undefined>;
   io?: ConfigStoreIO;
@@ -164,6 +169,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     workspaceId,
     commonApiBaseUrl,
     hostLabel,
+    remoteHost,
     auth,
     env,
     io,
@@ -256,7 +262,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   try {
-    const result = await apiClient.attach(cfg, workspaceId, hostLabel);
+    const result = await apiClient.attach(cfg, workspaceId, hostLabel, remoteHost);
     attachmentId = result.attachmentId;
     tileId = result.tileId;
   } catch (err) {
