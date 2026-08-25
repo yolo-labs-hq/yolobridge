@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, symlinkSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -400,5 +400,25 @@ describe('removeLocalMcpTrust', () => {
       );
       unlinkSync(settingsPath());
     }
+  });
+
+  it('deletes the HEALED TARGET, not the symlink itself, when cleaning up a settings.local.json that was a broken symlink at write time (Codex review, 2026-08-24, round 26)', () => {
+    // Same fix as local-mcp-config.ts's identical gap: writeLocalMcpTrust
+    // HEALS a broken symlink (round 25) by creating its missing target
+    // while leaving the symlink itself untouched -- the OLD cleanup
+    // unconditionally unlinked the LEXICAL settings.local.json path, which
+    // IS the symlink, destroying an operator's dotfile-managed link.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    const realTarget = join(dir, 'real-settings.json');
+    symlinkSync(realTarget, settingsPath());
+    const result = writeLocalMcpTrust(dir);
+    assert.equal(result.ok, true);
+    assert.equal(result.createdFile, true);
+    assert.ok(lstatSync(settingsPath()).isSymbolicLink(), 'sanity check: still a symlink right after the healing write');
+
+    removeLocalMcpTrust(dir, removeAllFrom(result));
+
+    assert.ok(lstatSync(settingsPath()).isSymbolicLink(), 'the symlink itself must survive cleanup');
+    assert.equal(existsSync(realTarget), false, 'the healed target this module actually created must be the thing that gets deleted');
   });
 });

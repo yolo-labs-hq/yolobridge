@@ -432,7 +432,7 @@ describe('runAttachDaemon', () => {
       const method = init?.method ?? 'GET';
       requests.push(`${method} ${u}`);
       if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
-      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return jsonResponse(204, {});
+      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return new Response(null, { status: 204 });
       if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
       throw new Error(`unexpected request: ${u}`);
     }) as any;
@@ -477,7 +477,7 @@ describe('runAttachDaemon', () => {
         stopRequested = true;
         return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
       }
-      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return jsonResponse(204, {});
+      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return new Response(null, { status: 204 });
       if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
       throw new Error(`unexpected request: ${u}`);
     }) as any;
@@ -499,6 +499,50 @@ describe('runAttachDaemon', () => {
     assert.deepEqual(result, { ok: true, reason: 'stopped' });
     assert.equal(onAttachedCalls, 0, 'onAttached must never run once a stop is already pending — not merely be interrupted mid-way through');
     assert.equal(loadAttachment(ENV, io), undefined, 'local attachment.json must still be cleared');
+  });
+
+  it('does NOT clear local attachment.json when the cleanup detach itself genuinely fails (Codex review, 2026-08-24, round 26)', async () => {
+    // `apiClient.detach` already treats a 404 as success (idempotent), so
+    // a THROW here means a genuine failure (network error, 5xx) -- the
+    // server-side attachment is very likely still recorded. Clearing
+    // attachment.json anyway would strand it: neither cli.ts's own
+    // post-return retry (`if (stopRequested && !localAgentExited) { await
+    // runDetach(...) }`) nor a manual `yolo-bridge detach` could find
+    // anything to retry against, and the next `attach` would create a
+    // SECOND server-side attachment/tile instead of ever cleaning up the
+    // orphaned first one.
+    let stopRequested = false;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.endsWith('/yolobridge/attach')) {
+        stopRequested = true;
+        return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      }
+      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return new Response('boom', { status: 500 });
+      if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      shouldStop: () => stopRequested,
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'stopped' });
+    const stored = loadAttachment(ENV, io);
+    assert.ok(stored, 'attachment.json must survive a failed cleanup detach so a later retry can find it');
+    assert.equal(stored?.workspaceId, 'w1');
+    assert.equal(stored?.tileId, 'tile-1');
+    assert.equal(stored?.attachmentId, 'a1');
   });
 
   it('answers a read-output frame by posting a read-output-reply with the stub capture', async () => {

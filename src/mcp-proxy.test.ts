@@ -359,6 +359,64 @@ describe('startMcpProxy', () => {
     assert.equal(body.find((r) => r.id === 2).result.usedToken, 'tok-2', "id 2's retried response must be the one returned to the caller");
   });
 
+  it('does NOT promote a FAILED subset retry\'s own HTTP status onto the merged response (Codex review, 2026-08-24, round 26)', async () => {
+    // The original response is ALWAYS a 200 on this code path (a
+    // transport-level 401 takes the whole-body retry instead) -- if the
+    // narrower SUBSET retry itself fails at the transport level (a genuine
+    // upstream 500, not a network error, which throws and is caught
+    // upstream of this branch entirely), the merged BODY already correctly
+    // falls back to the original text (id 1's success survives, id 2 keeps
+    // its original UNAUTHORIZED error unchanged) -- but blindly spreading
+    // the retry's own 500 onto the outer response would tell the caller the
+    // WHOLE batch failed, inviting a blind full retry that replays the
+    // already-successful mutating call all over again.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    let mutateCount = 0;
+    const fetchImpl = makeFetch({
+      mintToken: () => { mintCount++; return mintResponse(`tok-${mintCount}`); },
+      upstream: (init) => {
+        forwardCount++;
+        if (forwardCount === 1) {
+          const bodyArr = JSON.parse(init.body);
+          const responses = bodyArr.map((msg: any) => {
+            if (msg.id === 1) {
+              mutateCount++;
+              return { jsonrpc: '2.0', id: 1, result: { mutated: mutateCount } };
+            }
+            return { jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: JSON.stringify({ error: 'Invalid delegated token', code: 'UNAUTHORIZED' }) }] } };
+          });
+          return new Response(JSON.stringify(responses), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        // The retry (id 2 only) fails at the transport level.
+        return new Response('Internal Server Error', { status: 500 });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'update_tile_status', arguments: {} } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } },
+      ]),
+    });
+
+    assert.equal(res.status, 200, 'the retry subset failing at the transport level must not make the WHOLE merged response look like a transport failure');
+    const body = (await res.json()) as any[];
+    assert.equal(mutateCount, 1, 'the mutating call must still never be sent to the upstream a second time');
+    assert.deepEqual(body.find((r) => r.id === 1).result, { mutated: 1 }, "id 1's already-successful response must survive untouched");
+    assert.equal(
+      JSON.parse(body.find((r) => r.id === 2).result.content[0].text).code,
+      'UNAUTHORIZED',
+      'id 2 keeps its original UNAUTHORIZED result since the retry itself never actually landed',
+    );
+  });
+
   it('does NOT retry on a real tool error that happens to be HTTP 200 but is not UNAUTHORIZED (e.g. a legitimate FORBIDDEN scope error)', async () => {
     // The fix above must be specific to UNAUTHORIZED -- retrying a
     // FORBIDDEN (correctly-enforced, not-in-scope) call would just waste a

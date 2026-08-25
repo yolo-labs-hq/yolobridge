@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, chmodSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, chmodSync, statSync, symlinkSync, lstatSync, readdirSync } from 'node:fs';
 import { tmpdir, uptime } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -466,6 +466,24 @@ describe('cross-process config lock (Codex review, 2026-08-24, round 20)', () =>
     assert.deepEqual(result, { ok: true, createdFile: true });
   });
 
+  it('claims the lock via a hard-linked, fully-written temp file rather than an exclusive-create-then-write, leaving no stray claim-temp file behind (Codex review, 2026-08-24, round 26)', () => {
+    // A bare `writeFileSync(path, ..., {flag:'wx'})` makes file CREATION
+    // atomic but not CONTENT -- there's a real window where the lock
+    // exists but is still EMPTY. A second, genuinely concurrent attach
+    // reading it in that window would see "no valid pid" (round 24's own
+    // fix) and reclaim what is actually still a LIVE lock, defeating this
+    // lock's whole purpose. Claiming it via a hard link from an
+    // already-fully-written temp file closes that window structurally --
+    // this test proves the mechanism leaves no `.claim-*` litter behind on
+    // the successful path, not the race itself (a genuine two-process race
+    // at machine speed isn't reproducible deterministically without
+    // mocking `node:fs`, which this package's tests never do).
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.equal(result.ok, true);
+    const entries = readdirSync(dir);
+    assert.ok(entries.every((name) => !name.includes('.claim-')), `expected no leftover claim-temp file, found: ${JSON.stringify(entries)}`);
+  });
+
   it('reclaims a lock containing GARBAGE that parses to no valid pid at all, rather than waiting out the full deadline on every future attach (Codex review, 2026-08-24, round 24)', () => {
     writeFileSync(lockPath(), 'not-json-and-not-a-number-either');
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
@@ -637,5 +655,25 @@ describe('removeLocalMcpConfig', () => {
     writeFileSync(lockPath(), String(process.pid));
     removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', true);
     assert.equal(readFileSync(mcpJsonPath(), 'utf-8'), before, 'must be untouched while a live process holds the lock');
+  });
+
+  it('deletes the HEALED TARGET, not the symlink itself, when cleaning up a .mcp.json that was a broken symlink at write time (Codex review, 2026-08-24, round 26)', () => {
+    // writeLocalMcpConfig HEALS a broken symlink (round 25) by creating its
+    // missing target while leaving the symlink itself untouched --
+    // createdFile:true is still correct (nothing existed at that target
+    // before this write), but the OLD cleanup unconditionally unlinked the
+    // LEXICAL `.mcp.json` path, which IS the symlink -- destroying an
+    // operator's dotfile-managed link and orphaning the file this module
+    // actually created.
+    const realTarget = join(dir, 'real-mcp.json');
+    symlinkSync(realTarget, mcpJsonPath());
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
+    assert.ok(lstatSync(mcpJsonPath()).isSymbolicLink(), 'sanity check: still a symlink right after the healing write');
+
+    removeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp', result.createdFile);
+
+    assert.ok(lstatSync(mcpJsonPath()).isSymbolicLink(), 'the symlink itself must survive cleanup');
+    assert.equal(existsSync(realTarget), false, 'the healed target this module actually created must be the thing that gets deleted');
   });
 });

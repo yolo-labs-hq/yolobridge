@@ -627,7 +627,24 @@ async function handleRequest(
       if (retryBatch) {
         const reinjected = injectToken(retryBatch.requestSubset, refreshed);
         const retryResult = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
-        result = { ...retryResult, text: mergeRetryResponses(result.text, retryResult.text, retryBatch.ids) };
+        const mergedText = mergeRetryResponses(result.text, retryResult.text, retryBatch.ids);
+        // Only adopt the SUBSET retry's own status/headers when it actually
+        // succeeded at the transport level (Codex review, 2026-08-24, round
+        // 26): the trigger for this whole branch guarantees the ORIGINAL
+        // response was a 200 (a transport-level 401 takes the whole-body
+        // retry path above instead), so a retry that itself comes back
+        // non-2xx (a genuine upstream 500, not a network error -- that
+        // throws and is caught below, leaving `result` untouched) must not
+        // promote its OWN failure status onto the merged response. The body
+        // already correctly falls back to the ORIGINAL (still-successful-
+        // for-the-other-elements) text in that case; overwriting the status
+        // too would tell the caller the WHOLE batch failed and invite a
+        // blind full retry that double-mutates the already-successful
+        // elements — exactly what this partial-retry logic exists to
+        // prevent, just via the status code instead of the body this time.
+        result = retryResult.status >= 200 && retryResult.status < 300
+          ? { ...retryResult, text: mergedText }
+          : { ...result, text: mergedText };
       } else {
         const reinjected = injectToken(body, refreshed);
         result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);

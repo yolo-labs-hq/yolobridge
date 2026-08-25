@@ -62,9 +62,9 @@
  * trust prompt before this takes effect.
  */
 
-import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
-import { atomicWriteFileSync } from './atomic-write.js';
+import { atomicWriteFileSync, unlinkWriteTarget } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
 import { riskyToCommit, ensureTempSiblingExcluded } from './git-safety.js';
 
@@ -362,7 +362,10 @@ export function removeLocalMcpTrust(
   delete settings[OWNERSHIP_MARKER];
 
   if (opts.createdFile && Object.keys(settings).length === 0) {
-    unlinkSync(path);
+    // `unlinkWriteTarget`, not a bare `unlinkSync(path)` (Codex review,
+    // 2026-08-24, round 26) — same reasoning as local-mcp-config.ts's
+    // identical fix: `path` can be a symlink `atomicWriteFileSync` healed.
+    unlinkWriteTarget(path);
     return;
   }
   // Atomic — see the doc comment on the equivalent write in

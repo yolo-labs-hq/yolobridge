@@ -115,6 +115,35 @@ export function resolveWriteTarget(path: string): string {
   }
 }
 
+/**
+ * Deletes the file DATA at `path` without ever deleting a symlink the
+ * operator placed there (Codex review, 2026-08-24, round 26): a full
+ * cleanup delete (`createdFile && now empty`, in both `local-mcp-config.ts`
+ * and `local-mcp-trust.ts`) previously always `unlinkSync(path)`'d the
+ * LEXICAL path. For a broken symlink `atomicWriteFileSync` healed (round
+ * 25), that path IS the symlink itself — `createdFile` was computed from
+ * `!existsSync(path)`, which is true for exactly this case since the
+ * broken symlink's target didn't exist yet — so this would delete the
+ * operator's OWN symlink and leave the newly-created (now orphaned) target
+ * behind, destroying something this module never owned: the exact
+ * regression round 25 exists to prevent, just on the CLEANUP side instead
+ * of the write side. Resolves through the SAME symlink-following logic
+ * `atomicWriteFileSync` itself uses before deleting, so cleanup can never
+ * diverge from what the write actually touched. A plain, non-symlink path
+ * (the common case) is unaffected — this degrades to a bare `unlinkSync`.
+ */
+export function unlinkWriteTarget(path: string): void {
+  let target = path;
+  try {
+    if (lstatSync(path).isSymbolicLink()) target = resolveWriteTarget(path);
+  } catch {
+    // Race: `path` vanished before this lstat — fall through to the
+    // original `path` (unlinkSync then simply no-ops/throws ENOENT, same
+    // as before this fix).
+  }
+  unlinkSync(target);
+}
+
 /** Best-effort removal of any `.tmp-*` sibling this function itself could
  *  have left behind from a PRIOR call that crashed between creating it and
  *  either renaming or cleaning it up (Codex review, 2026-08-24, round 24) —

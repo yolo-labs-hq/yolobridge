@@ -31,11 +31,12 @@
  * a hard failure.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync, linkSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { uptime } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
-import { atomicWriteFileSync } from './atomic-write.js';
+import { atomicWriteFileSync, unlinkWriteTarget } from './atomic-write.js';
 import { riskyToCommit, ensureTempSiblingExcluded } from './git-safety.js';
 
 /** The literal string written into `.mcp.json`'s `headers` value — a
@@ -291,8 +292,38 @@ function acquireConfigLock(cwd: string): (() => void) | null {
   const path = lockPath(cwd);
   const deadline = Date.now() + 2000;
   for (;;) {
+    // Writes the FULL content to a private temp file FIRST, then claims
+    // `path` via a hard link (Codex review, 2026-08-24, round 26): a bare
+    // `writeFileSync(path, ..., { flag: 'wx' })` makes file CREATION atomic
+    // but not CONTENT — there's a real window where `path` exists but is
+    // still EMPTY (between the exclusive open and the write completing). A
+    // second, genuinely concurrent attach reading `path` in that window
+    // sees "no valid pid," which round 24's fix treats as reclaimable —
+    // letting it delete the FIRST process's still-being-written lock and
+    // acquire its own while the first ALSO proceeds, defeating this lock's
+    // whole purpose (both — and the first's later release can go on to
+    // delete the SECOND's lock too, compounding it). `linkSync` fails with
+    // EEXIST if `path` already exists, giving the SAME exclusivity
+    // guarantee `wx` does, but `path` only ever comes into existence
+    // pointing at content that was ALREADY fully written beforehand —
+    // there is no window where `path` exists with incomplete content at
+    // all, from any process's point of view.
+    const claimTmpPath = `${path}.claim-${process.pid}-${randomBytes(4).toString('hex')}`;
     try {
-      writeFileSync(path, JSON.stringify({ pid: process.pid, bootUptimeSec: uptime() }), { flag: 'wx' });
+      writeFileSync(claimTmpPath, JSON.stringify({ pid: process.pid, bootUptimeSec: uptime() }));
+      try {
+        linkSync(claimTmpPath, path);
+      } finally {
+        // The DATA now lives at `path` via the hard link (or the link
+        // failed and nobody ever pointed at this temp file) — either way,
+        // this second name is no longer needed.
+        try {
+          unlinkSync(claimTmpPath);
+        } catch {
+          // Best-effort — a leftover claim-temp file is inert litter, never
+          // a correctness problem (nothing else ever looks for it by name).
+        }
+      }
       return () => {
         try {
           unlinkSync(path);
@@ -691,7 +722,11 @@ function removeLocalMcpConfigLocked(cwd: string, expectedProxyUrl: string, creat
   const otherTopLevelKeys = Object.keys(config).filter((k) => k !== 'mcpServers');
 
   if (createdFile && !hasOtherServers && otherTopLevelKeys.length === 0) {
-    unlinkSync(path);
+    // `unlinkWriteTarget`, not a bare `unlinkSync(path)` (Codex review,
+    // 2026-08-24, round 26) — see its own doc comment for why: `path` can
+    // be a symlink `atomicWriteFileSync` healed rather than the plain file
+    // `createdFile` implies.
+    unlinkWriteTarget(path);
     if (recordedSidecar.proxyUrl === expectedProxyUrl) deleteSidecar(cwd);
     return;
   }

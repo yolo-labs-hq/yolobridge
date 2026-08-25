@@ -252,9 +252,22 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   async function detachAndReportStopped(): Promise<AttachDaemonResult> {
-    await apiClient.detach(cfg, workspaceId, attachmentId).catch((err) => {
+    try {
+      await apiClient.detach(cfg, workspaceId, attachmentId);
+    } catch (err) {
+      // Only clear `attachment.json` on a SUCCESSFUL (or already-gone —
+      // `apiClient.detach` itself treats a 404 as success) detach, not on
+      // a genuine failure (Codex review, 2026-08-24, round 26) — mirrors
+      // `runDetach`'s own established pattern. Clearing it unconditionally
+      // would strand the server-side attachment permanently: the caller's
+      // own post-return retry (`cli.ts`'s `if (stopRequested &&
+      // !localAgentExited) { await runDetach(...) }`) and a manual `yolo-
+      // bridge detach` both rely on `attachment.json` to know what to
+      // retry against, and the next `attach` would then create a SECOND
+      // server-side attachment/tile instead of ever cleaning up the first.
       log(`Cleanup detach failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
+      return { ok: true, reason: 'stopped' };
+    }
     clearAttachment(env, io);
     return { ok: true, reason: 'stopped' };
   }
