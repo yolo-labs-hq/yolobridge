@@ -106,6 +106,193 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
 }
 
 describe('runAttachDaemon', () => {
+  it('presents the SCOPED credential on every post-attach call, and the ACCOUNT token only on attach', async () => {
+    // The whole point of the chain: after attach, a stolen laptop's credential
+    // reaches one workspace's YoloBridge surface, not the whole account.
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: read-output\ndata: {"attachmentId":"a1","requestId":"r1"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+
+    const seen: Array<{ path: string; auth: string }> = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      seen.push({ path: u.replace('https://api.example.com', ''), auth: String(init?.headers?.Authorization ?? '') });
+      if (u.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          scopedToken: 'scoped-tok-1',
+          scopedTokenExpiresAt: Date.now() + 3600_000,
+        });
+      }
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      captureOutput: async () => ({ output: 'screen', busy: false }),
+    });
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+
+    // attach is the call that CREATES the scope, so it must run as the account.
+    const attachCall = seen.find((r) => r.path.endsWith('/yolobridge/attach'));
+    assert.equal(attachCall?.auth, 'Bearer at', 'attach must present the ACCOUNT token');
+
+    // Everything afterwards must present the scoped one. Asserted on the header
+    // actually sent, not on which variable the code referenced.
+    const postAttach = seen.filter((r) => !r.path.endsWith('/yolobridge/attach'));
+    assert.ok(postAttach.length >= 2, `expected post-attach calls, saw ${postAttach.length}`);
+    for (const call of postAttach) {
+      assert.equal(call.auth, 'Bearer scoped-tok-1', `${call.path} must present the SCOPED token, saw ${call.auth}`);
+    }
+  });
+
+  it('KEEPS sending the scoped token after an ACCOUNT-token refresh (the shared-config trap)', async () => {
+    // THE REGRESSION THIS CARD EXISTS TO PREVENT. `ensureFreshToken` rewrites the
+    // account config IN PLACE on a ~24h cadence. If the scoped token were ever
+    // assigned onto that same object, this tick would silently revert the daemon
+    // to account-wide credentials with every other test still green.
+    //
+    // The refresh MUST happen after attach for this to test anything — an
+    // expired-at-startup token refreshes before attach and never exercises the
+    // trap. So: start with a healthy token, then advance the clock and tick the
+    // heartbeat interval, exactly as the mid-stream-refresh test above does.
+    const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+
+    const heartbeatAuths: string[] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const auth = String(init?.headers?.Authorization ?? '');
+      if (u.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1', attachmentId: 'a1',
+          scopedToken: 'scoped-tok-1', scopedTokenExpiresAt: 9_999_999_999_999,
+        });
+      }
+      if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) {
+        // Heartbeats ride postEvent, not a /heartbeat path — capture by body type.
+        try {
+          if (JSON.parse(String(init?.body ?? '{}')).type === 'heartbeat') heartbeatAuths.push(auth);
+        } catch { /* not JSON — not a heartbeat */ }
+        return jsonResponse(200, { recorded: true });
+      }
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    let clock = 1_000_000;
+    const healthyAuth: StoredAuth = {
+      accessToken: 'account-at-1', refreshToken: 'rt-1', tokenType: 'Bearer', expiresAtMs: clock + 3600_000,
+    };
+    let refreshes = 0;
+    const refreshAccessToken: RefreshTokenFn = async () => {
+      refreshes++;
+      return {
+        status: 'ok',
+        tokens: { accessToken: 'account-at-2', refreshToken: 'rt-2', expiresInSec: 3600, expiresAtMs: clock + 7200_000 },
+      };
+    };
+
+    let stopFlag = false;
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      authBaseUrl: 'https://auth.example.com',
+      auth: healthyAuth,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      now: () => clock,
+      refreshAccessToken,
+      timers,
+      shouldStop: () => stopFlag,
+    });
+
+    await waitUntil(() => timers.intervals.length >= 2);
+    assert.equal(refreshes, 0, 'sanity: no refresh should have happened before attach');
+
+    clock += 3600_000; // now inside the refresh buffer, so the next tick rotates the ACCOUNT token
+    for (let i = 0; i < 20; i++) {
+      timers.tick(1);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    stopFlag = true;
+    timers.tick(1);
+    await withTimeout(resultPromise, 2000, 'runAttachDaemon after post-attach account refresh');
+
+    // Both halves matter. Without the first, the loop below is vacuous.
+    assert.ok(refreshes > 0, 'the ACCOUNT token must actually have been refreshed after attach');
+    assert.ok(heartbeatAuths.length > 0, 'at least one heartbeat must have fired after the refresh');
+    for (const auth of heartbeatAuths) {
+      assert.equal(auth, 'Bearer scoped-tok-1',
+        `a heartbeat after an account-token refresh must still carry the SCOPED token, saw ${auth}`);
+    }
+  });
+
+  it('degrades to the account token, out-of-band, when the server issues no scoped credential', async () => {
+    // A common-api predating the mint. This daemon binary may sit on a laptop
+    // for months; it cannot require a server capability that did not exist when
+    // it was installed. Degrade, don't brick — and say so off stdout.
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+
+    const authsSeen: string[] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      authsSeen.push(String(init?.headers?.Authorization ?? ''));
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const events: ConnectionEvent[] = [];
+    const logs: string[] = [];
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => logs.push(line),
+      clearScreen: () => {},
+      onConnectionEvent: (event) => events.push(event),
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.ok(authsSeen.every((a) => a === 'Bearer at'), `all calls should fall back to the account token, saw ${authsSeen.join(', ')}`);
+
+    // Reported once, pre-spawn, where stdout is still safe.
+    assert.ok(
+      logs.some((l) => /no workspace-scoped credential/i.test(l)),
+      `an unscoped attach must be reported to the operator, saw: ${logs.join(' | ')}`,
+    );
+
+    // And NOT as a connection state: `degraded` there means the LINK is
+    // struggling, so borrowing it would make `status` misreport a healthy
+    // session for its entire life.
+    assert.ok(
+      !events.some((e) => e.state === 'degraded'),
+      'credential scope must not be reported as a connection state',
+    );
+  });
+
   it('attaches, delivers a prompt frame, and exits cleanly on a server-initiated detach', async () => {
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +

@@ -187,8 +187,46 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const authBaseUrl = deps.authBaseUrl ?? process.env.YOLOBRIDGE_AUTH_URL ?? DEFAULT_AUTH_URL;
   const doRefresh = deps.refreshAccessToken ?? refreshAccessTokenApi;
 
-  const cfg: apiClient.ApiClientConfig = { commonApiBaseUrl, accessToken: auth.accessToken, fetchImpl };
+  /**
+   * THE ACCOUNT identity. Full-account bearer from `yolo-bridge login`, and the
+   * ONLY thing `ensureFreshToken` may write to. Used for exactly one call —
+   * `attach` — because that call is what CREATES the scope; there is nothing
+   * narrower to present until it returns.
+   */
+  const accountCfg: apiClient.ApiClientConfig = { commonApiBaseUrl, accessToken: auth.accessToken, fetchImpl };
   let currentAuth: StoredAuth = auth;
+
+  /**
+   * THE ATTACHMENT identity — the workspace-scoped credential common-api mints
+   * at attach (docs/YOLOBRIDGE_SCOPED_CREDENTIAL_PLAN.md). Every post-attach
+   * call presents this instead of the account token, so a stolen laptop yields
+   * a credential confined to ONE workspace's YoloBridge surface.
+   */
+  const scopedCredential: { token?: string; expiresAtMs?: number } = {};
+
+  /**
+   * Deliberately a FACTORY over a separate holder, not a second mutable config
+   * object.
+   *
+   * The trap this avoids: `ensureFreshToken` refreshes the ACCOUNT token on a
+   * ~24h cadence and writes `accountCfg.accessToken` in place. Had the scoped
+   * token been assigned onto that same object, the next refresh tick would
+   * silently overwrite it and the daemon would quietly revert to sending the
+   * account token — with every test still green. Because the scoped value lives
+   * in its own holder that `ensureFreshToken` has no reference to, the revert
+   * is structurally impossible rather than merely avoided.
+   *
+   * The account fallback is read LIVE, not snapshotted: when no scoped token
+   * exists (a common-api predating the mint), a snapshot taken at attach time
+   * would go stale after an account rotation and start 401-ing.
+   */
+  function scopedCfg(): apiClient.ApiClientConfig {
+    return {
+      commonApiBaseUrl,
+      accessToken: scopedCredential.token ?? currentAuth.accessToken,
+      fetchImpl,
+    };
+  }
 
   // Declared up here (rather than at their first assignment below) purely
   // so `noteConnection` can close over `attachmentId` without a temporal-
@@ -226,9 +264,10 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * stream and on every heartbeat tick while connected, so the daemon
    * rotates its access token well before the 24h production expiry
    * instead of degrading into a silent zombie that just starts 401ing.
-   * Updates both the in-memory `cfg`/`currentAuth` used by every
-   * subsequent API call in this process AND the on-disk auth.json (via
-   * `saveAuth`) so a later `status`/restart also sees the fresh token.
+   * Updates the in-memory `accountCfg`/`currentAuth` used by `attach` AND the
+   * on-disk auth.json (via `saveAuth`) so a later `status`/restart also sees
+   * the fresh token. It must NEVER write the scoped credential — see
+   * `scopedCfg` for why that separation is load-bearing.
    */
   async function ensureFreshToken(): Promise<{ ok: true } | { ok: false; message: string }> {
     if (now() < currentAuth.expiresAtMs - refreshBufferMs) return { ok: true };
@@ -242,7 +281,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       tokenType: currentAuth.tokenType,
       expiresAtMs: result.tokens.expiresAtMs,
     };
-    cfg.accessToken = currentAuth.accessToken;
+    accountCfg.accessToken = currentAuth.accessToken;
     saveAuth(currentAuth, env, io);
     // Out-of-band, not `log`: this fires on a ~24h cadence from inside the
     // heartbeat tick, i.e. while the local agent's TUI owns the terminal.
@@ -262,9 +301,14 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   try {
-    const result = await apiClient.attach(cfg, workspaceId, hostLabel, remoteHost);
+    const result = await apiClient.attach(accountCfg, workspaceId, hostLabel, remoteHost);
     attachmentId = result.attachmentId;
     tileId = result.tileId;
+    // `api-client` validates both-or-neither, so a half-pair never arrives here.
+    if (result.scopedToken) {
+      scopedCredential.token = result.scopedToken;
+      scopedCredential.expiresAtMs = result.scopedTokenExpiresAt;
+    }
   } catch (err) {
     return { ok: false, reason: 'attach-failed', message: err instanceof Error ? err.message : String(err) };
   }
@@ -274,6 +318,19 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   // agent, so nothing owns the screen yet (and the caller's `clearScreen()`
   // wipes it moments later anyway).
   log(`Attached. tileId=${tileId} attachmentId=${attachmentId}`);
+  if (!scopedCredential.token) {
+    // A common-api predating the scoped-credential mint. Degrade, don't brick:
+    // this daemon binary may sit on a laptop for months and cannot require a
+    // server capability that did not exist when it was installed.
+    //
+    // Reported on stdout HERE, and deliberately not through `noteConnection`:
+    // this is a property of the whole session, not a connection state, and
+    // `degraded` in that vocabulary means the LINK is struggling. Emitting it
+    // there would make `yolo-bridge status` show a perfectly healthy session as
+    // degraded for its entire life. Same stdout-safety as the line above — this
+    // is still before `onAttached` spawns the agent, so nothing owns the screen.
+    log('Note: this server issued no workspace-scoped credential; continuing on the account token.');
+  }
   noteConnection('connecting');
 
   // Codex-found race: if something already asked us to stop WHILE the
@@ -320,7 +377,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   async function detachAndReportStopped(): Promise<AttachDaemonResult> {
     try {
-      await apiClient.detach(cfg, workspaceId, attachmentId);
+      await apiClient.detach(scopedCfg(), workspaceId, attachmentId);
     } catch (err) {
       // Only clear `attachment.json` on a SUCCESSFUL (or already-gone —
       // `apiClient.detach` itself treats a 404 as success) detach, not on
@@ -367,7 +424,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
        *  `detached` frame that would normally end this loop cleanly. */
       let sawGone = false;
       try {
-        const res = await apiClient.openStream(cfg, workspaceId, attachmentId);
+        const res = await apiClient.openStream(scopedCfg(), workspaceId, attachmentId);
         attempt = 0; // reset backoff on a successful connect
 
         const parser = new SseFrameParser();
@@ -439,7 +496,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                         refreshFailed = refreshCheck;
                         return;
                       }
-                      await apiClient.postHeartbeat(cfg, workspaceId, attachmentId);
+                      await apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId);
                     },
                     (err) =>
                       noteConnection('degraded', {
@@ -449,7 +506,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                     deps.timers,
                   );
                   // Send one immediately so status isn't stale for the first ~10s.
-                  apiClient.postHeartbeat(cfg, workspaceId, attachmentId).catch((err) =>
+                  apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId).catch((err) =>
                     noteConnection('degraded', {
                       detail: `initial heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
                     }),
@@ -463,7 +520,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                 case 'read-output': {
                   const captured = await captureOutput();
                   await apiClient
-                    .postReadOutputReply(cfg, workspaceId, attachmentId, action.requestId, captured.output, captured.busy)
+                    .postReadOutputReply(scopedCfg(), workspaceId, attachmentId, action.requestId, captured.output, captured.busy)
                     .catch((err) =>
                       noteConnection('degraded', {
                         detail: `read-output reply failed: ${err instanceof Error ? err.message : String(err)}`,
