@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { listSelectableWorkspaces, YoloBridgeApiError, type ApiClientConfig } from './api-client.js';
+import { attach, listSelectableWorkspaces, YoloBridgeApiError, type ApiClientConfig } from './api-client.js';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -79,5 +79,54 @@ describe('listSelectableWorkspaces', () => {
         return true;
       },
     );
+  });
+});
+
+describe('attach — host handshake', () => {
+  it('POSTs hostLabel and the remoteHost facts the workspace tile renders as its session overview', async () => {
+    let seenUrl: string | undefined;
+    let seenBody: any;
+    const fetchImpl = (async (url: any, init?: any) => {
+      seenUrl = String(url);
+      seenBody = JSON.parse(init.body);
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+    }) as any;
+
+    const result = await attach({ ...CFG_BASE, fetchImpl }, 'w1', 'my-laptop', {
+      cwd: '/home/dev/proj',
+      platform: 'linux',
+      agent: 'claude',
+    });
+
+    assert.equal(seenUrl, 'https://api.example.com/v1/workspaces/w1/yolobridge/attach');
+    assert.deepEqual(seenBody, {
+      hostLabel: 'my-laptop',
+      remoteHost: { cwd: '/home/dev/proj', platform: 'linux', agent: 'claude' },
+    });
+    assert.deepEqual(result, { tileId: 't1', attachmentId: 'a1' });
+  });
+
+  it('omits remoteHost entirely when it carries nothing — an empty object would be indistinguishable from an older daemon', async () => {
+    let seenBody: any;
+    const fetchImpl = (async (_url: any, init?: any) => {
+      seenBody = JSON.parse(init.body);
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+    }) as any;
+
+    await attach({ ...CFG_BASE, fetchImpl }, 'w1', 'my-laptop', {});
+
+    assert.deepEqual(seenBody, { hostLabel: 'my-laptop' });
+  });
+
+  it('still works with no host info at all (the pre-handshake call shape)', async () => {
+    let seenBody: any;
+    const fetchImpl = (async (_url: any, init?: any) => {
+      seenBody = JSON.parse(init.body);
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+    }) as any;
+
+    await attach({ ...CFG_BASE, fetchImpl }, 'w1');
+
+    assert.deepEqual(seenBody, {});
   });
 });

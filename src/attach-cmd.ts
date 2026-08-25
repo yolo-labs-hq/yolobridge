@@ -27,6 +27,12 @@ import { deliverPromptToLocalAgent, captureLocalAgentOutput } from './local-agen
 import * as apiClient from './api-client.js';
 import { refreshAccessToken as refreshAccessTokenApi, type RefreshTokenResult } from './device-auth.js';
 import { loadAuth, saveAuth, saveAttachment, clearAttachment, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import {
+  recordConnectionEvent,
+  resetConnectionState,
+  type ConnectionEvent,
+  type ConnectionState,
+} from './connection-state.js';
 
 /** Same shape as device-auth.ts's `refreshAccessToken` — injectable so tests
  * don't hit the network. Defaults to the real auth-service call. */
@@ -53,6 +59,11 @@ export interface AttachDaemonDeps {
   workspaceId: string;
   commonApiBaseUrl: string;
   hostLabel?: string;
+  /** Non-sensitive facts about this machine, sent once in the attach
+   *  handshake so the workspace tile can show where the session is running
+   *  (see api-client.ts's `RemoteHostInfo`). Optional and purely
+   *  informational — nothing in this loop reads it back. */
+  remoteHost?: apiClient.RemoteHostInfo;
   auth: StoredAuth;
   env?: Record<string, string | undefined>;
   io?: ConfigStoreIO;
@@ -62,7 +73,27 @@ export interface AttachDaemonDeps {
   sleep?: (ms: number) => Promise<void>;
   backoffOpts?: Partial<BackoffOptions>;
   timers?: TimerImpl;
+  /**
+   * Human-readable output for the terminal. **Must never be used for
+   * connection-state narration** — see `onConnectionEvent` below and
+   * connection-state.ts's module header. Defaults to `process.stdout`,
+   * which after `onAttached` spawns the local agent is the very stream that
+   * agent's full-screen TUI is rendering into.
+   */
   log?: (line: string) => void;
+  /**
+   * Out-of-band sink for connection-state transitions (connected, dropped,
+   * reconnecting, token rotated, detached). **This is deliberately NOT
+   * `log`**: the daemon shares `process.stdout` with the local agent's PTY,
+   * so writing "Reconnecting in 1000ms…" as text corrupts whatever frame
+   * the agent's TUI last painted — a transient blip the daemon recovers
+   * from on its own still left the screen garbled until the next full
+   * repaint (bug, 2026-08-25). Defaults to persisting the event into
+   * `~/.config/yolobridge/connection.json`, which `yolo-bridge status`
+   * renders; injectable so tests (and any future richer surface) can
+   * observe the structured events directly.
+   */
+  onConnectionEvent?: (event: ConnectionEvent) => void;
   /** Called once, right when the SSE stream reports 'connected' — clears the
    *  terminal so the shell prompt / `Attached.` line don't linger once the
    *  locally-spawned agent's own UI takes over. Defaults to a real ANSI
@@ -138,6 +169,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     workspaceId,
     commonApiBaseUrl,
     hostLabel,
+    remoteHost,
     auth,
     env,
     io,
@@ -157,6 +189,37 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   const cfg: apiClient.ApiClientConfig = { commonApiBaseUrl, accessToken: auth.accessToken, fetchImpl };
   let currentAuth: StoredAuth = auth;
+
+  // Declared up here (rather than at their first assignment below) purely
+  // so `noteConnection` can close over `attachmentId` without a temporal-
+  // dead-zone throw: the very first `ensureFreshToken()` call runs before
+  // the attach round trip has produced one.
+  let attachmentId = '';
+  let tileId = '';
+
+  /**
+   * The out-of-band connection-state sink (see `AttachDaemonDeps.onConnectionEvent`).
+   * The default persists to `~/.config/yolobridge/connection.json`; a
+   * `connecting` event starts a fresh per-attachment record so `status`
+   * never shows a previous attach's history as if it were this one's.
+   */
+  const emitConnectionEvent: (event: ConnectionEvent) => void =
+    deps.onConnectionEvent ??
+    ((event: ConnectionEvent) => {
+      if (!attachmentId) return;
+      if (event.state === 'connecting') resetConnectionState(attachmentId, event, env, io);
+      else recordConnectionEvent(attachmentId, event, env, io);
+    });
+
+  function noteConnection(state: ConnectionState, extra: Omit<ConnectionEvent, 'state' | 'at'> = {}): void {
+    try {
+      emitConnectionEvent({ state, at: new Date(now()).toISOString(), ...extra });
+    } catch {
+      // This channel is diagnostics. A read-only config dir or a full disk
+      // must not take down an otherwise-working attach — and must NOT fall
+      // back to stdout, which is precisely the bug this replaced.
+    }
+  }
 
   /**
    * Proactive refresh (Bug 2 fix): checked before opening/reopening the
@@ -181,7 +244,9 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     };
     cfg.accessToken = currentAuth.accessToken;
     saveAuth(currentAuth, env, io);
-    log('Access token refreshed.');
+    // Out-of-band, not `log`: this fires on a ~24h cadence from inside the
+    // heartbeat tick, i.e. while the local agent's TUI owns the terminal.
+    noteConnection('refreshed');
     return { ok: true };
   }
 
@@ -196,10 +261,8 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     return { ok: false, reason: 'refresh-failed', message: initialRefresh.message };
   }
 
-  let attachmentId: string;
-  let tileId: string;
   try {
-    const result = await apiClient.attach(cfg, workspaceId, hostLabel);
+    const result = await apiClient.attach(cfg, workspaceId, hostLabel, remoteHost);
     attachmentId = result.attachmentId;
     tileId = result.tileId;
   } catch (err) {
@@ -207,7 +270,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   saveAttachment({ workspaceId, tileId, attachmentId, attachedAt: new Date().toISOString() }, env, io);
+  // Safe on stdout: this is still BEFORE `onAttached` spawns the local
+  // agent, so nothing owns the screen yet (and the caller's `clearScreen()`
+  // wipes it moments later anyway).
   log(`Attached. tileId=${tileId} attachmentId=${attachmentId}`);
+  noteConnection('connecting');
 
   // Codex-found race: if something already asked us to stop WHILE the
   // initial refresh/attach network round trip above was in flight (e.g. the
@@ -359,7 +426,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                   // right before `startLocalAgent`, the one moment
                   // guaranteed to be before any agent output regardless of
                   // either timing race.
-                  log('Stream connected.');
+                  // Out-of-band (was `log('Stream connected.')`): by this
+                  // point `onAttached` has spawned the local agent, whose
+                  // PTY is piped to this same stdout — a status line here
+                  // lands in the middle of the TUI's frame.
+                  noteConnection('connected');
                   heartbeat?.stop();
                   heartbeat = startHeartbeat(
                     async () => {
@@ -370,13 +441,18 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                       }
                       await apiClient.postHeartbeat(cfg, workspaceId, attachmentId);
                     },
-                    (err) => log(`heartbeat error: ${err instanceof Error ? err.message : String(err)}`),
+                    (err) =>
+                      noteConnection('degraded', {
+                        detail: `heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
+                      }),
                     undefined,
                     deps.timers,
                   );
                   // Send one immediately so status isn't stale for the first ~10s.
                   apiClient.postHeartbeat(cfg, workspaceId, attachmentId).catch((err) =>
-                    log(`initial heartbeat error: ${err instanceof Error ? err.message : String(err)}`),
+                    noteConnection('degraded', {
+                      detail: `initial heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
+                    }),
                   );
                   break;
                 case 'ping':
@@ -388,15 +464,19 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                   const captured = await captureOutput();
                   await apiClient
                     .postReadOutputReply(cfg, workspaceId, attachmentId, action.requestId, captured.output, captured.busy)
-                    .catch((err) => log(`read-output reply failed: ${err instanceof Error ? err.message : String(err)}`));
+                    .catch((err) =>
+                      noteConnection('degraded', {
+                        detail: `read-output reply failed: ${err instanceof Error ? err.message : String(err)}`,
+                      }),
+                    );
                   break;
                 }
                 case 'detached':
-                  log('Detached by server.');
+                  noteConnection('detached');
                   sawDetached = true;
                   break;
                 case 'unknown':
-                  log(`Unrecognized frame type: ${action.event}`);
+                  noteConnection('degraded', { detail: `unrecognized frame type: ${action.event}` });
                   break;
               }
               if (sawDetached) break;
@@ -407,7 +487,9 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
           timers.clearInterval(stopPollHandle);
         }
       } catch (err) {
-        log(`Stream error: ${err instanceof Error ? err.message : String(err)}`);
+        // The reported bug's primary symptom: this is the transient-drop
+        // path, and it used to write straight into the agent's PTY stream.
+        noteConnection('interrupted', { detail: err instanceof Error ? err.message : String(err) });
         if (err instanceof apiClient.YoloBridgeApiError && err.status === 404) sawGone = true;
       }
 
@@ -423,7 +505,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
       attempt += 1;
       const delay = nextBackoffMs(attempt, deps.backoffOpts);
-      log(`Reconnecting in ${delay}ms (attempt ${attempt})...`);
+      noteConnection('reconnecting', { attempt, retryInMs: delay });
       await sleep(delay);
     }
   } finally {
@@ -431,6 +513,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   if (refreshFailed) {
+    noteConnection('interrupted', { detail: `token refresh failed: ${refreshFailed.message}` });
+    // Still on stdout, deliberately: this is the terminal EXIT message for
+    // a daemon that is about to return and let cli.ts kill the local PTY.
+    // Unlike the reconnect narration above, there is no frame left to
+    // corrupt, and the alternative is an unexplained silent exit.
     log(`Token refresh failed: ${refreshFailed.message}`);
     log('Run `yolo-bridge login` again.');
     return { ok: false, reason: 'refresh-failed', message: refreshFailed.message };

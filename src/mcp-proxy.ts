@@ -111,6 +111,15 @@ export interface McpProxyOptions {
    *  must be a registered agent with a spawnable binary (`isHttpMintableAgent`
    *  in common-api/src/services/agent-registry.ts) or the mint 400s. */
   agentId: string;
+  /** The tile this daemon attached (the `tileId` from `attach`) — minted as
+   *  the token's `callerTileId` self-identity claim so the spawned agent can
+   *  tell which `studio_list_tiles` row is ITSELF instead of guessing. It is
+   *  NOT a `tileIds` restriction (this proxy stays workspace-wide by design,
+   *  see this file's header); it only marks that row `isCaller: true` and makes
+   *  `studio_send_to_tile` refuse a prompt addressed back at this same tile —
+   *  the exact self-dialogue loop a wrong guess produced. Optional: an older
+   *  common-api simply ignores the field. */
+  callerTileId?: string;
   fetchImpl?: FetchImpl;
   log?: (line: string) => void;
   /** Overrides `STARTUP_MINT_TIMEOUT_MS` — for tests only (a real caller
@@ -220,6 +229,7 @@ function makeTokenCache(
   getAccessToken: () => string,
   workspaceId: string,
   agentId: string,
+  callerTileId: string | undefined,
   fetchImpl: FetchImpl,
   tracker: RequestTracker,
 ) {
@@ -235,6 +245,7 @@ function makeTokenCache(
           workspaceId,
           agentId,
           scopes,
+          ...(callerTileId ? { callerTileId } : {}),
           ttlSeconds: REQUESTED_TTL_SECONDS,
         }),
         signal,
@@ -300,7 +311,7 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
   const fetchImpl = opts.fetchImpl ?? fetch;
   const tracker = new RequestTracker();
 
-  const tokenCache = makeTokenCache(opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, fetchImpl, tracker);
+  const tokenCache = makeTokenCache(opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, opts.callerTileId, fetchImpl, tracker);
 
   // Bounded (STARTUP_MINT_TIMEOUT_MS): a stalled scope-discovery/mint fetch
   // must not block `onAttached` from ever reaching `startLocalAgent`

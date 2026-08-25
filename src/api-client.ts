@@ -42,6 +42,25 @@ async function parseErrorBody(res: Response): Promise<{ message: string; code?: 
 }
 
 /**
+ * Self-reported, non-sensitive facts about THIS machine, sent once in the
+ * attach handshake so the workspace tile can show where the attached
+ * session is actually running (docs/YOLOBRIDGE_PLAN.md, "Tile session
+ * overview"). Mirrors common-api's `YoloBridgeRemoteHost`, which reads
+ * exactly these three keys and ignores anything else.
+ *
+ * Intentionally minimal: the working directory the operator launched the
+ * daemon from, the OS platform string, and which agent binary this attach
+ * drives. No environment variables, no directory contents, no username or
+ * account detail — the daemon reports what the tile needs to identify the
+ * session, and nothing more about the machine it runs on.
+ */
+export interface RemoteHostInfo {
+  cwd?: string;
+  platform?: string;
+  agent?: string;
+}
+
+/**
  * `POST /v1/workspaces/:workspaceId/yolobridge/attach`.
  *
  * `scopedToken` / `scopedTokenExpiresAt` are the workspace-scoped daemon
@@ -66,6 +85,7 @@ export async function attach(
   cfg: ApiClientConfig,
   workspaceId: string,
   hostLabel?: string,
+  remoteHost?: RemoteHostInfo,
 ): Promise<{
   tileId: string;
   attachmentId: string;
@@ -76,7 +96,10 @@ export async function attach(
   const res = await fetchImpl(`${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach`, {
     method: 'POST',
     headers: { ...authHeaders(cfg), 'Content-Type': 'application/json' },
-    body: JSON.stringify(hostLabel ? { hostLabel } : {}),
+    body: JSON.stringify({
+      ...(hostLabel ? { hostLabel } : {}),
+      ...(remoteHost && Object.values(remoteHost).some(Boolean) ? { remoteHost } : {}),
+    }),
   });
   if (!res.ok) {
     const { message, code } = await parseErrorBody(res);

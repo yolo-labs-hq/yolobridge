@@ -125,6 +125,7 @@ describe('startMcpProxy', () => {
     assert.equal('tileIds' in mintCalls[0], false, 'workspace-wide grant -- no tileIds restriction, first-class-tile parity');
     assert.equal(mintCalls[0].workspaceId, 'w1');
     assert.equal(mintCalls[0].agentId, 'claude');
+    assert.equal('callerTileId' in mintCalls[0], false, 'no self-identity claim unless the caller supplies one');
 
     // A real loopback call to the local proxy.
     const res = await fetch(handle!.url, {
@@ -160,6 +161,31 @@ describe('startMcpProxy', () => {
     });
     assert.equal(forwardedBody._delegatedToken, undefined);
     assert.equal(forwardedBody.params._delegatedToken, undefined);
+  });
+
+  it('mints the attached tileId as the callerTileId self-identity claim (so the spawned agent can tell which list_tiles row is itself)', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const mintCalls: any[] = [];
+    const fetchImpl = makeFetch({
+      mintCalls,
+      upstream: () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com',
+      getAccessToken: () => 'at',
+      workspaceId: 'w1',
+      agentId: 'claude',
+      callerTileId: 'yolobridge-1787680593278-ajmi',
+      fetchImpl,
+      log: () => {},
+    });
+
+    assert.equal(mintCalls.length, 1);
+    assert.equal(mintCalls[0].callerTileId, 'yolobridge-1787680593278-ajmi');
+    // Self-identity is not a restriction: the grant stays workspace-wide
+    // (first-class-tile parity, this file's header).
+    assert.equal('tileIds' in mintCalls[0], false);
   });
 
   it("injects the token into a tools/call that omits params.arguments entirely (a zero-input tool -- Codex review, 2026-08-24, round 4)", async () => {
