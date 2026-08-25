@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, readdirSync, existsSync, statSync, lstatSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, readdirSync, existsSync, statSync, lstatSync, symlinkSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -146,5 +146,49 @@ describe('atomicWriteFileSync', () => {
 
     assert.equal(lstatSync(linkPath).isSymbolicLink(), false, 'a broken symlink target has nowhere to write through');
     assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}');
+  });
+
+  it('resolves a symlinked PARENT DIRECTORY, not just the final path component (Codex review, 2026-08-24, round 24)', () => {
+    // Every normal fs call (writeFileSync, renameSync) transparently
+    // follows an intermediate directory symlink -- only lstatSync(path)'s
+    // OWN check (round 16) was blind to it, since it only ever asks about
+    // the FINAL path segment. `.claude` itself symlinked elsewhere is
+    // exactly the shape git-safety.ts's own round-24 fix depends on this
+    // function resolving correctly.
+    const realParent = join(dir, 'real-parent');
+    const linkedParent = join(dir, 'linked-parent');
+    mkdirSync(realParent);
+    symlinkSync(realParent, linkedParent);
+
+    atomicWriteFileSync(join(linkedParent, 'file.json'), '{"a":1}');
+
+    assert.equal(readFileSync(join(realParent, 'file.json'), 'utf-8'), '{"a":1}', 'the write must land in the REAL directory the symlink points at');
+    assert.equal(lstatSync(linkedParent).isSymbolicLink(), true, 'the parent symlink itself must survive untouched');
+  });
+
+  it('sweeps a stale .tmp-* sibling left by a PRIOR crashed call before writing a new one (Codex review, 2026-08-24, round 24)', () => {
+    // A crash between creating the temp file and either renaming or
+    // cleaning it up leaves a stray sibling behind -- self-heals on the
+    // very next successful write to the SAME destination rather than
+    // lingering indefinitely (narrows, doesn't eliminate, the exposure
+    // window a stray temp file represents).
+    const path = join(dir, 'target.json');
+    const staleTemp = `${path}.tmp-99999-deadbeef`;
+    writeFileSync(staleTemp, '{"leftover":"from a crashed prior call"}');
+
+    atomicWriteFileSync(path, '{"new":true}');
+
+    assert.equal(existsSync(staleTemp), false, 'the stale temp sibling must be swept away');
+    assert.deepEqual(readdirSync(dir), ['target.json']);
+  });
+
+  it('never sweeps an UNRELATED file merely sharing the directory', () => {
+    const path = join(dir, 'target2.json');
+    const unrelated = join(dir, 'unrelated-file.tmp-not-ours');
+    writeFileSync(unrelated, 'keep me');
+
+    atomicWriteFileSync(path, '{"new":true}');
+
+    assert.equal(readFileSync(unrelated, 'utf-8'), 'keep me');
   });
 });

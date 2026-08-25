@@ -454,6 +454,24 @@ describe('cross-process config lock (Codex review, 2026-08-24, round 20)', () =>
     assert.deepEqual(result, { ok: true, createdFile: true });
   });
 
+  it('reclaims a lock left EMPTY by a writer that crashed between the exclusive create and a completed write, instead of misreading it as a falsely-alive pid 0 (Codex review, 2026-08-24, round 24)', () => {
+    // `Number('') === 0` is a real JS quirk -- an empty (or otherwise
+    // truncated) lock would parse as pid 0 without this fix, and POSIX
+    // `kill(0, 0)` targets the caller's own process GROUP (always succeeds),
+    // misreporting pid 0 as "alive" forever. This test process's own pid is
+    // exactly what would be probed, and it's trivially alive -- proving the
+    // fix has to reject pid 0 as invalid outright, not rely on liveness.
+    writeFileSync(lockPath(), '');
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
+  });
+
+  it('reclaims a lock containing GARBAGE that parses to no valid pid at all, rather than waiting out the full deadline on every future attach (Codex review, 2026-08-24, round 24)', () => {
+    writeFileSync(lockPath(), 'not-json-and-not-a-number-either');
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
+  });
+
   it('refuses (ok:false) without touching .mcp.json when the lock is held by a confirmed-LIVE pid, instead of racing a concurrent sibling write', () => {
     // The two-process race this lock exists to close (Codex review,
     // 2026-08-24, round 20): two `attach` invocations starting in the same

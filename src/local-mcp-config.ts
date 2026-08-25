@@ -246,13 +246,26 @@ function sleepSync(ms: number): void {
  *  legitimately have been written by an older CLI version) — falling back to
  *  the legacy shape keeps a pre-round-23 crash's stale lock reclaimable
  *  instead of stuck forever the moment this module upgrades. */
+/** A pid is only ever a POSITIVE integer for a real Node/OS process — never
+ *  0 or negative (Codex review, 2026-08-24, round 24): `Number('') === 0`
+ *  is a real JS quirk, so a lock file left EMPTY or truncated by a crash
+ *  between the exclusive create and a completed write would otherwise
+ *  parse as pid 0. `process.kill(0, 0)` targets the caller's own PROCESS
+ *  GROUP on POSIX (not "process 0" — there is no such thing), which always
+ *  succeeds, so `isPidAlive(0)` would misreport that as "alive" forever —
+ *  bricking every future attach's lock acquisition until the file is
+ *  removed by hand. */
+function isValidPid(value: number): boolean {
+  return Number.isInteger(value) && value >= 1;
+}
+
 function parseLockContent(raw: string): { pid?: number; bootUptimeSec?: number } {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       const obj = parsed as Record<string, unknown>;
       return {
-        pid: typeof obj.pid === 'number' ? obj.pid : undefined,
+        pid: typeof obj.pid === 'number' && isValidPid(obj.pid) ? obj.pid : undefined,
         bootUptimeSec: typeof obj.bootUptimeSec === 'number' ? obj.bootUptimeSec : undefined,
       };
     }
@@ -260,7 +273,18 @@ function parseLockContent(raw: string): { pid?: number; bootUptimeSec?: number }
     // Not JSON at all — fall through to the legacy bare-pid-string format.
   }
   const legacyPid = Number(raw);
-  return { pid: Number.isInteger(legacyPid) ? legacyPid : undefined };
+  return { pid: isValidPid(legacyPid) ? legacyPid : undefined };
+}
+
+/** True when `a` and `b` record the IDENTICAL owner — both `pid` and
+ *  `bootUptimeSec` equal, including both being `undefined` together (the
+ *  "malformed/no valid pid at all" case, round 24's other fix below). Used
+ *  to prove nothing changed underneath a stale-lock reclaim between the
+ *  initial read and the delete (Codex review, 2026-08-24, round 24,
+ *  tightening round 22's pid-only re-check — see `acquireConfigLock`'s own
+ *  comment for the exact race a pid-only comparison missed). */
+function sameLockIdentity(a: { pid?: number; bootUptimeSec?: number }, b: { pid?: number; bootUptimeSec?: number }): boolean {
+  return a.pid === b.pid && a.bootUptimeSec === b.bootUptimeSec;
 }
 
 function acquireConfigLock(cwd: string): (() => void) | null {
@@ -279,35 +303,42 @@ function acquireConfigLock(cwd: string): (() => void) | null {
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null;
-      let holderPid: number | undefined;
-      let holderBootUptimeSec: number | undefined;
+      let holder: { pid?: number; bootUptimeSec?: number };
       try {
-        const parsed = parseLockContent(readFileSync(path, 'utf-8'));
-        holderPid = parsed.pid;
-        holderBootUptimeSec = parsed.bootUptimeSec;
+        holder = parseLockContent(readFileSync(path, 'utf-8'));
       } catch {
         // Lock file vanished between our failed create and this read —
         // another process's release raced us; loop around and retry.
         continue;
       }
-      if (Number.isInteger(holderPid) && isDefinitivelyStale(holderPid!, holderBootUptimeSec)) {
-        // Re-verify the lock still holds the SAME stale pid immediately
-        // before deleting it (Codex review, 2026-08-24, round 22): two
-        // processes can both observe this identical stale holderPid. Without
-        // this re-check, whichever one loses the race to unlink+recreate
-        // first would have its unconditional `unlinkSync` delete the
-        // OTHER's brand-new, LIVE lock instead of the stale one it
-        // originally saw — recreating the exact two-writer race this lock
-        // exists to prevent. A mismatch here means someone else already
-        // reclaimed it; skip deleting and loop back to re-evaluate from
-        // scratch rather than touching a lock that isn't stale anymore.
-        let stillStalePid: number | undefined;
+      // A MALFORMED lock (no valid pid at all — `holder.pid === undefined`,
+      // e.g. a writer that crashed between the exclusive create and a
+      // completed write, leaving it empty/truncated) is treated the SAME as
+      // a confirmed-stale record, not "can't tell, wait it out" (Codex
+      // review, 2026-08-24, round 24): there is no legitimate content this
+      // module ever writes that fails to parse a valid pid, so nothing
+      // genuine is ever at risk of being reclaimed here.
+      const isStaleOrInvalid = holder.pid === undefined || isDefinitivelyStale(holder.pid, holder.bootUptimeSec);
+      if (isStaleOrInvalid) {
+        // Re-verify the FULL recorded identity — pid AND bootUptimeSec
+        // TOGETHER, not pid alone — immediately before deleting (Codex
+        // review, 2026-08-24, round 24, tightening round 22's fix): after a
+        // reboot recycles a stale lock's exact pid number, two processes can
+        // both judge it stale and race to reclaim. If the WINNER's own live
+        // pid happens to equal that same recycled number, a pid-only
+        // re-check would see "same pid" and let the loser delete the
+        // winner's brand-new LIVE lock anyway — comparing the full
+        // (pid, bootUptimeSec) pair is what actually proves nothing changed
+        // underneath us. A mismatch (or the content going from "malformed"
+        // to "a real record") means someone else already reclaimed it; skip
+        // deleting and loop back to re-evaluate from scratch.
+        let current: { pid?: number; bootUptimeSec?: number };
         try {
-          stillStalePid = parseLockContent(readFileSync(path, 'utf-8')).pid;
+          current = parseLockContent(readFileSync(path, 'utf-8'));
         } catch {
           continue; // Already gone — someone else's reclaim or release; retry.
         }
-        if (stillStalePid !== holderPid) continue;
+        if (!sameLockIdentity(current, holder)) continue;
         try {
           unlinkSync(path);
         } catch {

@@ -98,4 +98,26 @@ describe('riskyToCommit', () => {
 
     assert.equal(riskyToCommit(dir, linkPath), false);
   });
+
+  it('returns true when the PARENT DIRECTORY (not the final path itself) is a symlink resolving into a TRACKED location (Codex review, 2026-08-24, round 24)', () => {
+    // Every normal fs call transparently follows an intermediate directory
+    // symlink -- only the FINAL path segment's own symlink-ness (round 21)
+    // was being resolved. `.claude` itself symlinked elsewhere is exactly
+    // this shape: the file at the end of the path is a perfectly ordinary,
+    // non-symlink file, but the directory it lives in is a symlink into a
+    // TRACKED location `git check-ignore` on the lexical `.claude/...` path
+    // alone would report as "beyond a symbolic link" (status 128, a safe
+    // degrade for a genuinely out-of-repo target) even though the write
+    // actually lands somewhere fully tracked.
+    initGitRepo();
+    mkdirSync(join(dir, 'real-claude'));
+    const realTarget = join(dir, 'real-claude', 'settings.local.json');
+    writeFileSync(realTarget, '{"tracked":true}');
+    spawnSync('git', ['add', 'real-claude/settings.local.json'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+    symlinkSync(join(dir, 'real-claude'), join(dir, '.claude'));
+
+    const path = join(dir, '.claude', 'settings.local.json');
+    assert.equal(riskyToCommit(dir, path), true, 'the TRACKED real target must make this risky even though the final path segment is not itself a symlink');
+  });
 });

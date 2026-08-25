@@ -42,39 +42,117 @@
  * plain file there" behavior this function already had before this fix,
  * not a new regression.
  */
-import { writeFileSync, renameSync, unlinkSync, existsSync, statSync, chmodSync, lstatSync, realpathSync } from 'node:fs';
+import { writeFileSync, renameSync, unlinkSync, existsSync, statSync, chmodSync, lstatSync, realpathSync, readdirSync } from 'node:fs';
+import { dirname, basename, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 /** Exported for `git-safety.ts` (Codex review, 2026-08-24, round 21): the
  *  git-ignore check must validate the SAME real target this function is
  *  about to write through, not just the (possibly symlinked) path the
  *  caller named — see that module's doc comment for the exact gap this
- *  closes. */
+ *  closes.
+ *
+ *  Resolves a symlinked PARENT DIRECTORY too, not just `path`'s own final
+ *  component (Codex review, 2026-08-24, round 24): `lstatSync(path)` only
+ *  reports whether the FINAL path segment is a symlink — an intermediate
+ *  ancestor directory (e.g. `.claude` itself symlinked elsewhere) is
+ *  transparently followed by every normal fs call (`writeFileSync`,
+ *  `renameSync`, ...) but was invisible to this function, which returned
+ *  the untouched LEXICAL path. `git check-ignore` on that lexical path then
+ *  fails with "is beyond a symbolic link" (status 128, the same code this
+ *  module already treats as a safe degrade for "outside the repository
+ *  entirely") — reporting safe while the actual write still traverses the
+ *  symlink and can land in a TRACKED file the git-ignore check never
+ *  actually validated. `realpathSync` on the PARENT resolves the whole
+ *  ancestor chain in one call; the file's own possible symlink-ness (round
+ *  16) is still resolved separately afterward, starting from that already-
+ *  parent-resolved path. A parent that doesn't exist yet (nothing has been
+ *  written here before) has no symlink layer to resolve either — falls
+ *  back to the lexical path, same as before this fix, not a regression. */
 export function resolveWriteTarget(path: string): string {
+  let realDir: string;
   try {
-    if (!lstatSync(path).isSymbolicLink()) return path;
+    realDir = realpathSync(dirname(path));
   } catch {
-    return path; // Doesn't exist yet — nothing to resolve.
+    realDir = dirname(path); // Parent doesn't exist yet — nothing to resolve.
+  }
+  const parentResolvedPath = join(realDir, basename(path));
+  try {
+    if (!lstatSync(parentResolvedPath).isSymbolicLink()) return parentResolvedPath;
+  } catch {
+    return parentResolvedPath; // Doesn't exist yet — nothing further to resolve.
   }
   try {
-    return realpathSync(path);
+    return realpathSync(parentResolvedPath);
   } catch {
-    return path; // Broken symlink — write a plain file at `path` itself.
+    return parentResolvedPath; // Broken symlink — write a plain file there.
+  }
+}
+
+/** Best-effort removal of any `.tmp-*` sibling this function itself could
+ *  have left behind from a PRIOR call that crashed between creating it and
+ *  either renaming or cleaning it up (Codex review, 2026-08-24, round 24) —
+ *  see the temp-file-permissions doc comment on `atomicWriteFileSync` for
+ *  the exposure this narrows. Scoped to siblings of THIS exact target so it
+ *  never touches an unrelated file merely sharing the directory. */
+function sweepStaleTempSiblings(targetPath: string): void {
+  const dir = dirname(targetPath);
+  const prefix = `${basename(targetPath)}.tmp-`;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return; // Directory doesn't exist (nothing written here yet) — nothing to sweep.
+  }
+  for (const name of entries) {
+    if (!name.startsWith(prefix)) continue;
+    try {
+      unlinkSync(join(dir, name));
+    } catch {
+      // Best-effort — a leftover temp file is only ever a tighter-than-this-
+      // call's-own risk window, never a correctness problem for THIS write.
+    }
   }
 }
 
 export function atomicWriteFileSync(path: string, content: string): void {
   const targetPath = resolveWriteTarget(path);
+  // Clears out anything a PRIOR crashed call left behind before adding a
+  // new one — see `sweepStaleTempSiblings`'s own doc comment.
+  sweepStaleTempSiblings(targetPath);
   const tmpPath = `${targetPath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
-    writeFileSync(tmpPath, content, 'utf-8');
+    // Owner-only from the moment of CREATION (Codex review, 2026-08-24,
+    // round 24), not after a separate chmod below: `writeFileSync`'s
+    // default mode (subject to the process umask, commonly 0644/0664) would
+    // otherwise leave a window — between this call returning and the
+    // `chmodSync` a few lines down — where a crash or SIGKILL leaves a
+    // WORLD-READABLE copy of the full new content (which, for an EXISTING
+    // destination being overwritten, is the operator's complete file, not
+    // just this module's own fragment) sitting on disk under a temp name
+    // `riskyToCommit` never validated on its own.
+    writeFileSync(tmpPath, content, { encoding: 'utf-8', mode: 0o600 });
     let existingMode: number | undefined;
     try {
       existingMode = statSync(targetPath).mode & 0o777;
     } catch {
       // `targetPath` doesn't exist yet — nothing to preserve.
     }
-    if (existingMode !== undefined) chmodSync(tmpPath, existingMode);
+    if (existingMode !== undefined) {
+      chmodSync(tmpPath, existingMode);
+    } else {
+      // No prior file to preserve permissions from — widen back to the
+      // process's NORMAL default (umask-derived) mode right before the
+      // rename, matching a plain `writeFileSync` with no explicit mode
+      // (same behavior this module already guaranteed pre-round-24 — see
+      // the "brand-new file" test below). The 0600 above only needs to
+      // hold DURING the write itself to close the crash-exposure window;
+      // a caller that never asked for owner-only on a brand-new file (e.g.
+      // `local-mcp-trust.ts`'s `settings.local.json`, which has no explicit
+      // chmod of its own) must not have that silently imposed on it as a
+      // side effect of this fix.
+      chmodSync(tmpPath, 0o666 & ~process.umask());
+    }
     renameSync(tmpPath, targetPath);
   } catch (err) {
     // Best-effort: don't leave a stray temp file behind on failure.
