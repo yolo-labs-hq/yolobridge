@@ -21,6 +21,23 @@ import type { TimerImpl } from './heartbeat.js';
 const ENV = { HOME: '/home/yolo' };
 const AUTH: StoredAuth = { accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: Date.now() + 3600_000 };
 
+/**
+ * The attach response every fake server in this file returns.
+ *
+ * Card 09 made the workspace-scoped credential MANDATORY on both sides:
+ * `api-client.attach` refuses a response without it, and the server's daemon
+ * routes refuse a request without one. A fixture that omitted it would be
+ * testing a shape the real system can no longer produce. The expiry is far
+ * enough out that the 75%-of-lifetime renewal never fires inside a test that
+ * isn't specifically driving a clock.
+ */
+const ATTACH_OK = {
+  tileId: 'tile-1',
+  attachmentId: 'a1',
+  scopedToken: 'scoped-tok-1',
+  scopedTokenExpiresAt: 4_102_444_800_000,
+};
+
 function fakeIO(): ConfigStoreIO & { files: Map<string, string> } {
   const files = new Map<string, string>();
   return {
@@ -255,54 +272,48 @@ describe('runAttachDaemon', () => {
     }
   });
 
-  it('degrades to the account token, out-of-band, when the server issues no scoped credential', async () => {
-    // A common-api predating the mint. This daemon binary may sit on a laptop
-    // for months; it cannot require a server capability that did not exist when
-    // it was installed. Degrade, don't brick — and say so off stdout.
-    const sse =
-      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
-      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
-
+  it('FAILS the attach when the server issues no scoped credential, instead of degrading to the account token', async () => {
+    // Card 09, D6 — no backwards support. This used to degrade and run the
+    // whole session on the account token. Boundary B refuses that token on
+    // every post-attach route, so continuing would buy the daemon nothing but
+    // a 403 on its first heartbeat, with no diagnosis anywhere. It stops here,
+    // while the operator is still watching the terminal.
     const authsSeen: string[] = [];
     const fetchImpl = (async (url: any, init?: any) => {
       const u = String(url);
       authsSeen.push(String(init?.headers?.Authorization ?? ''));
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
-      if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
-      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
-      throw new Error(`unexpected request: ${u}`);
+      if (u.endsWith('/yolobridge/attach')) {
+        // A response with no scopedToken/scopedTokenExpiresAt at all.
+        return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      }
+      throw new Error(`must not reach ${u} without a scoped credential`);
     }) as any;
 
     const events: ConnectionEvent[] = [];
-    const logs: string[] = [];
+    const io = fakeIO();
     const result = await runAttachDaemon({
       workspaceId: 'w1',
       commonApiBaseUrl: 'https://api.example.com',
       auth: AUTH,
       env: ENV,
-      io: fakeIO(),
+      io,
       fetchImpl,
-      log: (line) => logs.push(line),
+      log: () => {},
       clearScreen: () => {},
       onConnectionEvent: (event) => events.push(event),
     });
 
-    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
-    assert.ok(authsSeen.every((a) => a === 'Bearer at'), `all calls should fall back to the account token, saw ${authsSeen.join(', ')}`);
-
-    // Reported once, pre-spawn, where stdout is still safe.
-    assert.ok(
-      logs.some((l) => /no workspace-scoped credential/i.test(l)),
-      `an unscoped attach must be reported to the operator, saw: ${logs.join(' | ')}`,
-    );
-
-    // And NOT as a connection state: `degraded` there means the LINK is
-    // struggling, so borrowing it would make `status` misreport a healthy
-    // session for its entire life.
-    assert.ok(
-      !events.some((e) => e.state === 'degraded'),
-      'credential scope must not be reported as a connection state',
-    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.reason, 'attach-failed');
+      assert.match(result.message, /no workspace-scoped credential/i);
+    }
+    // It really did attempt the attach (and only the attach) — otherwise this
+    // would pass just as well against a daemon that never made a request.
+    assert.deepEqual(authsSeen, ['Bearer at'], `expected exactly one attach call, saw ${authsSeen.join(', ')}`);
+    // Nothing was reported as a CONNECTION state: `degraded` there means the
+    // link is struggling, and this session never had a link at all.
+    assert.ok(!events.some((e) => e.state === 'degraded'), 'a credential failure is not a connection state');
   });
 
   it('attaches, delivers a prompt frame, and exits cleanly on a server-initiated detach', async () => {
@@ -315,7 +326,7 @@ describe('runAttachDaemon', () => {
     const fetchImpl = (async (url: any, init?: any) => {
       const u = String(url);
       requests.push(`${init?.method ?? 'GET'} ${u}`);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -362,7 +373,7 @@ describe('runAttachDaemon', () => {
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -397,7 +408,7 @@ describe('runAttachDaemon', () => {
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -430,7 +441,7 @@ describe('runAttachDaemon', () => {
     const fetchImpl = (async (url: any) => {
       const u = String(url);
       calls.push(u);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -476,7 +487,7 @@ describe('runAttachDaemon', () => {
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -532,7 +543,7 @@ describe('runAttachDaemon', () => {
 
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponseChunked([chunk1, chunk2]);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -568,7 +579,7 @@ describe('runAttachDaemon', () => {
     // running with no way for the daemon to ever end on its own.
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return jsonResponse(404, { error: 'Attachment not found', code: 'NOT_FOUND' });
       throw new Error(`unexpected request: ${u}`);
     }) as any;
@@ -634,7 +645,7 @@ describe('runAttachDaemon', () => {
       const u = String(url);
       const method = init?.method ?? 'GET';
       requests.push(`${method} ${u}`);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return new Response(null, { status: 204 });
       if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
       throw new Error(`unexpected request: ${u}`);
@@ -678,7 +689,7 @@ describe('runAttachDaemon', () => {
         // Simulates Ctrl+C landing WHILE this exact request was in flight —
         // shouldStop() only starts reporting true once it resolves.
         stopRequested = true;
-        return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+        return jsonResponse(201, ATTACH_OK);
       }
       if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return new Response(null, { status: 204 });
       if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
@@ -720,7 +731,7 @@ describe('runAttachDaemon', () => {
       const method = init?.method ?? 'GET';
       if (u.endsWith('/yolobridge/attach')) {
         stopRequested = true;
-        return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+        return jsonResponse(201, ATTACH_OK);
       }
       if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return new Response('boom', { status: 500 });
       if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
@@ -757,7 +768,7 @@ describe('runAttachDaemon', () => {
     let replyBody: any;
     const fetchImpl = (async (url: any, init?: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) {
         const parsed = JSON.parse(String(init?.body ?? '{}'));
@@ -787,7 +798,7 @@ describe('runAttachDaemon', () => {
     const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -849,7 +860,7 @@ describe('runAttachDaemon — connection state never enters the terminal output 
     let streamCalls = 0;
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) {
         streamCalls += 1;
         // 502, not 404: a transient upstream blip, which is the case that
@@ -960,11 +971,12 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
 
     const authHeadersSeen: string[] = [];
+    let attachAuth: string | undefined;
     const fetchImpl = (async (url: any, init?: any) => {
       const u = String(url);
       const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
       if (auth) authHeadersSeen.push(auth);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) { attachAuth = auth; return jsonResponse(201, ATTACH_OK); }
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -1006,13 +1018,23 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
 
     assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
     assert.equal(refreshCalls, 1, 'refresh should fire once before the stream was opened');
+    // ATTACH — the one call that is still an account action — must present the
+    // freshly rotated account token, never the stale one.
+    assert.equal(attachAuth, 'Bearer fresh-at', `the attach call must use the rotated token, saw ${attachAuth}`);
+    // Everything AFTER attach must present the workspace-scoped credential.
+    // (This assertion used to read "every call uses fresh-at" and passed only
+    // because the fixture returned no scoped token, i.e. it was silently
+    // pinning the degrade path card 09 deleted.)
+    const postAttach = authHeadersSeen.filter((h) => h !== attachAuth);
+    assert.ok(postAttach.length > 0, 'sanity: there must BE post-attach calls to check');
     assert.ok(
-      authHeadersSeen.every((h) => h === 'Bearer fresh-at'),
-      `every API call after refresh should use the new access token, saw: ${authHeadersSeen.join(', ')}`,
+      postAttach.every((h) => h === 'Bearer scoped-tok-1'),
+      `every post-attach call must use the scoped credential, saw: ${postAttach.join(', ')}`,
     );
     assert.deepEqual(loadAuth(ENV, io), {
       accessToken: 'fresh-at',
-      refreshToken: 'rt-2',
+      // The rotated REFRESH token is not written back: card 09 made
+      // `persistAccountAuth`'s drop unconditional.
       tokenType: 'Bearer',
       expiresAtMs: 1_000_000 + 3600_000,
     });
@@ -1027,7 +1049,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
     const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -1083,7 +1105,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       'event: detached\ndata: {"attachmentId":"a1"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return sseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -1117,7 +1139,7 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
     const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
       if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
@@ -1169,24 +1191,35 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
     );
   });
 
-  it('a refresh failure mid-stream (not just pre-connect) also stops the daemon instead of looping', async () => {
-    const sse = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+  it('a refresh failure mid-stream does NOT stop the daemon any more — the scoped session outlives the account token', async () => {
+    // THIS TEST'S ASSERTION IS DELIBERATELY THE INVERSE OF WHAT IT USED TO BE.
+    // It once required a mid-stream account-refresh failure to end the daemon
+    // with `refresh-failed`, and it passed for the wrong reason: its attach
+    // fixture returned no scoped credential, so the daemon was on the DEGRADED
+    // path, where the account token really was its only credential. Card 08
+    // downgraded that failure to best-effort on the scoped path; card 09
+    // deleted the degraded path outright, which is what finally exposed the
+    // fixture. The full behaviour (heartbeats continuing on the scoped token,
+    // the retry latching, nothing reported as `degraded`) is pinned against a
+    // REAL config dir by the card-08 suite below; what is kept here is the one
+    // fact this block is about — the daemon does not exit.
+    const stream = controllableSseResponse('event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n');
     const fetchImpl = (async (url: any) => {
       const u = String(url);
-      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
-      if (u.includes('/yolobridge/stream')) return neverEndingSseStreamResponse(sse);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
+      if (u.includes('/yolobridge/stream')) return stream.response;
       if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
       throw new Error(`unexpected request: ${u}`);
     }) as any;
 
     const timers = fakeTimers();
-    // Connect with plenty of validity left (so the PRE-stream check
-    // passes), then simulate the clock advancing past the refresh buffer
-    // once we're already inside the stream — mirroring a real long-lived
-    // connection outliving the token.
     let clock = 1_000_000;
     const freshAuth: StoredAuth = { accessToken: 'at-1', refreshToken: 'rt-1', tokenType: 'Bearer', expiresAtMs: clock + 3600_000 };
-    const refreshAccessToken: RefreshTokenFn = async () => ({ status: 'failed', message: 'invalid_grant' });
+    let refreshAttempts = 0;
+    const refreshAccessToken: RefreshTokenFn = async () => {
+      refreshAttempts += 1;
+      return { status: 'failed', message: 'invalid_grant' };
+    };
 
     const resultPromise = runAttachDaemon({
       workspaceId: 'w1',
@@ -1202,22 +1235,19 @@ describe('runAttachDaemon — access-token refresh (Bug 2)', () => {
       timers,
     });
 
-    await waitUntil(() => timers.intervals.length >= 2); // connected: heartbeat + stop-poll both registered
+    await waitUntil(() => timers.intervals.length >= 2); // connected: heartbeat + stop-poll
+    clock += 3600_000; // now inside the refresh buffer — the rotation will be attempted and fail
+    await tickUntil(timers, () => refreshAttempts > 0);
+    assert.ok(refreshAttempts > 0, 'sanity: the account rotation really was attempted and really failed');
 
-    clock += 3600_000; // now within the refresh buffer of expiry
-    // The heartbeat tick's ensureFreshToken() call is async (goes through
-    // the injected fetchImpl), so it doesn't resolve within the same
-    // synchronous tick() pass the stop-poll interval also fires in. Ticking
-    // repeatedly with a real (short) yield between each tick gives that
-    // promise chain room to resolve and set `refreshFailed` before the
-    // next stop-poll check reads it and destroy()s the stream.
-    for (let i = 0; i < 20; i++) {
-      timers.tick(1);
-      await new Promise((r) => setTimeout(r, 5));
-    }
-
+    // Still streaming: the only thing that ends it is the server saying so.
+    stream.push('event: detached\ndata: {"attachmentId":"a1"}\n\n');
     const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after mid-stream refresh failure');
-    assert.deepEqual(result, { ok: false, reason: 'refresh-failed', message: 'invalid_grant' });
+    assert.deepEqual(
+      result,
+      { ok: true, reason: 'detached-by-server' },
+      'the daemon must end on the server detach, never on a failed account rotation',
+    );
   });
 });
 
@@ -1803,18 +1833,27 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
     }
   });
 
-  it('KEEPS the refresh token on the DEGRADED path, and a restarted daemon still rotates the account token with it', async () => {
-    // THE BRICK-AVOIDANCE CASE. With no scoped credential, `scopedCfg()` falls
-    // back to the account token and the daemon runs the entire session on it —
-    // so the refresh token is still the only thing that can keep that session
-    // alive past the ~24h access-token expiry. Dropping it unconditionally
-    // kills this daemon a day later with a 401 that points nowhere near here.
+  it('drops the refresh token UNCONDITIONALLY now the degraded path is gone, and an unscoped attach fails rather than running on it (card 09)', async () => {
+    // Card 08 kept the refresh token whenever no scoped credential arrived,
+    // because `scopedCfg()` fell back to the account token and the daemon ran
+    // the entire session on it. Card 09 deleted that fallback AND made the
+    // server refuse the account token on every daemon route, so there is no
+    // session left for the refresh token to keep alive. Both halves are
+    // asserted here — the attach failing, and the disk no longer holding the
+    // durable account key afterwards.
     const home = realHome();
     try {
-      let clock = T0;
       saveAuth(
-        { accessToken: 'account-at-1', refreshToken: 'account-rt-1', tokenType: 'Bearer', expiresAtMs: T0 + DAY_MS },
+        // Near expiry, so the pre-attach `ensureFreshToken()` really rotates
+        // and really writes `auth.json` back through `persistAccountAuth` —
+        // which is the write this test is about. A far-future expiry would
+        // skip the write entirely and the assertion below would prove nothing.
+        { accessToken: 'account-at-1', refreshToken: 'account-rt-1', tokenType: 'Bearer', expiresAtMs: T0 + 1000 },
         home.env,
+      );
+      assert.ok(
+        fs.readFileSync(home.authFile, 'utf-8').includes('account-rt-1'),
+        'sanity: the refresh token really is on disk before the attach',
       );
 
       const attachAuths: string[] = [];
@@ -1825,9 +1864,7 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
           // No scopedToken/scopedTokenExpiresAt: a common-api predating the mint.
           return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
         }
-        if (u.includes('/yolobridge/stream')) return sseStreamResponse(CONNECTED + DETACHED);
-        if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
-        throw new Error(`unexpected request: ${u}`);
+        throw new Error(`must not reach ${u} without a scoped credential`);
       }) as any;
 
       const refreshedWith: string[] = [];
@@ -1839,12 +1876,12 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
             accessToken: 'account-at-2',
             refreshToken: 'account-rt-2',
             expiresInSec: 86_400,
-            expiresAtMs: clock + DAY_MS,
+            expiresAtMs: T0 + DAY_MS,
           },
         };
       };
 
-      const first = await runAttachFromDisk({
+      const result = await runAttachFromDisk({
         workspaceId: 'w1',
         commonApiBaseUrl: 'https://api.example.com',
         env: home.env,
@@ -1852,43 +1889,20 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
         refreshAccessToken,
         log: () => {},
         clearScreen: () => {},
-        now: () => clock,
+        now: () => T0,
       });
-      assert.deepEqual(first, { ok: true, reason: 'detached-by-server' });
-      assert.deepEqual(refreshedWith, [], 'sanity: nothing needed rotating during the first session');
 
-      const afterFirst = JSON.parse(fs.readFileSync(home.authFile, 'utf-8'));
-      assert.equal(
-        afterFirst.refreshToken,
-        'account-rt-1',
-        'a degraded attach must LEAVE the refresh token on disk — it is still the working credential',
-      );
+      assert.equal(result.ok, false, 'an attach with no scoped credential must not report success');
+      if (!result.ok) assert.equal(result.reason, 'attach-failed');
+      assert.deepEqual(refreshedWith, ['account-rt-1'], 'sanity: the pre-attach rotation really ran');
+      assert.deepEqual(attachAuths, ['Bearer account-at-2'], 'sanity: the attach really was attempted, with the rotated token');
 
-      // A day later: the account access token has expired. The restart has to
-      // rotate it, and the only thing that can is the token left above.
-      clock = T0 + DAY_MS + 1;
-      const second = await runAttachFromDisk({
-        workspaceId: 'w1',
-        commonApiBaseUrl: 'https://api.example.com',
-        env: home.env,
-        fetchImpl,
-        refreshAccessToken,
-        log: () => {},
-        clearScreen: () => {},
-        now: () => clock,
-      });
-      assert.deepEqual(second, { ok: true, reason: 'detached-by-server' }, 'the restarted daemon must not be bricked');
-      assert.deepEqual(
-        refreshedWith,
-        ['account-rt-1'],
-        'the restart must have rotated using the refresh token the first session left behind',
-      );
-      assert.ok(attachAuths.length === 2, `sanity: two attaches, saw ${attachAuths.length}`);
-      assert.equal(attachAuths[1], 'Bearer account-at-2', 'the second attach must present the freshly rotated token');
+      const raw = fs.readFileSync(home.authFile, 'utf-8');
+      assert.ok(raw.includes('account-at-2'), `sanity: this is the real auth.json we are reading, got: ${raw}`);
       assert.equal(
-        JSON.parse(fs.readFileSync(home.authFile, 'utf-8')).refreshToken,
-        'account-rt-2',
-        'the rotated refresh token must still be persisted on the degraded path',
+        'refreshToken' in JSON.parse(raw),
+        false,
+        `the drop is unconditional now — the durable account key must be ABSENT, got: ${raw}`,
       );
     } finally {
       home.cleanup();

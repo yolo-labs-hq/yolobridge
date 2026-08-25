@@ -39,26 +39,58 @@ export type DetachResult =
   | { ok: false; reason: 'not-logged-in' | 'not-attached' | 'error'; message: string };
 
 export async function runDetach(deps: DetachDeps): Promise<DetachResult> {
-  const auth = loadAuth(deps.env, deps.io);
-  if (!auth) return { ok: false, reason: 'not-logged-in', message: 'Not logged in — run `yolo-bridge login` first.' };
+  // Still a real precondition, but no longer the credential: `auth.json` is
+  // what makes this a set-up machine at all, and its absence has a much better
+  // remedy to offer than a 403 would.
+  if (!loadAuth(deps.env, deps.io)) {
+    return { ok: false, reason: 'not-logged-in', message: 'Not logged in — run `yolo-bridge login` first.' };
+  }
 
   const attachment = loadAttachment(deps.env, deps.io);
   if (!attachment) return { ok: false, reason: 'not-attached', message: 'No active attachment found.' };
 
+  // READ THE CREDENTIAL BEFORE ANY CLEARING BELOW. `DELETE .../attach/:id` is a
+  // daemon-only route behind Boundary B (card 09): an account token is refused
+  // there with 403 YOLOBRIDGE_SCOPED_TOKEN_REQUIRED, so this command must
+  // present the workspace-scoped credential `attach` persisted alongside the
+  // attachment identity — the same one the running daemon uses.
+  const scopedToken = attachment.scopedToken;
+  if (!scopedToken) {
+    // No credential the daemon surface will accept, and nothing on this machine
+    // can mint one for an attachment that already exists. Say so plainly rather
+    // than sending an account token to be refused: the operator's real remedy
+    // is to let the tile go stale on its own (the server stops it once the
+    // heartbeat lapses) or to re-attach.
+    return {
+      ok: false,
+      reason: 'error',
+      message:
+        'No workspace-scoped credential is stored for this attachment, so it cannot be '
+        + 'detached from this machine. The tile stops on its own once its heartbeat lapses; '
+        + 'run `yolo-bridge attach` to reconnect.',
+    };
+  }
+
   try {
     await apiDetach(
-      { commonApiBaseUrl: deps.commonApiBaseUrl, accessToken: auth.accessToken, fetchImpl: deps.fetchImpl },
+      { commonApiBaseUrl: deps.commonApiBaseUrl, accessToken: scopedToken, fetchImpl: deps.fetchImpl },
       attachment.workspaceId,
       attachment.attachmentId,
     );
   } catch (err) {
     // The attachment RECORD is deliberately kept on a genuine failure so the
-    // retry path knows what to retry against — but the workspace-scoped
-    // credential stored alongside it is not part of that retry (this command
-    // authenticates the DELETE with the account token) and the server refuses
-    // it the moment the attachment stops being live. Keeping it would leave a
-    // dead credential sitting in a file whose only remaining risk is being
-    // read by someone else. Card 08.
+    // retry path knows what to retry against — but the stored credential is
+    // stripped, per card 08: the server refuses it the moment the attachment
+    // stops being live, so what is left is residue that can only be leaked.
+    //
+    // KNOWN CONSEQUENCE of card 09 layering on top of that, not silently
+    // absorbed: the credential is now what authenticates the retry too, so
+    // stripping it here means a second `yolo-bridge detach` takes the
+    // no-credential branch above instead of retrying. The record still tells
+    // `status` what happened, and the server still reaps the attachment on
+    // heartbeat lapse, so nothing is stranded that would not have been —
+    // but D5's "the retry path authenticates with the account token" is no
+    // longer true and is recorded as such in D6.
     clearStoredScopedToken(deps.env, deps.io);
     return { ok: false, reason: 'error', message: err instanceof Error ? err.message : String(err) };
   }

@@ -89,7 +89,7 @@ describe('attach — host handshake', () => {
     const fetchImpl = (async (url: any, init?: any) => {
       seenUrl = String(url);
       seenBody = JSON.parse(init.body);
-      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1', scopedToken: 's1', scopedTokenExpiresAt: 1_800_003_600_000 });
     }) as any;
 
     const result = await attach({ ...CFG_BASE, fetchImpl }, 'w1', 'my-laptop', {
@@ -103,14 +103,19 @@ describe('attach — host handshake', () => {
       hostLabel: 'my-laptop',
       remoteHost: { cwd: '/home/dev/proj', platform: 'linux', agent: 'claude' },
     });
-    assert.deepEqual(result, { tileId: 't1', attachmentId: 'a1' });
+    assert.deepEqual(result, {
+      tileId: 't1',
+      attachmentId: 'a1',
+      scopedToken: 's1',
+      scopedTokenExpiresAt: 1_800_003_600_000,
+    });
   });
 
   it('omits remoteHost entirely when it carries nothing — an empty object would be indistinguishable from an older daemon', async () => {
     let seenBody: any;
     const fetchImpl = (async (_url: any, init?: any) => {
       seenBody = JSON.parse(init.body);
-      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1', scopedToken: 's1', scopedTokenExpiresAt: 1_800_003_600_000 });
     }) as any;
 
     await attach({ ...CFG_BASE, fetchImpl }, 'w1', 'my-laptop', {});
@@ -122,11 +127,61 @@ describe('attach — host handshake', () => {
     let seenBody: any;
     const fetchImpl = (async (_url: any, init?: any) => {
       seenBody = JSON.parse(init.body);
-      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1', scopedToken: 's1', scopedTokenExpiresAt: 1_800_003_600_000 });
     }) as any;
 
     await attach({ ...CFG_BASE, fetchImpl }, 'w1');
 
     assert.deepEqual(seenBody, {});
+  });
+});
+
+describe('attach — the workspace-scoped credential is MANDATORY (card 09)', () => {
+  it('returns the scoped pair verbatim when the server issues one', async () => {
+    let called = 0;
+    const fetchImpl = (async () => {
+      called += 1;
+      return jsonResponse(201, {
+        tileId: 't1',
+        attachmentId: 'a1',
+        scopedToken: 'scoped.jwt',
+        scopedTokenExpiresAt: 1_800_003_600_000,
+      });
+    }) as any;
+
+    const result = await attach({ ...CFG_BASE, fetchImpl }, 'w1');
+    assert.equal(called, 1, 'sanity: the request really was made');
+    assert.equal(result.scopedToken, 'scoped.jwt');
+    assert.equal(result.scopedTokenExpiresAt, 1_800_003_600_000);
+  });
+
+  it('THROWS on a 201 carrying no scoped credential at all — the old degrade path is gone', async () => {
+    let called = 0;
+    const fetchImpl = (async () => {
+      called += 1;
+      return jsonResponse(201, { tileId: 't1', attachmentId: 'a1' });
+    }) as any;
+
+    await assert.rejects(
+      () => attach({ ...CFG_BASE, fetchImpl }, 'w1'),
+      (err: unknown) => {
+        assert.ok(err instanceof YoloBridgeApiError, `expected a YoloBridgeApiError, got ${String(err)}`);
+        assert.match(err.message, /no workspace-scoped credential/i);
+        return true;
+      },
+    );
+    assert.equal(called, 1, 'sanity: it failed on the RESPONSE, not before sending the request');
+  });
+
+  it('THROWS on a half-pair (token, no expiry) — unschedulable is as useless as absent', async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(201, { tileId: 't1', attachmentId: 'a1', scopedToken: 'scoped.jwt' })) as any;
+    await assert.rejects(() => attach({ ...CFG_BASE, fetchImpl }, 'w1'), YoloBridgeApiError);
+  });
+
+  it('THROWS on a half-pair (expiry, no token)', async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(201, { tileId: 't1', attachmentId: 'a1', scopedTokenExpiresAt: 1_800_003_600_000 })) as any;
+    await assert.rejects(() => attach({ ...CFG_BASE, fetchImpl }, 'w1'), YoloBridgeApiError);
   });
 });

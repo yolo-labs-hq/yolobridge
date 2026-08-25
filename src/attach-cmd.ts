@@ -246,29 +246,36 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const scopedCredential: { token?: string; expiresAtMs?: number; refreshAtMs?: number } = {};
 
   /**
-   * Write `auth.json` back, WITHOUT the account refresh token once a scoped
-   * credential exists (card 08).
+   * Write `auth.json` back, NEVER with the account refresh token (cards 08+09).
    *
-   * The conditional is the whole card. On the scoped path the account
-   * credential is dead weight the moment `attach` returns, so the durable key
-   * to the entire account has no business surviving on disk — a leaked
-   * `auth.json` should be worth, at worst, an access token that expires on its
-   * own. But on the DEGRADED path (a common-api predating the mint issued no
-   * scoped token), `scopedCfg()` falls back to the account token and the daemon
-   * runs the whole session on it, so `ensureFreshToken` — and therefore the
-   * refresh token — is still load-bearing. Dropping it there bricks the daemon
-   * roughly 24h later with a 401 that points nowhere near the cause.
+   * The access token expires on its own; the REFRESH token is the durable key
+   * to the whole account, and this daemon does not need it on disk to do its
+   * job. Once `attach` has exchanged it for a workspace-scoped credential the
+   * daemon's entire YoloBridge traffic runs on that instead, so a leaked
+   * `auth.json` should be worth at worst a self-expiring access token.
+   *
+   * UNCONDITIONAL since 0.7.0. Card 08 made the drop conditional on a scoped
+   * token being in hand, to protect the DEGRADED path — a common-api predating
+   * the mint, where `scopedCfg()` fell back to the account token and the daemon
+   * ran the whole session on it. Boundary B deleted that path: an account token
+   * is now refused on every post-attach route, so there is no session left for
+   * the refresh token to be load-bearing in, and `runAttachDaemon` fails at
+   * attach rather than continuing without a scoped credential.
+   *
+   * ONE CONSEQUENCE, ACCEPTED AND NOT HIDDEN: the pre-attach
+   * `ensureFreshToken()` call also writes through here, so a rotation that
+   * happens moments BEFORE a failed attach drops the refresh token without an
+   * exchange ever completing. The operator keeps a ~24h access token and must
+   * `yolo-bridge login` again after that. Narrow (it needs a near-expiry token
+   * AND a failing attach in the same run) and it errs toward less crown-jewel
+   * material on disk, which is the direction this work exists to push.
    *
    * Every `auth.json` write in this file goes through here rather than calling
    * `saveAuth` directly, so an account rotation cannot quietly re-persist the
    * very token the attach exchange just dropped.
    */
   function persistAccountAuth(): void {
-    saveAuth(
-      scopedCredential.token ? { ...currentAuth, refreshToken: undefined } : currentAuth,
-      env,
-      io,
-    );
+    saveAuth({ ...currentAuth, refreshToken: undefined }, env, io);
   }
 
   /**
@@ -301,16 +308,23 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * in its own holder that `ensureFreshToken` has no reference to, the revert
    * is structurally impossible rather than merely avoided.
    *
-   * The account fallback is read LIVE, not snapshotted: when no scoped token
-   * exists (a common-api predating the mint), a snapshot taken at attach time
-   * would go stale after an account rotation and start 401-ing.
+   * NO ACCOUNT FALLBACK, since 0.7.0 (card 09). It used to read
+   * `?? currentAuth.accessToken` so a daemon talking to a common-api predating
+   * the mint could still work. Boundary B refuses an account token on every
+   * route this config is used for, so the fallback can no longer produce a
+   * working call — it can only convert one legible failure at attach into an
+   * unexplained 403 on every heartbeat for the rest of the session. The daemon
+   * stops at attach instead (see the `scopedCredential.token` check below), so
+   * by the time anything calls this a scoped token is always in hand; the throw
+   * is a structural backstop for a future caller that reorders that, not a
+   * reachable path today.
    */
   function scopedCfg(): apiClient.ApiClientConfig {
-    return {
-      commonApiBaseUrl,
-      accessToken: scopedCredential.token ?? currentAuth.accessToken,
-      fetchImpl,
-    };
+    const accessToken = scopedCredential.token;
+    if (!accessToken) {
+      throw new Error('internal: scopedCfg() called before a workspace-scoped credential was obtained');
+    }
+    return { commonApiBaseUrl, accessToken, fetchImpl };
   }
 
   // Declared up here (rather than at their first assignment below) purely
@@ -425,33 +439,33 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   let accountRefreshAbandoned = false;
 
   /**
-   * `ensureFreshToken`, with the failure classified by whether the account
-   * token is still load-bearing.
+   * `ensureFreshToken`, downgraded from fatal to best-effort.
    *
-   * On the DEGRADED path (no scoped credential — an old common-api) the account
-   * token IS the daemon's credential, so a failed refresh is terminal and must
-   * stop the loop with the `yolo-bridge login` remedy, exactly as before.
+   * Nothing in this daemon's YoloBridge traffic uses the account token past
+   * attach, so killing a perfectly healthy session because it could not be
+   * rotated would be a self-inflicted brick. The rotation is kept running — it
+   * is not dead code: `onAttached` hands `getAccessToken` to the local MCP
+   * proxy, whose delegated-token mints are still account-authenticated (see
+   * mcp-proxy.ts) — but a failure DEGRADES that one enhancement rather than
+   * ending the session, and latches so the heartbeat tick stops retrying a call
+   * that cannot start working again.
    *
-   * On the SCOPED path nothing in this daemon's YoloBridge traffic uses the
-   * account token any more, so killing a perfectly healthy session because it
-   * could not be rotated would be a self-inflicted brick. The rotation is kept
-   * running (it is not dead code: `onAttached` hands `getAccessToken` to the
-   * local MCP proxy, whose delegated-token mints are still account-
-   * authenticated — see mcp-proxy.ts) but a failure DEGRADES that one
-   * enhancement rather than ending the session.
+   * Card 08 classified this failure by whether a scoped credential existed,
+   * because on the degraded path the account token WAS the daemon's credential
+   * and a failed refresh had to be terminal. Card 09 removed that path
+   * entirely: `runAttachDaemon` never reaches this loop without a scoped
+   * credential, so the classification had exactly one branch left.
    *
    * Deliberately silent when it degrades. `noteConnection('degraded')` means
    * "the LINK is struggling" and, being the last event recorded, would leave
    * `yolo-bridge status` reporting a healthy session as degraded for the rest
-   * of its life — the same trap the unscoped-attach notice avoids. The one
-   * consumer, MCP minting, already reports its own failures, and best-effort
-   * MCP is its documented contract.
+   * of its life. The one consumer, MCP minting, already reports its own
+   * failures, and best-effort MCP is its documented contract.
    */
   async function ensureFreshAccountToken(): Promise<{ ok: true } | { ok: false; message: string }> {
     if (accountRefreshAbandoned) return { ok: true };
     const outcome = await ensureFreshToken();
     if (outcome.ok) return outcome;
-    if (!scopedCredential.token) return outcome;
     accountRefreshAbandoned = true;
     return { ok: true };
   }
@@ -498,10 +512,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * retry is immediate rather than deferred another 45 minutes).
    */
   function ensureFreshScopedToken(): Promise<ScopedRefreshOutcome> {
-    // No scoped credential at all: a common-api predating the mint. Nothing to
-    // renew, and nothing to fail — the account-token degrade already reported
-    // itself once, pre-spawn.
     if (scopedRefreshTerminal) return Promise.resolve(scopedRefreshTerminal);
+    // Unreachable in this loop — `rememberScopedCredential` sets all three
+    // fields together and the daemon refuses to start without them (card 09).
+    // Kept as the type-level narrowing `scopedCredential.refreshAtMs` needs
+    // below, not as a live degrade branch.
     if (!scopedCredential.token || scopedCredential.refreshAtMs === undefined) {
       return Promise.resolve({ ok: true });
     }
@@ -618,16 +633,28 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       attachmentId = result.attachmentId;
       tileId = result.tileId;
       attachedAt = new Date().toISOString();
-      // `api-client` validates both-or-neither, so a half-pair never arrives
-      // here — narrowed on both anyway rather than asserted away, since a
-      // non-null assertion is exactly the kind of hidden mismatch this file's
-      // credential separation exists to make impossible.
-      if (result.scopedToken !== undefined && result.scopedTokenExpiresAt !== undefined) {
-        rememberScopedCredential(result.scopedToken, result.scopedTokenExpiresAt);
-      }
+      // `api-client.attach` now REQUIRES the scoped pair and throws on its
+      // absence (card 09), so this is a plain read rather than the narrowing
+      // the optional shape used to need. A server that issues no credential
+      // lands in the catch below, as an attach failure with its own message.
+      rememberScopedCredential(result.scopedToken, result.scopedTokenExpiresAt);
     } catch (err) {
       return { ok: false, reason: 'attach-failed', message: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  // Belt and braces for the property everything after this point depends on:
+  // BOTH routes into this line (a fresh attach, and the resume branch above)
+  // set the scoped credential or fail, so this cannot fire today. It exists so
+  // that if a third route is ever added, the daemon stops HERE — with a message
+  // an operator can act on, while they are still watching the terminal — rather
+  // than proceeding to 403 on every daemon call for the rest of the session.
+  if (!scopedCredential.token) {
+    const message =
+      'this attach produced no workspace-scoped credential, so the daemon has nothing '
+      + 'the YoloBridge routes will accept';
+    log(message);
+    return { ok: false, reason: 'attach-failed', message };
   }
 
   persistAttachment();
@@ -643,19 +670,6 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   // agent, so nothing owns the screen yet (and the caller's `clearScreen()`
   // wipes it moments later anyway).
   log(`${resumed ? 'Resumed' : 'Attached'}. tileId=${tileId} attachmentId=${attachmentId}`);
-  if (!scopedCredential.token) {
-    // A common-api predating the scoped-credential mint. Degrade, don't brick:
-    // this daemon binary may sit on a laptop for months and cannot require a
-    // server capability that did not exist when it was installed.
-    //
-    // Reported on stdout HERE, and deliberately not through `noteConnection`:
-    // this is a property of the whole session, not a connection state, and
-    // `degraded` in that vocabulary means the LINK is struggling. Emitting it
-    // there would make `yolo-bridge status` show a perfectly healthy session as
-    // degraded for its entire life. Same stdout-safety as the line above — this
-    // is still before `onAttached` spawns the agent, so nothing owns the screen.
-    log('Note: this server issued no workspace-scoped credential; continuing on the account token.');
-  }
   noteConnection('connecting');
 
   // Codex-found race: if something already asked us to stop WHILE the

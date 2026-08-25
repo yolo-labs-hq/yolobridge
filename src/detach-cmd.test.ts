@@ -8,6 +8,21 @@ const ATTACHMENT_FILE = '/home/yolo/.config/yolobridge/attachment.json';
 
 const ENV = { HOME: '/home/yolo' };
 
+/**
+ * The attachment record a real `yolo-bridge attach` leaves behind since card
+ * 08 — identity PLUS the workspace-scoped credential. Card 09 made the second
+ * half load-bearing for this command: `DELETE .../attach/:id` is a daemon-only
+ * route behind Boundary B, so the account token no longer works there.
+ */
+const SCOPED_ATTACHMENT = {
+  workspaceId: 'w1',
+  tileId: 't1',
+  attachmentId: 'a1',
+  attachedAt: 'x',
+  scopedToken: 'scoped-tok',
+  scopedTokenExpiresAtMs: 2,
+};
+
 function fakeIO(): ConfigStoreIO & { files: Map<string, string> } {
   const files = new Map<string, string>();
   return {
@@ -26,7 +41,7 @@ describe('runDetach', () => {
   it('calls DELETE with the stored attachment and clears local state', async () => {
     const io = fakeIO();
     saveAuth({ accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 1 }, ENV, io);
-    saveAttachment({ workspaceId: 'w1', tileId: 't1', attachmentId: 'a1', attachedAt: 'x' }, ENV, io);
+    saveAttachment(SCOPED_ATTACHMENT, ENV, io);
 
     let sawDelete = false;
     const fetchImpl = (async (url: any, init?: any) => {
@@ -41,6 +56,45 @@ describe('runDetach', () => {
     assert.deepEqual(result, { ok: true });
     assert.equal(sawDelete, true);
     assert.equal(loadAttachment(ENV, io), undefined);
+  });
+
+  it('authenticates the DELETE with the WORKSPACE-SCOPED credential, never the account token (card 09)', async () => {
+    // Boundary B refuses an account token on this route, so sending one is not
+    // a style preference — it is a 403 and a tile left pointing at a dead
+    // daemon. The account token is deliberately a DIFFERENT string here so the
+    // assertion cannot pass by coincidence.
+    const io = fakeIO();
+    saveAuth({ accessToken: 'account-at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 1 }, ENV, io);
+    saveAttachment(SCOPED_ATTACHMENT, ENV, io);
+
+    const auths: string[] = [];
+    const fetchImpl = (async (_url: any, init?: any) => {
+      auths.push(String(init?.headers?.Authorization ?? ''));
+      return new Response(null, { status: 204 });
+    }) as any;
+
+    const result = await runDetach({ commonApiBaseUrl: 'https://api.example.com', env: ENV, io, fetchImpl });
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(auths, ['Bearer scoped-tok'], `expected the scoped credential, saw ${auths.join(', ')}`);
+  });
+
+  it('refuses to send anything when no scoped credential is stored, rather than presenting a token the server will reject', async () => {
+    const io = fakeIO();
+    saveAuth({ accessToken: 'account-at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 1 }, ENV, io);
+    saveAttachment({ workspaceId: 'w1', tileId: 't1', attachmentId: 'a1', attachedAt: 'x' }, ENV, io);
+
+    let calls = 0;
+    const fetchImpl = (async () => { calls += 1; return new Response(null, { status: 204 }); }) as any;
+
+    const result = await runDetach({ commonApiBaseUrl: 'https://api.example.com', env: ENV, io, fetchImpl });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.reason, 'error');
+      assert.match(result.message, /No workspace-scoped credential/i);
+    }
+    assert.equal(calls, 0, 'no request may be sent — an account token would only be refused');
+    // The record survives, so `status` still reports what this machine believes.
+    assert.equal(loadAttachment(ENV, io)?.attachmentId, 'a1');
   });
 
   it('fails fast when not logged in', async () => {
@@ -128,7 +182,7 @@ describe('runDetach', () => {
   it('treats a 404 (already detached server-side) as success', async () => {
     const io = fakeIO();
     saveAuth({ accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 1 }, ENV, io);
-    saveAttachment({ workspaceId: 'w1', tileId: 't1', attachmentId: 'a1', attachedAt: 'x' }, ENV, io);
+    saveAttachment(SCOPED_ATTACHMENT, ENV, io);
     const fetchImpl = (async () => jsonResponse(404, { error: 'Attachment not found', code: 'NOT_FOUND' })) as any;
     const result = await runDetach({ commonApiBaseUrl: 'https://api.example.com', env: ENV, io, fetchImpl });
     assert.deepEqual(result, { ok: true });

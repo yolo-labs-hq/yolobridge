@@ -71,12 +71,16 @@ export interface RemoteHostInfo {
  * the full-account token. `scopedTokenExpiresAt` is absolute epoch-ms computed
  * server-side at mint, so the refresh schedule never requires decoding the JWT.
  *
- * OPTIONAL, deliberately. This client is the FROZEN side of the seam — a daemon
- * binary sits on someone's laptop for months — so a build that talks to a
- * common-api predating the mint must degrade, not throw on shape validation.
- * The enforcement that makes the scoped token mandatory is server-side
- * (Boundary B), where it can actually be reasoned about; a hard client-side
- * requirement here would only turn an old server into a mystery attach failure.
+ * REQUIRED since 0.7.0 (card 09, D6 — "no backwards support"). Both fields or
+ * neither is still the rule; what changed is that "neither" is now an ERROR
+ * rather than a degrade. This used to be optional to protect a daemon binary
+ * frozen on a laptop against a common-api predating the mint — but Boundary B
+ * now refuses an account token on every post-attach route, so a daemon that
+ * attaches without a scoped credential cannot do anything afterwards. Accepting
+ * the response would buy it exactly one successful call and then a 403 loop
+ * with no diagnosis; failing here names the real problem at the one moment the
+ * operator is still watching the terminal.
+ *
  * Every other exported function's signature is unchanged: they still take "the
  * bearer token to send" via `ApiClientConfig`, and which token that is remains
  * the caller's decision.
@@ -89,8 +93,8 @@ export async function attach(
 ): Promise<{
   tileId: string;
   attachmentId: string;
-  scopedToken?: string;
-  scopedTokenExpiresAt?: number;
+  scopedToken: string;
+  scopedTokenExpiresAt: number;
 }> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const res = await fetchImpl(`${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach`, {
@@ -109,14 +113,22 @@ export async function attach(
   if (typeof body?.tileId !== 'string' || typeof body?.attachmentId !== 'string') {
     throw new YoloBridgeApiError('attach returned an unexpected shape', res.status);
   }
-  // Both-or-neither: a token with no expiry cannot be refreshed on time, and an
-  // expiry with no token is nothing. Carrying half of the pair forward would
-  // hand the caller a credential it cannot schedule around.
-  const scoped =
-    typeof body?.scopedToken === 'string' && typeof body?.scopedTokenExpiresAt === 'number'
-      ? { scopedToken: body.scopedToken as string, scopedTokenExpiresAt: body.scopedTokenExpiresAt as number }
-      : {};
-  return { tileId: body.tileId, attachmentId: body.attachmentId, ...scoped };
+  // Both-or-neither, and "neither" is a failure (see the doc comment). A token
+  // with no expiry cannot be renewed on time and an expiry with no token is
+  // nothing, so a half-pair is refused by the same check — there is no shape
+  // here that yields a usable-but-unschedulable credential.
+  if (typeof body?.scopedToken !== 'string' || typeof body?.scopedTokenExpiresAt !== 'number') {
+    throw new YoloBridgeApiError(
+      'attach returned no workspace-scoped credential — this server cannot host a YoloBridge daemon',
+      res.status,
+    );
+  }
+  return {
+    tileId: body.tileId,
+    attachmentId: body.attachmentId,
+    scopedToken: body.scopedToken as string,
+    scopedTokenExpiresAt: body.scopedTokenExpiresAt as number,
+  };
 }
 
 /**
@@ -201,6 +213,16 @@ export async function listSelectableWorkspaces(cfg: ApiClientConfig): Promise<Se
   return workspaces;
 }
 
+/**
+ * `DELETE /v1/workspaces/:workspaceId/yolobridge/attach/:attachmentId`.
+ *
+ * `cfg.accessToken` must be the WORKSPACE-SCOPED credential, not the account
+ * token: this is one of the daemon-only routes Boundary B guards, and an
+ * account token is refused there with 403 YOLOBRIDGE_SCOPED_TOKEN_REQUIRED
+ * (card 09). Both callers comply — the daemon's own cleanup path via
+ * `scopedCfg()`, and standalone `yolo-bridge detach` via the credential
+ * `attachment.json` persisted at attach.
+ */
 export async function detach(cfg: ApiClientConfig, workspaceId: string, attachmentId: string): Promise<void> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const res = await fetchImpl(`${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}`, {
