@@ -225,7 +225,8 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   // round 27) — see local-mcp-config.ts's identical fix for why.
   // `?? path` (Codex review, 2026-08-24, round 31) — see
   // local-mcp-config.ts's identical fix for why.
-  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(path) ?? path)}.tmp-*`);
+  const resolvedSettingsPath = resolveWriteTarget(path) ?? path;
+  ensureTempSiblingExcluded(cwd, dirname(resolvedSettingsPath), `${basename(resolvedSettingsPath)}.tmp-*`);
   const createdFile = !existsSync(path);
   let settings: Record<string, unknown>;
   try {

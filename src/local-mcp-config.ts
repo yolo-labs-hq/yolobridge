@@ -32,7 +32,7 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync, linkSync, renameSync, statSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { uptime } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
@@ -650,8 +650,10 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   // THROW instead of creating anything at all (see its own doc comment) —
   // nothing will exist to need excluding either way, so the lexical path
   // is a harmless fallback here.
-  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(path) ?? path)}.tmp-*`);
-  ensureTempSiblingExcluded(cwd, `${basename(resolveWriteTarget(sidecarPath(cwd)) ?? sidecarPath(cwd))}.tmp-*`);
+  const resolvedMcpJsonPath = resolveWriteTarget(path) ?? path;
+  const resolvedSidecarPath = resolveWriteTarget(sidecarPath(cwd)) ?? sidecarPath(cwd);
+  ensureTempSiblingExcluded(cwd, dirname(resolvedMcpJsonPath), `${basename(resolvedMcpJsonPath)}.tmp-*`);
+  ensureTempSiblingExcluded(cwd, dirname(resolvedSidecarPath), `${basename(resolvedSidecarPath)}.tmp-*`);
   // The LOCK ITSELF (and its own `.claim-*`/`.reclaim-*` ephemeral siblings,
   // round 26/27) got NONE of this treatment before round 28 — reasoned at
   // the time that it "only exists for the duration of a single synchronous
@@ -668,9 +670,9 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   // the lock's exact name (and its own ephemeral siblings) actually
   // git-ignored, the same way the temp-sibling gap was closed, needs no
   // such refusal at all.
-  ensureTempSiblingExcluded(cwd, basename(lockPath(cwd)));
-  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.claim-*`);
-  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.reclaim-*`);
+  ensureTempSiblingExcluded(cwd, dirname(lockPath(cwd)), basename(lockPath(cwd)));
+  ensureTempSiblingExcluded(cwd, dirname(lockPath(cwd)), `${basename(lockPath(cwd))}.claim-*`);
+  ensureTempSiblingExcluded(cwd, dirname(lockPath(cwd)), `${basename(lockPath(cwd))}.reclaim-*`);
   // Serializes the whole read-check-write sequence below across PROCESSES,
   // not just within one (Codex review, 2026-08-24, round 20) — see
   // `acquireConfigLock`'s doc comment for the race this closes.
@@ -824,9 +826,9 @@ export function removeLocalMcpConfig(cwd: string, expectedProxyUrl: string, crea
   // — a repo where `writeLocalMcpConfig` already succeeded once already has
   // these patterns; this only matters for the (unlikely but possible) case
   // where this lock gets created for the very first time via a detach path.
-  ensureTempSiblingExcluded(cwd, basename(lockPath(cwd)));
-  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.claim-*`);
-  ensureTempSiblingExcluded(cwd, `${basename(lockPath(cwd))}.reclaim-*`);
+  ensureTempSiblingExcluded(cwd, dirname(lockPath(cwd)), basename(lockPath(cwd)));
+  ensureTempSiblingExcluded(cwd, dirname(lockPath(cwd)), `${basename(lockPath(cwd))}.claim-*`);
+  ensureTempSiblingExcluded(cwd, dirname(lockPath(cwd)), `${basename(lockPath(cwd))}.reclaim-*`);
   // Same cross-process lock `writeLocalMcpConfig` takes (Codex review,
   // 2026-08-24, round 20) — a concurrent attach's read-check-write could
   // otherwise interleave with this read-modify-write of the same file. A

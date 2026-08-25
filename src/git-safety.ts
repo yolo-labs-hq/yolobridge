@@ -11,9 +11,9 @@
  * check (Codex review, 2026-08-24, rounds 15 and 16).
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join, isAbsolute } from 'node:path';
-import { resolveWriteTarget } from './atomic-write.js';
+import { existsSync, readFileSync, mkdirSync } from 'node:fs';
+import { dirname, join, isAbsolute, relative, sep } from 'node:path';
+import { atomicWriteFileSync, resolveWriteTarget } from './atomic-write.js';
 
 /**
  * True only when `git check-ignore` DEFINITIVELY confirms `path` is NOT
@@ -87,19 +87,49 @@ function isConfirmedNotIgnored(cwd: string, path: string): boolean {
  * `.gitignore` itself uses under the hood — closes the gap without that
  * regression.
  *
- * `pattern` is the LITERAL exclude-file line to add (a plain name, or a
- * `*`-glob — round 28 generalized this from always appending `.tmp-*` onto
- * a passed-in basename, since `acquireConfigLock`'s own siblings don't fit
- * that one fixed shape).
+ * `patternBasename` is the LITERAL exclude-file basename to add (a plain
+ * name, or a `*`-glob — round 28 generalized this from always appending
+ * `.tmp-*` onto a passed-in basename, since `acquireConfigLock`'s own
+ * siblings don't fit that one fixed shape). `destDir` is the absolute
+ * directory `patternBasename` lives in.
+ *
+ * Anchored to `destDir`, relative to the repo's working-tree root (Codex
+ * review, 2026-08-25, round 32) — a bare basename pattern with no `/` in it
+ * (what this function wrote through round 31) matches that basename in
+ * EVERY directory of the repo, not just the one the caller actually writes
+ * to: running `attach` in one monorepo package permanently hid a
+ * same-shaped file in every OTHER package too (e.g. an operator's own
+ * `.mcp.json.tmp-backup` sitting in an unrelated package now matches the
+ * trailing `*` and vanishes from `git status`). A leading `/` makes a
+ * `.git/info/exclude` pattern match only at the given path from the
+ * worktree root, the same anchoring a `/`-prefixed line in a root
+ * `.gitignore` gets.
  *
  * Best-effort and silent on any failure (no `.git` dir, a worktree/
  * submodule shape `git rev-parse` can't resolve cleanly, a read-only
- * `.git`): degrades to "only the destination's own git-ignore status is
- * checked," exactly the pre-round-25 behavior — never blocks the write
- * itself over this.
+ * `.git`, `destDir` outside the working tree entirely): degrades to "only
+ * the destination's own git-ignore status is checked," exactly the
+ * pre-round-25 behavior — never blocks the write itself over this.
+ *
+ * Writes via `atomicWriteFileSync` (Codex review, 2026-08-25, round 32),
+ * not a direct `writeFileSync` — this file routinely already holds an
+ * operator's OWN local excludes, so a truncate-then-write that gets cut off
+ * by ENOSPC/SIGKILL mid-write used to leave it partial or empty, silently
+ * un-hiding whatever the operator had excluded before. Write-to-temp then
+ * rename means the original content survives any failure up to the rename
+ * itself.
  */
-export function ensureTempSiblingExcluded(cwd: string, pattern: string): void {
+export function ensureTempSiblingExcluded(cwd: string, destDir: string, patternBasename: string): void {
   try {
+    const topLevelResult = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf-8' });
+    if (topLevelResult.status !== 0) return;
+    const topLevel = topLevelResult.stdout.trim();
+    if (!topLevel) return;
+    const relDir = relative(topLevel, destDir);
+    if (relDir.startsWith('..') || isAbsolute(relDir)) return; // `destDir` isn't inside this working tree at all.
+    const relDirPosix = relDir.split(sep).join('/');
+    const pattern = relDirPosix ? `/${relDirPosix}/${patternBasename}` : `/${patternBasename}`;
+
     const gitDirResult = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd, encoding: 'utf-8' });
     if (gitDirResult.status !== 0) return;
     const gitDir = gitDirResult.stdout.trim();
@@ -109,7 +139,7 @@ export function ensureTempSiblingExcluded(cwd: string, pattern: string): void {
     if (existing.split('\n').some((line) => line.trim() === pattern)) return; // Already present.
     mkdirSync(dirname(excludePath), { recursive: true });
     const withTrailingNewline = existing.length > 0 && !existing.endsWith('\n') ? `${existing}\n` : existing;
-    writeFileSync(excludePath, `${withTrailingNewline}${pattern}\n`);
+    atomicWriteFileSync(excludePath, `${withTrailingNewline}${pattern}\n`);
   } catch {
     // Best-effort — see doc comment above.
   }

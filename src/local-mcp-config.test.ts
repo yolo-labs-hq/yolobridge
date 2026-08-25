@@ -728,11 +728,11 @@ describe('removeLocalMcpConfig', () => {
 
     const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
     assert.ok(
-      excludeContent.split('\n').some((line) => line.trim() === 'differently-named.json.tmp-*'),
+      excludeContent.split('\n').some((line) => line.trim() === '/differently-named.json.tmp-*'),
       `expected the RESOLVED target's temp pattern in .git/info/exclude, got: ${excludeContent}`,
     );
     assert.ok(
-      !excludeContent.split('\n').some((line) => line.trim() === '.mcp.json.tmp-*'),
+      !excludeContent.split('\n').some((line) => line.trim() === '/.mcp.json.tmp-*'),
       "the symlink's OWN basename must not be what gets excluded -- that temp filename is never actually created",
     );
   });
@@ -754,8 +754,8 @@ describe('removeLocalMcpConfig', () => {
 
     const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
     const lines = excludeContent.split('\n').map((l) => l.trim());
-    assert.ok(lines.includes('.yolobridge-mcp-state.json.lock'), `expected the lock's own exact name in .git/info/exclude, got: ${excludeContent}`);
-    assert.ok(lines.includes('.yolobridge-mcp-state.json.lock.claim-*'), `expected the claim-temp pattern in .git/info/exclude, got: ${excludeContent}`);
-    assert.ok(lines.includes('.yolobridge-mcp-state.json.lock.reclaim-*'), `expected the reclaim-temp pattern in .git/info/exclude, got: ${excludeContent}`);
+    assert.ok(lines.includes('/.yolobridge-mcp-state.json.lock'), `expected the lock's own exact name in .git/info/exclude, got: ${excludeContent}`);
+    assert.ok(lines.includes('/.yolobridge-mcp-state.json.lock.claim-*'), `expected the claim-temp pattern in .git/info/exclude, got: ${excludeContent}`);
+    assert.ok(lines.includes('/.yolobridge-mcp-state.json.lock.reclaim-*'), `expected the reclaim-temp pattern in .git/info/exclude, got: ${excludeContent}`);
   });
 });

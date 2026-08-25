@@ -157,17 +157,17 @@ describe('ensureTempSiblingExcluded', () => {
     writeFileSync(tempSibling, '{}');
     assert.equal(riskyToCommit(dir, tempSibling), true, 'sanity check: the temp sibling name is NOT covered before the fix runs');
 
-    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
+    ensureTempSiblingExcluded(dir, dir, '.mcp.json.tmp-*');
 
     assert.equal(riskyToCommit(dir, tempSibling), false, 'the temp sibling must now be confirmed git-ignored');
   });
 
   it('is idempotent — calling it twice does not duplicate the exclude line', () => {
     initGitRepo();
-    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
-    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
+    ensureTempSiblingExcluded(dir, dir, '.mcp.json.tmp-*');
+    ensureTempSiblingExcluded(dir, dir, '.mcp.json.tmp-*');
     const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
-    const occurrences = excludeContent.split('\n').filter((line) => line.trim() === '.mcp.json.tmp-*').length;
+    const occurrences = excludeContent.split('\n').filter((line) => line.trim() === '/.mcp.json.tmp-*').length;
     assert.equal(occurrences, 1);
   });
 
@@ -176,15 +176,33 @@ describe('ensureTempSiblingExcluded', () => {
     mkdirSync(join(dir, '.git', 'info'), { recursive: true });
     writeFileSync(join(dir, '.git', 'info', 'exclude'), '# operator-authored line\nsome-other-pattern\n');
 
-    ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*');
+    ensureTempSiblingExcluded(dir, dir, '.mcp.json.tmp-*');
 
     const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
     assert.ok(excludeContent.includes('# operator-authored line'));
     assert.ok(excludeContent.includes('some-other-pattern'));
-    assert.ok(excludeContent.includes('.mcp.json.tmp-*'));
+    assert.ok(excludeContent.includes('/.mcp.json.tmp-*'));
   });
 
   it('is a silent no-op outside a git repo entirely', () => {
-    assert.doesNotThrow(() => ensureTempSiblingExcluded(dir, '.mcp.json.tmp-*'));
+    assert.doesNotThrow(() => ensureTempSiblingExcluded(dir, dir, '.mcp.json.tmp-*'));
+  });
+
+  it('anchors the pattern to destDir — does not hide a same-shaped file in an unrelated sibling directory (Codex review, 2026-08-25, round 32)', () => {
+    initGitRepo();
+    mkdirSync(join(dir, 'packages', 'other-package'), { recursive: true });
+    writeFileSync(join(dir, '.gitignore'), '.mcp.json\n');
+    const unrelatedTempFile = join(dir, 'packages', 'other-package', '.mcp.json.tmp-backup');
+    writeFileSync(unrelatedTempFile, '{}');
+    assert.equal(riskyToCommit(dir, unrelatedTempFile), true, 'sanity check: the unrelated file is not covered before the call');
+
+    const ownedDir = join(dir, 'packages', 'my-package');
+    mkdirSync(ownedDir, { recursive: true });
+    ensureTempSiblingExcluded(dir, ownedDir, '.mcp.json.tmp-*');
+
+    assert.equal(riskyToCommit(dir, unrelatedTempFile), true, 'a same-shaped file in a DIFFERENT directory must stay uncovered — a repo-wide bare-basename pattern would wrongly hide it');
+
+    const excludeContent = readFileSync(join(dir, '.git', 'info', 'exclude'), 'utf-8');
+    assert.ok(excludeContent.includes('/packages/my-package/.mcp.json.tmp-*'), 'the written pattern must be anchored to the owning directory, not a bare basename');
   });
 });
