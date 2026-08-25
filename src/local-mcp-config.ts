@@ -31,7 +31,7 @@
  * a hard failure.
  */
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync, linkSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync, linkSync, renameSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { uptime } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -278,6 +278,32 @@ function parseLockContent(raw: string): { pid?: number; bootUptimeSec?: number }
 }
 
 
+/**
+ * Known, accepted residual race (Codex review, 2026-08-24, round 29):
+ * process A can peek a stale lock, pause, and by the time it resumes and
+ * renames `path` away, a DIFFERENT process has already run a full reclaim
+ * cycle and installed its OWN brand-new LIVE lock there. The inode recheck
+ * immediately before the rename (below) narrows this to a two-syscall gap
+ * but cannot close it entirely with pure POSIX primitives — if A's rename
+ * still lands on that live lock, A's fresh re-inspection correctly sees it
+ * as live and restores it (via `linkSync`, never a blind overwrite) rather
+ * than discarding it, since discarding would let a THIRD process enter the
+ * critical section concurrently with the still-running live holder — a
+ * safety violation, strictly worse than what this leaves: if the live
+ * holder's OWN release happens to run while A holds the lock claimed away
+ * (finding it already gone, a harmless no-op) and A then restores it, the
+ * restored lock can outlive its owner's own cleanup — a stuck lock,
+ * blocking every later config operation until that specific daemon process
+ * exits, not a data-corruption risk. Closing this fully would need
+ * OS-level advisory locking (`flock`, unavailable via Node's core `fs`) or
+ * a well-audited external dependency; disproportionate for a scenario this
+ * narrow (requires a live sibling attach, a stale-lock reclaim race
+ * against it, AND a scheduling pause landing in a two-syscall window, all
+ * at once) on a single local machine, matching this module's own
+ * established philosophy of narrowing rather than perfecting an
+ * astronomically rare edge case (see round 24's identical acceptance of
+ * the non-reboot pid-reuse case).
+ */
 function acquireConfigLock(cwd: string): (() => void) | null {
   const path = lockPath(cwd);
   const deadline = Date.now() + 2000;
@@ -298,9 +324,11 @@ function acquireConfigLock(cwd: string): (() => void) | null {
     // pointing at content that was ALREADY fully written beforehand —
     // there is no window where `path` exists with incomplete content at
     // all, from any process's point of view.
-    const claimTmpPath = `${path}.claim-${process.pid}-${randomBytes(4).toString('hex')}`;
+    const myPid = process.pid;
+    const myBootUptimeSec = uptime();
+    const claimTmpPath = `${path}.claim-${myPid}-${randomBytes(4).toString('hex')}`;
     try {
-      writeFileSync(claimTmpPath, JSON.stringify({ pid: process.pid, bootUptimeSec: uptime() }));
+      writeFileSync(claimTmpPath, JSON.stringify({ pid: myPid, bootUptimeSec: myBootUptimeSec }));
       try {
         linkSync(claimTmpPath, path);
       } finally {
@@ -315,18 +343,36 @@ function acquireConfigLock(cwd: string): (() => void) | null {
         }
       }
       return () => {
+        // Ownership-aware release (Codex review, 2026-08-24, round 29),
+        // not a blind `unlinkSync(path)`: matches the SAME "only ever
+        // touch exactly what you own" discipline every other cleanup path
+        // in this file already follows (`removeLocalMcpConfig`'s
+        // `expectedProxyUrl` check, `removeLocalMcpTrust`'s `attachId`
+        // check) — this was the one release in this file that never got
+        // it. Defense-in-depth: only deletes `path` if its CURRENT content
+        // still records exactly the identity THIS call wrote, so a lock
+        // that ended up holding something else by the time release fires
+        // (any race, not just one specific scenario) is never touched.
+        let current: { pid?: number; bootUptimeSec?: number };
+        try {
+          current = parseLockContent(readFileSync(path, 'utf-8'));
+        } catch {
+          return; // Already gone — nothing to clean up either way.
+        }
+        if (current.pid !== myPid || current.bootUptimeSec !== myBootUptimeSec) return; // Not ours anymore — leave it alone.
         try {
           unlinkSync(path);
         } catch {
-          // Already gone (or replaced by a stale-lock reclaim elsewhere) —
-          // nothing left for us to clean up either way.
+          // Raced with someone else's cleanup — fine.
         }
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null;
       let holder: { pid?: number; bootUptimeSec?: number };
+      let holderIno: number | bigint;
       try {
         holder = parseLockContent(readFileSync(path, 'utf-8'));
+        holderIno = statSync(path).ino;
       } catch {
         // Lock file vanished between our failed create and this read —
         // another process's release raced us; loop around and retry.
@@ -355,6 +401,30 @@ function acquireConfigLock(cwd: string): (() => void) | null {
         // ENOENT, since the source is already gone) — there is no gap to
         // pause in between "decided to claim it" and "actually claimed it,"
         // because those are the SAME syscall.
+        //
+        // Verified to still be the SAME lock INSTANCE originally inspected,
+        // immediately before that rename (Codex review, 2026-08-24, round
+        // 29, narrowing round 27's fix further): if THIS process paused
+        // between its peek above and here, a DIFFERENT process could have
+        // completed its OWN full reclaim cycle in the meantime — deleted
+        // the original stale lock and installed a brand-new LIVE one at
+        // `path`. Renaming unconditionally would then steal that live
+        // process's lock instead of the stale one this process actually
+        // decided to reclaim. Comparing the INODE NUMBER (not just content)
+        // is a stronger identity check than re-reading and comparing JSON —
+        // immune to a coincidental content collision across two distinct
+        // lock generations. This narrows, but does not eliminate, the
+        // TOCTOU: there is still a residual gap between THIS check and the
+        // rename syscall itself, just now two back-to-back synchronous
+        // calls instead of an arbitrary pause — see this function's own
+        // top-level doc note on the compound race that remains.
+        let recheckIno: number | bigint;
+        try {
+          recheckIno = statSync(path).ino;
+        } catch {
+          continue; // Already gone — someone else's reclaim or release; retry.
+        }
+        if (recheckIno !== holderIno) continue; // A different lock instance is there now — never touch it.
         const reclaimTmpPath = `${path}.reclaim-${process.pid}-${randomBytes(4).toString('hex')}`;
         try {
           renameSync(path, reclaimTmpPath);

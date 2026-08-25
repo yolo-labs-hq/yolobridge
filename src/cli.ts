@@ -294,17 +294,6 @@ async function cmdAttach(args: string[]): Promise<number> {
             agentId: resolvedAgentId,
             log: (line) => process.stdout.write(`${line}\n`),
           });
-          // Exported on THIS process's env, before `startLocalAgent` spawns
-          // the local agent below (which inherits it) — the actual secret
-          // never touches `.mcp.json` itself (Codex review, 2026-08-24,
-          // round 12: that file is a `${SECRET_ENV_VAR}` template Claude Code
-          // expands against its own inherited env at load time, since many
-          // repos — including this one's own root — already track a
-          // `.mcp.json`, and a YOLO-mode agent committing/pushing it would
-          // publish a live full-workspace credential). Harmless to set even
-          // when `mcpProxyHandle` ends up unused (e.g. a non-claude agent
-          // below).
-          if (mcpProxyHandle) process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
           // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
           // conventions — Codex reads `~/.codex/config.toml`'s
           // `[mcp_servers.*]` instead (`containers/services/container-api/
@@ -322,12 +311,42 @@ async function cmdAttach(args: string[]): Promise<number> {
           // successfully but still skip writing the config a real Claude
           // Code process would actually read.
           if (mcpProxyHandle && resolvedAgentId !== 'claude') {
+            // A non-claude agent never reads `.mcp.json`/`${SECRET_ENV_VAR}`
+            // at all, so exporting the secret here is harmless (nothing
+            // ever consumes it) — kept for that case only; see below for
+            // why the claude case is NOT unconditional.
+            process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
             process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
           } else if (mcpProxyHandle) {
             const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
             if (!configResult.ok) {
-              process.stdout.write(`yolo-bridge: could not configure local MCP access (${spawnCwd}/.mcp.json is unparseable, already has its own "yolo-studio" entry, or would not be safe from a future commit) — leaving it unconfigured rather than overwrite/dirty it.\n`);
+              // Deliberately does NOT export `${SECRET_ENV_VAR}` here (Codex
+              // review, 2026-08-24, round 29): the most common refusal
+              // reason is a SIBLING attach in the same directory that
+              // already owns the shared `.mcp.json` entry — `.mcp.json`
+              // still points at THAT sibling's proxy URL, unrelated to
+              // this process's own secret. Exporting our own secret anyway
+              // used to make this session's Claude authenticate against
+              // the sibling's proxy with the WRONG secret — a consistent,
+              // confusing 401 on every MCP tool call, not the "left
+              // unconfigured" degrade this log line describes. Leaving the
+              // var unset doesn't fully fix that (Claude still sees the
+              // sibling's entry either way — `.mcp.json` is shared, not
+              // per-process), but it stops actively contributing a
+              // guaranteed-wrong credential to an entry this process
+              // doesn't own.
+              process.stdout.write(`yolo-bridge: could not configure local MCP access (${spawnCwd}/.mcp.json is unparseable, already has its own "yolo-studio" entry — possibly from a live sibling attach in this same directory — or would not be safe from a future commit) — leaving it as-is rather than overwrite/dirty it.\n`);
             } else {
+              // Exported on THIS process's env, before `startLocalAgent`
+              // spawns the local agent below (which inherits it) — the
+              // actual secret never touches `.mcp.json` itself (Codex
+              // review, 2026-08-24, round 12: that file is a
+              // `${SECRET_ENV_VAR}` template Claude Code expands against its
+              // own inherited env at load time). Set ONLY after confirming
+              // THIS process actually owns the `.mcp.json` entry it points
+              // at — see the refusal branch above for why setting it
+              // unconditionally was wrong.
+              process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
               mcpConfigCleanup = { expectedProxyUrl: mcpProxyHandle.url, createdFile: configResult.createdFile };
               // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
               // its own tool-call approvals) so Claude Code doesn't sit on an
