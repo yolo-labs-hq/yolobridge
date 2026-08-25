@@ -78,20 +78,20 @@ export async function runDetach(deps: DetachDeps): Promise<DetachResult> {
       attachment.attachmentId,
     );
   } catch (err) {
-    // The attachment RECORD is deliberately kept on a genuine failure so the
-    // retry path knows what to retry against — but the stored credential is
-    // stripped, per card 08: the server refuses it the moment the attachment
-    // stops being live, so what is left is residue that can only be leaked.
+    // The attachment RECORD **and** its credential are both kept on a genuine
+    // failure, because the retry needs both.
     //
-    // KNOWN CONSEQUENCE of card 09 layering on top of that, not silently
-    // absorbed: the credential is now what authenticates the retry too, so
-    // stripping it here means a second `yolo-bridge detach` takes the
-    // no-credential branch above instead of retrying. The record still tells
-    // `status` what happened, and the server still reaps the attachment on
-    // heartbeat lapse, so nothing is stranded that would not have been —
-    // but D5's "the retry path authenticates with the account token" is no
-    // longer true and is recorded as such in D6.
-    clearStoredScopedToken(deps.env, deps.io);
+    // Card 08 stripped the credential here, reasoning it was leakable residue
+    // the server would refuse anyway. Card 09 invalidated that: the scoped
+    // credential is now the ONLY thing Boundary B accepts on this route, so
+    // discarding it made every retry — automatic or manual — take the
+    // no-credential branch above. The attachment stays live server-side, this
+    // machine can no longer remove it, and the next `attach` creates a SECOND
+    // attachment and tile. (Codex review, gpt-5.6-sol, 2026-08-25: two P1s.)
+    //
+    // The credential is discarded only on a SUCCESSFUL or confirmed-gone
+    // detach — the same rule the record already follows, and for the same
+    // reason: the two are only useful together.
     return { ok: false, reason: 'error', message: err instanceof Error ? err.message : String(err) };
   }
 

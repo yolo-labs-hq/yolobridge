@@ -32,7 +32,6 @@ import {
   loadAttachment,
   saveAttachment,
   clearAttachment,
-  clearStoredScopedToken,
   type ConfigStoreIO,
   type StoredAuth,
 } from './config-store.js';
@@ -729,11 +728,13 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       // retry against, and the next `attach` would then create a SECOND
       // server-side attachment/tile instead of ever cleaning up the first.
       log(`Cleanup detach failed: ${err instanceof Error ? err.message : String(err)}`);
-      // The record stays (see above) — the CREDENTIAL does not. A detach was
-      // intended, so the scoped token has no remaining use, and the retry path
-      // that needs this file authenticates with the account token, not with
-      // this. Card 08.
-      clearStoredScopedToken(env, io);
+      // The record stays (see above) and so does the CREDENTIAL. Card 08 cleared
+      // it here on the reasoning that the retry authenticated with the account
+      // token — card 09's Boundary B made that false, and `runDetach` now
+      // accepts only the scoped credential. Clearing it would leave the retry
+      // this comment describes unable to authenticate at all, stranding a live
+      // server-side attachment and duplicating the tile on the next attach.
+      // (Codex review, gpt-5.6-sol, 2026-08-25.)
       return { ok: true, reason: 'stopped' };
     }
     clearAttachment(env, io);

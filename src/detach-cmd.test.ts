@@ -142,11 +142,12 @@ describe('runDetach', () => {
     );
   });
 
-  it('strips the stored scoped token even when the DELETE itself FAILS, while keeping the record for the retry (card 08)', async () => {
+  it('KEEPS the stored scoped token when the DELETE fails, so the retry can still authenticate (card 09 / codex P1)', async () => {
     // The load-bearing half. On success `clearAttachment` removes the whole
-    // file, so a success-path assertion would pass even with the strip deleted.
-    // On failure the record is deliberately KEPT — so this is the only path
-    // where stripping the credential is the thing doing the work.
+    // file, so a success-path assertion proves nothing either way. On failure
+    // the record is deliberately KEPT — and under Boundary B the credential is
+    // the ONLY thing `runDetach` can authenticate with, so it has to be kept
+    // too or the retry this record exists for cannot happen.
     const io = fakeIO();
     saveAuth({ accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 1 }, ENV, io);
     saveAttachment(
@@ -173,10 +174,17 @@ describe('runDetach', () => {
 
     const raw = io.files.get(ATTACHMENT_FILE);
     assert.ok(raw, 'the attachment record must survive a failed detach — the retry path needs it');
-    assert.ok(!raw.includes('scoped-tok'), `the scoped credential must be gone, got: ${raw}`);
+    assert.ok(
+      raw.includes('scoped-tok'),
+      `the scoped credential must SURVIVE a failed detach — Boundary B accepts nothing else, so dropping it strands the attachment; got: ${raw}`,
+    );
     const stored = loadAttachment(ENV, io);
     assert.equal(stored?.attachmentId, 'a1', 'the identity must survive so the detach can be retried');
-    assert.equal(stored?.scopedToken, undefined);
+    assert.equal(
+      stored?.scopedToken,
+      'scoped-tok',
+      'the credential must survive with it — identity alone cannot authenticate the retry',
+    );
   });
 
   it('treats a 404 (already detached server-side) as success', async () => {
