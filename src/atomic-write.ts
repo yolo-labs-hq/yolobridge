@@ -42,8 +42,8 @@
  * plain file there" behavior this function already had before this fix,
  * not a new regression.
  */
-import { writeFileSync, renameSync, unlinkSync, existsSync, statSync, chmodSync, lstatSync, realpathSync, readdirSync } from 'node:fs';
-import { dirname, basename, join } from 'node:path';
+import { writeFileSync, renameSync, unlinkSync, existsSync, statSync, chmodSync, lstatSync, realpathSync, readdirSync, readlinkSync } from 'node:fs';
+import { dirname, basename, join, isAbsolute } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 /** Exported for `git-safety.ts` (Codex review, 2026-08-24, round 21): the
@@ -85,7 +85,33 @@ export function resolveWriteTarget(path: string): string {
   try {
     return realpathSync(parentResolvedPath);
   } catch {
-    return parentResolvedPath; // Broken symlink — write a plain file there.
+    // Broken symlink (its target doesn't exist YET) — resolve the link
+    // LEXICALLY via `readlinkSync` instead of giving up and writing over
+    // the symlink itself (Codex review, 2026-08-24, round 25): the
+    // ORIGINAL, pre-round-13 direct `writeFileSync` followed a symlink and
+    // CREATED its missing target when the target's own parent directory
+    // existed — falling back to `parentResolvedPath` here instead means
+    // the subsequent `renameSync` REPLACES the symlink itself with a plain
+    // file, destroying it — the exact regression round 16 exists to
+    // prevent, just for this one sub-case (a target that's merely ABSENT,
+    // not a symlink pointing nowhere sensible at all). A relative link
+    // target is resolved against the symlink's OWN directory, matching
+    // `readlink`'s documented semantics.
+    try {
+      const linkTarget = readlinkSync(parentResolvedPath);
+      const healedTarget = isAbsolute(linkTarget) ? linkTarget : join(dirname(parentResolvedPath), linkTarget);
+      // Only "heal" it if the intended target's OWN parent directory
+      // exists — the same constraint a plain `writeFileSync` would have
+      // been bound by too (it can't create a file in a directory that
+      // doesn't exist either). Otherwise fall through to the same
+      // write-over-the-symlink degrade as any other unresolvable case.
+      if (existsSync(dirname(healedTarget))) return healedTarget;
+    } catch {
+      // `readlinkSync` failing means `parentResolvedPath` isn't actually a
+      // symlink after all (raced since the `lstatSync` check above) — fall
+      // through to the same degrade.
+    }
+    return parentResolvedPath;
   }
 }
 

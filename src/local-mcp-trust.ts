@@ -63,10 +63,10 @@
  */
 
 import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { atomicWriteFileSync } from './atomic-write.js';
 import { randomUUID } from 'node:crypto';
-import { riskyToCommit } from './git-safety.js';
+import { riskyToCommit, ensureTempSiblingExcluded } from './git-safety.js';
 
 /** Same identity as local-mcp-config.ts's SERVER_NAME -- kept as an
  *  independent constant (not imported) since these two modules are meant to
@@ -191,6 +191,11 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
   if (riskyToCommit(cwd, path)) {
     return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
+  // The DESTINATION is confirmed safe above, but `atomicWriteFileSync`'s own
+  // `.tmp-*` temp sibling has a DIFFERENT literal name an exact-match
+  // `.gitignore` entry doesn't cover (Codex review, 2026-08-24, round 25) —
+  // see `ensureTempSiblingExcluded`'s own doc comment.
+  ensureTempSiblingExcluded(cwd, basename(path));
   const createdFile = !existsSync(path);
   let settings: Record<string, unknown>;
   try {

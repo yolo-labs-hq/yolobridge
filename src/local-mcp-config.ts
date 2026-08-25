@@ -32,11 +32,11 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { uptime } from 'node:os';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
 import { atomicWriteFileSync } from './atomic-write.js';
-import { riskyToCommit } from './git-safety.js';
+import { riskyToCommit, ensureTempSiblingExcluded } from './git-safety.js';
 
 /** The literal string written into `.mcp.json`'s `headers` value — a
  *  template, not the secret itself (Codex review, 2026-08-24, round 12).
@@ -502,6 +502,13 @@ export function writeLocalMcpConfig(cwd: string, proxyUrl: string): McpConfigWri
   if (riskyToCommit(cwd, path) || riskyToCommit(cwd, sidecarPath(cwd))) {
     return { ok: false, createdFile: false };
   }
+  // The DESTINATION is confirmed safe above, but `atomicWriteFileSync`'s own
+  // `.tmp-*` temp sibling has a DIFFERENT literal name an exact-match
+  // `.gitignore` entry doesn't cover (Codex review, 2026-08-24, round 25) —
+  // see `ensureTempSiblingExcluded`'s own doc comment for why refusing the
+  // write instead would break every correctly-configured repo.
+  ensureTempSiblingExcluded(cwd, basename(path));
+  ensureTempSiblingExcluded(cwd, basename(sidecarPath(cwd)));
   // Serializes the whole read-check-write sequence below across PROCESSES,
   // not just within one (Codex review, 2026-08-24, round 20) — see
   // `acquireConfigLock`'s doc comment for the race this closes.

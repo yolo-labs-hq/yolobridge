@@ -458,6 +458,49 @@ describe('runAttachDaemon', () => {
     assert.equal(loadAttachment(ENV, io), undefined, 'local attachment.json must be cleared, not left orphaned');
   });
 
+  it('does NOT invoke onAttached at all once a stop is already pending by the time the attach round trip completes (Codex review, 2026-08-24, round 25)', async () => {
+    // `onAttached` can spend a real delay (minting MCP credentials,
+    // starting a local proxy) -- checking `shouldStop()` only AFTER it runs
+    // (the pre-round-25 behavior) still pays that whole cost for an
+    // attachment already guaranteed to be torn down the moment it
+    // returns, making a Ctrl+C that lands while the initial attach
+    // request is still in flight feel like it did nothing for however
+    // long that setup takes.
+    let stopRequested = false;
+    let onAttachedCalls = 0;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      const method = init?.method ?? 'GET';
+      if (u.endsWith('/yolobridge/attach')) {
+        // Simulates Ctrl+C landing WHILE this exact request was in flight —
+        // shouldStop() only starts reporting true once it resolves.
+        stopRequested = true;
+        return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      }
+      if (method === 'DELETE' && u.includes('/yolobridge/attach/a1')) return jsonResponse(204, {});
+      if (u.includes('/yolobridge/stream')) throw new Error('must not open a stream once already stopped');
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const io = fakeIO();
+    const result = await runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io,
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      shouldStop: () => stopRequested,
+      onAttached: async () => { onAttachedCalls++; },
+    });
+
+    assert.deepEqual(result, { ok: true, reason: 'stopped' });
+    assert.equal(onAttachedCalls, 0, 'onAttached must never run once a stop is already pending — not merely be interrupted mid-way through');
+    assert.equal(loadAttachment(ENV, io), undefined, 'local attachment.json must still be cleared');
+  });
+
   it('answers a read-output frame by posting a read-output-reply with the stub capture', async () => {
     const sse =
       'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +

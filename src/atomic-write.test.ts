@@ -137,14 +137,33 @@ describe('atomicWriteFileSync', () => {
     assert.equal(statSync(realFile).mode & 0o777, 0o600);
   });
 
-  it('replaces a BROKEN symlink with a plain file, same as before this fix (not a new regression)', () => {
+  it('HEALS a broken symlink by creating its missing target, rather than destroying the symlink (Codex review, 2026-08-24, round 25)', () => {
+    // The ORIGINAL, pre-round-13 direct writeFileSync followed a symlink
+    // and created its missing target when the target's own parent
+    // directory existed -- an earlier version of this fix instead fell
+    // back to writing OVER the symlink itself the moment its target didn't
+    // exist YET, silently destroying a dotfile-managed symlink the first
+    // time its target happened to be absent (e.g. a fresh checkout that
+    // hasn't run its own setup yet).
     const missingTarget = join(dir, 'does-not-exist.json');
     const linkPath = join(dir, 'broken-link.json');
     symlinkSync(missingTarget, linkPath);
 
     atomicWriteFileSync(linkPath, '{"new":true}');
 
-    assert.equal(lstatSync(linkPath).isSymbolicLink(), false, 'a broken symlink target has nowhere to write through');
+    assert.equal(lstatSync(linkPath).isSymbolicLink(), true, 'the symlink itself must survive — only its missing target gets created');
+    assert.equal(readFileSync(missingTarget, 'utf-8'), '{"new":true}', 'the REAL (previously-missing) target must receive the content');
+    assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}', 'reading through the still-intact symlink sees the new content too');
+  });
+
+  it('falls back to writing OVER a broken symlink whose target directory ALSO does not exist (nothing to heal into)', () => {
+    const missingTarget = join(dir, 'no-such-subdir', 'does-not-exist.json');
+    const linkPath = join(dir, 'broken-link-2.json');
+    symlinkSync(missingTarget, linkPath);
+
+    atomicWriteFileSync(linkPath, '{"new":true}');
+
+    assert.equal(lstatSync(linkPath).isSymbolicLink(), false, "there's no parent directory to heal the target into, so this degrades to the pre-existing 'write over it' behavior");
     assert.equal(readFileSync(linkPath, 'utf-8'), '{"new":true}');
   });
 

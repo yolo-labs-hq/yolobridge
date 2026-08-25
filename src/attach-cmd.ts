@@ -209,6 +209,31 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   saveAttachment({ workspaceId, tileId, attachmentId, attachedAt: new Date().toISOString() }, env, io);
   log(`Attached. tileId=${tileId} attachmentId=${attachmentId}`);
 
+  // Codex-found race: if something already asked us to stop WHILE the
+  // initial refresh/attach network round trip above was in flight (e.g. the
+  // local agent process this daemon spawns exits almost immediately), the
+  // caller's own onExit-triggered best-effort detach ran too early — before
+  // this attachment existed anywhere — and found nothing to clean up. The
+  // `while (!shouldStop())` loop below would otherwise exit on its very
+  // first check having never opened a stream, returning `{ ok: true,
+  // reason: 'stopped' }` with the attachment just created above left as a
+  // permanent orphan (the CLI's own post-return cleanup skips it too, since
+  // it believes the onExit path already handled detaching). Catch it here,
+  // right after this call is the one that created it, so there's exactly
+  // one place responsible for cleaning up what it made.
+  //
+  // Checked BEFORE `onAttached`, not just after (Codex review, 2026-08-24,
+  // round 25): `onAttached` can spend a real, possibly-many-second delay
+  // minting MCP credentials and starting a local proxy — running all of
+  // that for an attachment that's already guaranteed to be torn down the
+  // moment it returns makes a Ctrl+C feel like it did nothing for however
+  // long that setup takes. This check alone doesn't replace the one AFTER
+  // `onAttached` below — a stop can just as easily arrive WHILE that hook
+  // is still running, not only before it starts.
+  if (shouldStop()) {
+    return detachAndReportStopped();
+  }
+
   if (deps.onAttached) {
     try {
       await deps.onAttached({
@@ -222,19 +247,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     }
   }
 
-  // Codex-found race: if something already asked us to stop WHILE the
-  // initial refresh/attach network round trip above was in flight (e.g. the
-  // local agent process this daemon spawns exits almost immediately), the
-  // caller's own onExit-triggered best-effort detach ran too early — before
-  // this attachment existed anywhere — and found nothing to clean up. The
-  // `while (!shouldStop())` loop below would otherwise exit on its very
-  // first check having never opened a stream, returning `{ ok: true,
-  // reason: 'stopped' }` with the attachment just created above left as a
-  // permanent orphan (the CLI's own post-return cleanup skips it too, since
-  // it believes the onExit path already handled detaching). Catch it here,
-  // right after this call is the one that created it, so there's exactly
-  // one place responsible for cleaning up what it made.
   if (shouldStop()) {
+    return detachAndReportStopped();
+  }
+
+  async function detachAndReportStopped(): Promise<AttachDaemonResult> {
     await apiClient.detach(cfg, workspaceId, attachmentId).catch((err) => {
       log(`Cleanup detach failed: ${err instanceof Error ? err.message : String(err)}`);
     });
