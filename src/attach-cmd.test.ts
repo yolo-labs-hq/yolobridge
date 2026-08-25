@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { runAttachDaemon, pickWorkspaceFromDisk, type RefreshTokenFn } from './attach-cmd.js';
 import { loadAttachment, loadAuth, saveAuth, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import { loadConnectionState, type ConnectionEvent } from './connection-state.js';
 import type { TimerImpl } from './heartbeat.js';
 
 const ENV = { HOME: '/home/yolo' };
@@ -177,6 +178,9 @@ describe('runAttachDaemon', () => {
       io: fakeIO(),
       fetchImpl,
       log: (line) => calls.push(`log:${line}`),
+      // 'connected' is now an out-of-band connection EVENT, not a log line
+      // (see connection-state.ts) — same sanity signal, new channel.
+      onConnectionEvent: (event) => calls.push(`conn:${event.state}`),
       clearScreen: () => calls.push('clear'),
       deliverPrompt: async () => {},
       captureOutput: async () => ({ output: 'unused', busy: false }),
@@ -184,7 +188,7 @@ describe('runAttachDaemon', () => {
     });
 
     assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
-    assert.equal(calls.filter((c) => c === 'log:Stream connected.').length, 2, 'sanity check: both connected frames were processed');
+    assert.equal(calls.filter((c) => c === 'conn:connected').length, 2, 'sanity check: both connected frames were processed');
     assert.deepEqual(calls.filter((c) => c === 'clear'), [], 'runAttachDaemon must never call clearScreen itself');
   });
 
@@ -617,6 +621,136 @@ describe('runAttachDaemon', () => {
 
     const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon after stop signal');
     assert.deepEqual(result, { ok: true, reason: 'stopped' });
+  });
+});
+
+describe('runAttachDaemon — connection state never enters the terminal output stream', () => {
+  // Regression guard for the reported bug (2026-08-25): a brief, entirely
+  // self-recovering connection drop garbled the Claude Code TUI. `attach`
+  // spawns the local agent under a PTY whose output is piped to this
+  // process's own `process.stdout` (local-agent.ts), and the daemon's
+  // `log` defaults to that SAME stream — so `Stream error: …` /
+  // `Reconnecting in 1000ms (attempt 1)...` were injected straight into a
+  // frame the full-screen TUI believed it had drawn, and stayed corrupted
+  // until it next happened to fully repaint.
+  //
+  // Anything a human would read as connection narration. The assertion is
+  // deliberately on the SHAPE of the text rather than exact strings: the
+  // bug is "human-readable connection status reaches the output stream at
+  // all", so a reworded message must not be able to sneak past this.
+  const CONNECTION_NARRATION =
+    /stream (connected|error)|reconnect|disconnect|detached by server|heartbeat error|token refreshed|unrecognized frame/i;
+
+  /** attach → one transient stream failure → a clean reconnect that then
+   *  receives `detached`. Mirrors the report: the drop self-recovers. */
+  function blipThenReconnectFetch(): { fetchImpl: any; streamCalls: () => number } {
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    let streamCalls = 0;
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+      if (u.includes('/yolobridge/stream')) {
+        streamCalls += 1;
+        // 502, not 404: a transient upstream blip, which is the case that
+        // retries and recovers. (A 404 is the terminal "attachment is
+        // gone" path, covered by its own test above.)
+        if (streamCalls === 1) return jsonResponse(502, { error: 'Bad gateway' });
+        return sseStreamResponse(sse);
+      }
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+    return { fetchImpl, streamCalls: () => streamCalls };
+  }
+
+  it('routes a drop + reconnect to the structured connection channel and writes nothing about it to the terminal', async () => {
+    const { fetchImpl, streamCalls } = blipThenReconnectFetch();
+    const logs: string[] = [];
+    const events: ConnectionEvent[] = [];
+
+    const result = await withTimeout(
+      runAttachDaemon({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        auth: AUTH,
+        env: ENV,
+        io: fakeIO(),
+        fetchImpl,
+        log: (line) => logs.push(line),
+        onConnectionEvent: (event) => events.push(event),
+        clearScreen: () => {},
+        deliverPrompt: async () => {},
+        captureOutput: async () => ({ output: '', busy: false }),
+        shouldStop: () => false,
+        sleep: async () => {},
+      }),
+      2000,
+      'runAttachDaemon across a transient stream drop',
+    );
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(streamCalls(), 2, 'sanity check: the daemon really did drop and reconnect');
+
+    const offending = logs.filter((line) => CONNECTION_NARRATION.test(line));
+    assert.deepEqual(
+      offending,
+      [],
+      `connection state must never reach the output stream a TUI is rendering into, got: ${JSON.stringify(offending)}`,
+    );
+
+    // ...and it is NOT swallowed: the same information is there, structured.
+    assert.deepEqual(
+      events.map((e) => e.state),
+      ['connecting', 'interrupted', 'reconnecting', 'connected', 'detached'],
+    );
+    const interrupted = events.find((e) => e.state === 'interrupted');
+    assert.match(interrupted?.detail ?? '', /stream open failed/i);
+    const reconnecting = events.find((e) => e.state === 'reconnecting');
+    assert.equal(reconnecting?.attempt, 1);
+    assert.equal(typeof reconnecting?.retryInMs, 'number');
+    for (const event of events) {
+      assert.match(event.at, /^\d{4}-\d{2}-\d{2}T/, 'every connection event carries a timestamp');
+    }
+  });
+
+  it('persists the drop through the DEFAULT channel (no injected sink) so `yolo-bridge status` can still report it', async () => {
+    // The point of the fix is not "print less" — it is "print it somewhere
+    // that is not the PTY". With nothing injected, the daemon must land the
+    // same events in the on-disk record status-cmd.ts reads.
+    const { fetchImpl } = blipThenReconnectFetch();
+    const io = fakeIO();
+    const logs: string[] = [];
+
+    const result = await withTimeout(
+      runAttachDaemon({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        auth: AUTH,
+        env: ENV,
+        io,
+        fetchImpl,
+        log: (line) => logs.push(line),
+        clearScreen: () => {},
+        deliverPrompt: async () => {},
+        captureOutput: async () => ({ output: '', busy: false }),
+        shouldStop: () => false,
+        sleep: async () => {},
+      }),
+      2000,
+      'runAttachDaemon across a transient stream drop (default connection channel)',
+    );
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.deepEqual(logs.filter((line) => CONNECTION_NARRATION.test(line)), []);
+
+    const stored = loadConnectionState(ENV, io);
+    assert.ok(stored, 'the daemon must record connection state where the user can read it back');
+    assert.equal(stored.attachmentId, 'a1');
+    assert.equal(stored.current.state, 'detached');
+    const history = stored.recent.map((e) => e.state);
+    assert.deepEqual(history, ['connecting', 'interrupted', 'reconnecting', 'connected']);
   });
 });
 
