@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { hostname } from 'node:os';
 
-import { parseAttachArgs, resolveWorkspaceIdOrName } from './cli.js';
+import { parseAttachArgs, resolveAttachHostInfo, resolveWorkspaceIdOrName } from './cli.js';
 
 describe('parseAttachArgs', () => {
   it('plain workspaceId with no flags', () => {
@@ -124,5 +125,49 @@ describe('resolveWorkspaceIdOrName', () => {
       message: 'Not logged in — run `yolo-bridge login` first.',
     }));
     assert.deepEqual(result, { ok: false, message: 'Not logged in — run `yolo-bridge login` first.' });
+  });
+});
+
+describe('resolveAttachHostInfo', () => {
+  const BASE = { hostname: 'dev-laptop', cwd: '/home/dev/proj', platform: 'linux', agent: 'claude' };
+
+  it('defaults hostLabel to the machine hostname when --label was not given', () => {
+    const result = resolveAttachHostInfo(BASE);
+    assert.equal(result.hostLabel, 'dev-laptop');
+  });
+
+  it('lets an explicit --label win over the hostname', () => {
+    const result = resolveAttachHostInfo({ ...BASE, label: 'workshop-pi' });
+    assert.equal(result.hostLabel, 'workshop-pi');
+  });
+
+  it('falls back to the hostname for a whitespace-only label rather than naming the tile with blanks', () => {
+    const result = resolveAttachHostInfo({ ...BASE, label: '   ' });
+    assert.equal(result.hostLabel, 'dev-laptop');
+  });
+
+  it('leaves hostLabel undefined when there is neither a label nor a usable hostname', () => {
+    const result = resolveAttachHostInfo({ ...BASE, hostname: '' });
+    assert.equal(result.hostLabel, undefined);
+  });
+
+  it('reports exactly the three machine facts the tile shows — cwd, platform, agent — and nothing else', () => {
+    const result = resolveAttachHostInfo(BASE);
+    assert.deepEqual(result.remoteHost, { cwd: '/home/dev/proj', platform: 'linux', agent: 'claude' });
+    // Guards the privacy boundary directly: adding an env dump, a username,
+    // or a file listing here would fail this assertion, not slip through.
+    assert.deepEqual(Object.keys(result.remoteHost).sort(), ['agent', 'cwd', 'platform']);
+  });
+
+  it('describes the REAL process when handed real values (no mocks — the actual call shape cli.ts uses)', () => {
+    const result = resolveAttachHostInfo({
+      hostname: hostname(),
+      cwd: process.cwd(),
+      platform: process.platform,
+      agent: 'codex',
+    });
+    assert.equal(result.remoteHost.cwd, process.cwd());
+    assert.equal(result.remoteHost.platform, process.platform);
+    assert.equal(typeof result.hostLabel, 'string');
   });
 });
