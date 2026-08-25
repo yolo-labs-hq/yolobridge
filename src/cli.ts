@@ -328,7 +328,7 @@ async function cmdAttach(args: string[]): Promise<number> {
       // skipped, not fatal — MCP access is an enhancement on a tile that
       // already works without it (send_to_tile/read_tile_output are
       // unaffected either way).
-      onAttached: async ({ getAccessToken, clearScreen }) => {
+      onAttached: async ({ tileId, getAccessToken, clearScreen }) => {
         // Isolated from `startLocalAgent` below on purpose (Codex review,
         // 2026-08-24): `startMcpProxy` itself never throws, but
         // `writeLocalMcpConfig`/`writeLocalMcpTrust` do plain synchronous
@@ -346,6 +346,11 @@ async function cmdAttach(args: string[]): Promise<number> {
             getAccessToken,
             workspaceId,
             agentId: resolvedAgentId,
+            // Self-identity for the spawned agent: the tile it is running in.
+            // Without it, an agent asked to message "the other tile" has to
+            // guess which studio_list_tiles row is itself — and a backwards
+            // guess sends the prompt into its OWN input.
+            callerTileId: tileId,
             log: (line) => process.stdout.write(`${line}\n`),
           });
           // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
