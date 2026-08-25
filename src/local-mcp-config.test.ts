@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, chmodSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, uptime } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -109,7 +109,13 @@ describe('writeLocalMcpConfig', () => {
         'yolo-studio': { type: 'http', url: 'http://127.0.0.1:4123/mcp', headers: { [SECRET_HEADER]: SECRET_HEADER_TEMPLATE } },
       },
     });
-    assert.deepEqual(JSON.parse(readFileSync(sidecarPath(), 'utf-8')), { proxyUrl: 'http://127.0.0.1:4123/mcp', pid: process.pid });
+    const sidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
+    // bootUptimeSec (Codex review, 2026-08-24, round 23) is os.uptime() at
+    // write time -- non-deterministic across machines/runs, so its exact
+    // value isn't asserted, only that it was recorded as a number.
+    assert.equal(typeof sidecar.bootUptimeSec, 'number');
+    delete sidecar.bootUptimeSec;
+    assert.deepEqual(sidecar, { proxyUrl: 'http://127.0.0.1:4123/mcp', pid: process.pid });
   });
 
   it('writes an entry with only standard http-transport fields, no custom marker (Codex review, 2026-08-24, round 9)', () => {
@@ -198,6 +204,22 @@ describe('writeLocalMcpConfig', () => {
     writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
     const sidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
     sidecar.pid = spawnAndExit();
+    writeFileSync(sidecarPath(), JSON.stringify(sidecar));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: false });
+  });
+
+  it('DOES reclaim once the recorded bootUptimeSec proves a machine reboot happened since, even though the recorded pid still reads as alive (Codex review, 2026-08-24, round 23)', () => {
+    // A reboot restarts pid numbering from low numbers, so an early-starting
+    // long-lived process can land on the EXACT pid an old sidecar recorded
+    // before the crash -- `isPidAlive` alone would misreport that as "the
+    // same sibling, still running." Simulated here with THIS test process's
+    // own (trivially alive) pid, but a recorded bootUptimeSec far in the
+    // "future" relative to the CURRENT os.uptime() -- exactly what a real
+    // reboot since that write would look like (uptime resets to near-zero).
+    writeLocalMcpConfig(dir, 'http://127.0.0.1:9999/mcp');
+    const sidecar = JSON.parse(readFileSync(sidecarPath(), 'utf-8'));
+    sidecar.bootUptimeSec = uptime() + 1_000_000;
     writeFileSync(sidecarPath(), JSON.stringify(sidecar));
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: false });
@@ -358,7 +380,7 @@ describe('writeLocalMcpConfig', () => {
       assert.equal(result.ok, false);
       assert.deepEqual(
         JSON.parse(readFileSync(sidecarPath(), 'utf-8')),
-        { proxyUrl: 'http://127.0.0.1:9999/mcp', pid: priorSidecar.pid },
+        { proxyUrl: 'http://127.0.0.1:9999/mcp', pid: priorSidecar.pid, bootUptimeSec: priorSidecar.bootUptimeSec },
         'sidecar must be rolled back to what it recorded before this failed call',
       );
     } finally {
@@ -422,6 +444,14 @@ describe('cross-process config lock (Codex review, 2026-08-24, round 20)', () =>
     const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
     assert.deepEqual(result, { ok: true, createdFile: true });
     assert.equal(existsSync(lockPath()), false, 'the lock must not be left behind after a successful write');
+  });
+
+  it('reclaims a lock whose recorded bootUptimeSec proves a machine reboot happened since, even though its pid still reads as alive (Codex review, 2026-08-24, round 23)', () => {
+    // Same reboot-vs-pid-reuse scenario as local-mcp-config.ts's sidecar
+    // equivalent, applied to the LOCK's own JSON content format.
+    writeFileSync(lockPath(), JSON.stringify({ pid: process.pid, bootUptimeSec: uptime() + 1_000_000 }));
+    const result = writeLocalMcpConfig(dir, 'http://127.0.0.1:4123/mcp');
+    assert.deepEqual(result, { ok: true, createdFile: true });
   });
 
   it('refuses (ok:false) without touching .mcp.json when the lock is held by a confirmed-LIVE pid, instead of racing a concurrent sibling write', () => {

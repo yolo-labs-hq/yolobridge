@@ -33,6 +33,7 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
+import { uptime } from 'node:os';
 import { SECRET_HEADER, SECRET_ENV_VAR } from './mcp-proxy.js';
 import { atomicWriteFileSync } from './atomic-write.js';
 import { riskyToCommit } from './git-safety.js';
@@ -118,6 +119,14 @@ interface SidecarState {
    *  exited" apart from "it's still running, from a SIBLING attach in the
    *  same directory." */
   pid?: number;
+  /** `os.uptime()` at the moment this record was written (Codex review,
+   *  2026-08-24, round 23) — see `isDefinitivelyStale`'s doc comment: closes
+   *  the specific case where a machine REBOOT lets an unrelated process
+   *  land on the exact `pid` an old record recorded, which `isPidAlive`
+   *  alone would misreport as "still alive." Optional so an older record
+   *  written before this field existed still degrades to the pre-round-23
+   *  pid-only check, not a hard failure. */
+  bootUptimeSec?: number;
 }
 
 /** Best-effort read: a missing or corrupt sidecar just means "we don't know
@@ -132,7 +141,11 @@ function readSidecar(cwd: string): SidecarState {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.proxyUrl === 'string' && typeof parsed.pid === 'number') {
-      return { proxyUrl: parsed.proxyUrl, pid: parsed.pid };
+      return {
+        proxyUrl: parsed.proxyUrl,
+        pid: parsed.pid,
+        bootUptimeSec: typeof parsed.bootUptimeSec === 'number' ? parsed.bootUptimeSec : undefined,
+      };
     }
   } catch {
     // Corrupt sidecar — treated as absent above.
@@ -165,6 +178,37 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * True when the owner recorded by `pid` can be DEFINITIVELY proven to no
+ * longer be the same process that wrote it (Codex review, 2026-08-24,
+ * round 23) — `isPidAlive` alone can misreport "still alive" for a
+ * completely unrelated process: after a crash OR a machine REBOOT, the OS
+ * can hand the exact same pid number to a new, long-lived process (PIDs
+ * restart from low numbers after every boot, so an early-starting system
+ * daemon landing on an old sidecar/lock's exact pid is a real occurrence,
+ * not theoretical), and every LATER attach would then refuse to reclaim (or
+ * time out acquiring the lock) until that unrelated process happens to
+ * exit.
+ *
+ * `os.uptime()` only ever increases within a single boot session, so a
+ * CURRENT uptime smaller than what was recorded at write time can only mean
+ * the machine rebooted since — no process can survive that, so the
+ * recorded pid is provably stale regardless of what `isPidAlive` reports
+ * for whatever happens to hold that number now. `recordedBootUptimeSec`
+ * absent (an older record written before this field existed) degrades to
+ * the pre-round-23 pid-only check, not a hard failure.
+ *
+ * Does NOT close the (much rarer) case of an exact pid being recycled to an
+ * unrelated process WITHOUT an intervening reboot — doing that portably
+ * would need a per-platform process-START-TIME comparison (`/proc/<pid>/
+ * stat` on Linux, `ps -o lstart=` on macOS, WMI on Windows); disproportionate
+ * for a best-effort, never-hard-failing local guard.
+ */
+function isDefinitivelyStale(pid: number, recordedBootUptimeSec: number | undefined): boolean {
+  if (recordedBootUptimeSec !== undefined && uptime() < recordedBootUptimeSec) return true;
+  return !isPidAlive(pid);
+}
+
 function lockPath(cwd: string): string {
   return sidecarPath(cwd) + '.lock';
 }
@@ -195,12 +239,36 @@ function sleepSync(ms: number): void {
  * returns `null`, which callers treat as their existing degraded `ok:
  * false`, never a hard failure/throw.
  */
+/** Parses a lock file's content into its recorded pid/bootUptimeSec. Accepts
+ *  BOTH this module's own JSON-object format and the bare-pid-number-string
+ *  format every lock predating round 23 was written in (a lock outlives its
+ *  writer only when that writer crashed mid-section, so a lingering lock can
+ *  legitimately have been written by an older CLI version) — falling back to
+ *  the legacy shape keeps a pre-round-23 crash's stale lock reclaimable
+ *  instead of stuck forever the moment this module upgrades. */
+function parseLockContent(raw: string): { pid?: number; bootUptimeSec?: number } {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      return {
+        pid: typeof obj.pid === 'number' ? obj.pid : undefined,
+        bootUptimeSec: typeof obj.bootUptimeSec === 'number' ? obj.bootUptimeSec : undefined,
+      };
+    }
+  } catch {
+    // Not JSON at all — fall through to the legacy bare-pid-string format.
+  }
+  const legacyPid = Number(raw);
+  return { pid: Number.isInteger(legacyPid) ? legacyPid : undefined };
+}
+
 function acquireConfigLock(cwd: string): (() => void) | null {
   const path = lockPath(cwd);
   const deadline = Date.now() + 2000;
   for (;;) {
     try {
-      writeFileSync(path, String(process.pid), { flag: 'wx' });
+      writeFileSync(path, JSON.stringify({ pid: process.pid, bootUptimeSec: uptime() }), { flag: 'wx' });
       return () => {
         try {
           unlinkSync(path);
@@ -212,14 +280,17 @@ function acquireConfigLock(cwd: string): (() => void) | null {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null;
       let holderPid: number | undefined;
+      let holderBootUptimeSec: number | undefined;
       try {
-        holderPid = Number(readFileSync(path, 'utf-8'));
+        const parsed = parseLockContent(readFileSync(path, 'utf-8'));
+        holderPid = parsed.pid;
+        holderBootUptimeSec = parsed.bootUptimeSec;
       } catch {
         // Lock file vanished between our failed create and this read —
         // another process's release raced us; loop around and retry.
         continue;
       }
-      if (Number.isInteger(holderPid) && !isPidAlive(holderPid)) {
+      if (Number.isInteger(holderPid) && isDefinitivelyStale(holderPid!, holderBootUptimeSec)) {
         // Re-verify the lock still holds the SAME stale pid immediately
         // before deleting it (Codex review, 2026-08-24, round 22): two
         // processes can both observe this identical stale holderPid. Without
@@ -230,13 +301,13 @@ function acquireConfigLock(cwd: string): (() => void) | null {
         // exists to prevent. A mismatch here means someone else already
         // reclaimed it; skip deleting and loop back to re-evaluate from
         // scratch rather than touching a lock that isn't stale anymore.
-        let stillStale: string | undefined;
+        let stillStalePid: number | undefined;
         try {
-          stillStale = readFileSync(path, 'utf-8');
+          stillStalePid = parseLockContent(readFileSync(path, 'utf-8')).pid;
         } catch {
           continue; // Already gone — someone else's reclaim or release; retry.
         }
-        if (stillStale !== String(holderPid)) continue;
+        if (stillStalePid !== holderPid) continue;
         try {
           unlinkSync(path);
         } catch {
@@ -250,7 +321,7 @@ function acquireConfigLock(cwd: string): (() => void) | null {
   }
 }
 
-function writeSidecar(cwd: string, state: Required<SidecarState>): void {
+function writeSidecar(cwd: string, state: Required<Pick<SidecarState, 'proxyUrl' | 'pid'>> & Pick<SidecarState, 'bootUptimeSec'>): void {
   const path = sidecarPath(cwd);
   // Atomic, not a direct overwrite (Codex review, 2026-08-24, round 14): a
   // plain `writeFileSync` on an EXISTING sidecar opens with O_TRUNC, which
@@ -287,7 +358,7 @@ function writeSidecar(cwd: string, state: Required<SidecarState>): void {
 function rollbackSidecar(cwd: string, prior: SidecarState): void {
   try {
     if (prior.proxyUrl !== undefined && prior.pid !== undefined) {
-      writeSidecar(cwd, { proxyUrl: prior.proxyUrl, pid: prior.pid });
+      writeSidecar(cwd, { proxyUrl: prior.proxyUrl, pid: prior.pid, bootUptimeSec: prior.bootUptimeSec });
     } else {
       deleteSidecar(cwd);
     }
@@ -442,8 +513,12 @@ function writeLocalMcpConfigLocked(cwd: string, proxyUrl: string, path: string):
     // whichever one wrote it first, and this attach's own later detach
     // could delete the entry out from under that still-running daemon.
     // `priorSidecar.pid` is guaranteed defined here — `looksLikeOurOwnEntry`
-    // already required it for the match above to succeed.
-    if (priorSidecar.pid !== undefined && isPidAlive(priorSidecar.pid)) return { ok: false, createdFile: false };
+    // already required it for the match above to succeed. `isDefinitivelyStale`
+    // (round 23) additionally recognizes a machine reboot since the sidecar
+    // was written as proof the recorded pid can't be this same sibling,
+    // regardless of what a bare `isPidAlive` reports for whoever holds that
+    // pid number now.
+    if (priorSidecar.pid !== undefined && !isDefinitivelyStale(priorSidecar.pid, priorSidecar.bootUptimeSec)) return { ok: false, createdFile: false };
   }
 
   // Sidecar written BEFORE the `.mcp.json` entry itself (Codex review,
@@ -458,7 +533,7 @@ function writeLocalMcpConfigLocked(cwd: string, proxyUrl: string, path: string):
   // the sidecar first means a failure here leaves `.mcp.json` completely
   // untouched — nothing to roll back.
   try {
-    writeSidecar(cwd, { proxyUrl, pid: process.pid });
+    writeSidecar(cwd, { proxyUrl, pid: process.pid, bootUptimeSec: uptime() });
   } catch {
     return { ok: false, createdFile: false };
   }
