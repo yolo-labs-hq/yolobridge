@@ -1,8 +1,20 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { runAttachDaemon, pickWorkspaceFromDisk, type RefreshTokenFn } from './attach-cmd.js';
-import { loadAttachment, loadAuth, saveAuth, type ConfigStoreIO, type StoredAuth } from './config-store.js';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import { runAttachDaemon, runAttachFromDisk, pickWorkspaceFromDisk, type RefreshTokenFn } from './attach-cmd.js';
+import {
+  loadAttachment,
+  loadAuth,
+  saveAuth,
+  saveAttachment,
+  type ConfigStoreIO,
+  type StoredAuth,
+} from './config-store.js';
+import { getStatus, formatStatus } from './status-cmd.js';
 import { loadConnectionState, type ConnectionEvent } from './connection-state.js';
 import type { TimerImpl } from './heartbeat.js';
 
@@ -1705,6 +1717,658 @@ describe('pickWorkspaceFromDisk', () => {
     if (!result.ok) {
       assert.equal(result.reason, 'list-failed');
       assert.match((result as any).message, /boom/);
+    }
+  });
+});
+
+/**
+ * Card 08 — the account refresh token stops surviving the attach exchange, and
+ * the workspace-scoped credential starts surviving a daemon restart.
+ *
+ * These tests use the REAL filesystem (a throwaway HOME per test, no injected
+ * `io`) rather than the in-memory `fakeIO` the suite uses elsewhere, because
+ * the property under test is literally "what is left in the file on disk". A
+ * stub that agrees with the code about what was written proves nothing about
+ * what a leaked `~/.config/yolobridge/auth.json` would be worth.
+ */
+describe('runAttachDaemon — account refresh token is not persisted past the attach exchange (card 08)', () => {
+  const T0 = 1_800_000_000_000;
+  const DAY_MS = 24 * 3600_000;
+  const CONNECTED = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+  const DETACHED = 'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+
+  function realHome(): {
+    env: { HOME: string };
+    authFile: string;
+    attachmentFile: string;
+    connectionFile: string;
+    cleanup(): void;
+  } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yolobridge-card08-'));
+    const cfg = path.join(dir, '.config', 'yolobridge');
+    return {
+      env: { HOME: dir },
+      authFile: path.join(cfg, 'auth.json'),
+      attachmentFile: path.join(cfg, 'attachment.json'),
+      connectionFile: path.join(cfg, 'connection.json'),
+      cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+    };
+  }
+
+  it('drops the account refresh token from the REAL auth.json once a scoped credential is in hand', async () => {
+    const home = realHome();
+    try {
+      saveAuth(
+        { accessToken: 'account-at', refreshToken: 'account-rt', tokenType: 'Bearer', expiresAtMs: T0 + 30 * DAY_MS },
+        home.env,
+      );
+      assert.ok(
+        fs.readFileSync(home.authFile, 'utf-8').includes('account-rt'),
+        'sanity: the refresh token really is on disk before the attach',
+      );
+
+      const fetchImpl = (async (url: any) => {
+        const u = String(url);
+        if (u.endsWith('/yolobridge/attach')) {
+          return jsonResponse(201, {
+            tileId: 'tile-1',
+            attachmentId: 'a1',
+            scopedToken: 'scoped-tok-1',
+            scopedTokenExpiresAt: T0 + 3600_000,
+          });
+        }
+        if (u.includes('/yolobridge/stream')) return sseStreamResponse(CONNECTED + DETACHED);
+        if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      const result = await runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        log: () => {},
+        clearScreen: () => {},
+        now: () => T0,
+      });
+      assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+
+      const raw = fs.readFileSync(home.authFile, 'utf-8');
+      assert.ok(raw.includes('account-at'), `sanity: this is the real auth.json we are reading, got: ${raw}`);
+      assert.ok(!raw.includes('account-rt'), `the durable account key must be gone from disk, got: ${raw}`);
+      assert.equal('refreshToken' in JSON.parse(raw), false, 'the field must be ABSENT, not empty');
+      assert.equal(loadAuth(home.env)?.refreshToken, undefined);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('KEEPS the refresh token on the DEGRADED path, and a restarted daemon still rotates the account token with it', async () => {
+    // THE BRICK-AVOIDANCE CASE. With no scoped credential, `scopedCfg()` falls
+    // back to the account token and the daemon runs the entire session on it —
+    // so the refresh token is still the only thing that can keep that session
+    // alive past the ~24h access-token expiry. Dropping it unconditionally
+    // kills this daemon a day later with a 401 that points nowhere near here.
+    const home = realHome();
+    try {
+      let clock = T0;
+      saveAuth(
+        { accessToken: 'account-at-1', refreshToken: 'account-rt-1', tokenType: 'Bearer', expiresAtMs: T0 + DAY_MS },
+        home.env,
+      );
+
+      const attachAuths: string[] = [];
+      const fetchImpl = (async (url: any, init?: any) => {
+        const u = String(url);
+        if (u.endsWith('/yolobridge/attach')) {
+          attachAuths.push(String(init?.headers?.Authorization ?? ''));
+          // No scopedToken/scopedTokenExpiresAt: a common-api predating the mint.
+          return jsonResponse(201, { tileId: 'tile-1', attachmentId: 'a1' });
+        }
+        if (u.includes('/yolobridge/stream')) return sseStreamResponse(CONNECTED + DETACHED);
+        if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      const refreshedWith: string[] = [];
+      const refreshAccessToken: RefreshTokenFn = async (_authUrl, refreshToken) => {
+        refreshedWith.push(refreshToken);
+        return {
+          status: 'ok',
+          tokens: {
+            accessToken: 'account-at-2',
+            refreshToken: 'account-rt-2',
+            expiresInSec: 86_400,
+            expiresAtMs: clock + DAY_MS,
+          },
+        };
+      };
+
+      const first = await runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        refreshAccessToken,
+        log: () => {},
+        clearScreen: () => {},
+        now: () => clock,
+      });
+      assert.deepEqual(first, { ok: true, reason: 'detached-by-server' });
+      assert.deepEqual(refreshedWith, [], 'sanity: nothing needed rotating during the first session');
+
+      const afterFirst = JSON.parse(fs.readFileSync(home.authFile, 'utf-8'));
+      assert.equal(
+        afterFirst.refreshToken,
+        'account-rt-1',
+        'a degraded attach must LEAVE the refresh token on disk — it is still the working credential',
+      );
+
+      // A day later: the account access token has expired. The restart has to
+      // rotate it, and the only thing that can is the token left above.
+      clock = T0 + DAY_MS + 1;
+      const second = await runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        refreshAccessToken,
+        log: () => {},
+        clearScreen: () => {},
+        now: () => clock,
+      });
+      assert.deepEqual(second, { ok: true, reason: 'detached-by-server' }, 'the restarted daemon must not be bricked');
+      assert.deepEqual(
+        refreshedWith,
+        ['account-rt-1'],
+        'the restart must have rotated using the refresh token the first session left behind',
+      );
+      assert.ok(attachAuths.length === 2, `sanity: two attaches, saw ${attachAuths.length}`);
+      assert.equal(attachAuths[1], 'Bearer account-at-2', 'the second attach must present the freshly rotated token');
+      assert.equal(
+        JSON.parse(fs.readFileSync(home.authFile, 'utf-8')).refreshToken,
+        'account-rt-2',
+        'the rotated refresh token must still be persisted on the degraded path',
+      );
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('an ACCOUNT rotation mid-session never re-persists the refresh token on the scoped path', async () => {
+    // The account token keeps rotating (the local MCP proxy still mints with
+    // it), but from a copy that lives only in this process's memory. Nothing
+    // may write it back to disk.
+    const home = realHome();
+    try {
+      let clock = T0;
+      saveAuth(
+        { accessToken: 'account-at-1', refreshToken: 'account-rt-1', tokenType: 'Bearer', expiresAtMs: T0 + 3600_000 },
+        home.env,
+      );
+
+      const stream = controllableSseResponse(CONNECTED);
+      const fetchImpl = (async (url: any) => {
+        const u = String(url);
+        if (u.endsWith('/yolobridge/attach')) {
+          return jsonResponse(201, {
+            tileId: 'tile-1',
+            attachmentId: 'a1',
+            scopedToken: 'scoped-tok-1',
+            scopedTokenExpiresAt: T0 + 30 * DAY_MS,
+          });
+        }
+        if (u.includes('/yolobridge/stream')) return stream.response;
+        if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      const refreshedWith: string[] = [];
+      const refreshAccessToken: RefreshTokenFn = async (_authUrl, refreshToken) => {
+        refreshedWith.push(refreshToken);
+        return {
+          status: 'ok',
+          tokens: {
+            accessToken: 'account-at-2',
+            refreshToken: 'account-rt-2',
+            expiresInSec: 86_400,
+            expiresAtMs: clock + DAY_MS,
+          },
+        };
+      };
+
+      const timers = fakeTimers();
+      const resultPromise = runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        refreshAccessToken,
+        log: () => {},
+        clearScreen: () => {},
+        now: () => clock,
+        timers,
+      });
+
+      await waitUntil(() => timers.intervals.length >= 2);
+      clock = T0 + 3600_000; // inside the refresh buffer → the next tick rotates
+      await tickUntil(timers, () => refreshedWith.length > 0);
+
+      // Both halves: the rotation really happened (from the in-memory copy)...
+      assert.deepEqual(
+        refreshedWith,
+        ['account-rt-1'],
+        'the daemon must still be able to rotate from the copy it kept in memory',
+      );
+      // ...and it did not leak back onto disk.
+      const raw = fs.readFileSync(home.authFile, 'utf-8');
+      assert.ok(raw.includes('account-at-2'), `sanity: the rotation was persisted at all, got: ${raw}`);
+      assert.ok(!raw.includes('account-rt-2'), `a rotation must not re-persist the refresh token, got: ${raw}`);
+      assert.ok(!raw.includes('account-rt-1'), `nor the original one, got: ${raw}`);
+
+      stream.push(DETACHED);
+      const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon across an account rotation');
+      assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('a SCOPED session survives an account-token refresh failure instead of ending, and stops retrying it', async () => {
+    // Once scoped, the account token is not this daemon's credential for any
+    // YoloBridge call. Ending a healthy session because it could not be rotated
+    // would be a self-inflicted brick — the exact failure mode that makes the
+    // drop conditional in the first place.
+    const home = realHome();
+    try {
+      let clock = T0;
+      saveAuth(
+        { accessToken: 'account-at-1', refreshToken: 'account-rt-1', tokenType: 'Bearer', expiresAtMs: T0 + 3600_000 },
+        home.env,
+      );
+
+      const heartbeatAuths: string[] = [];
+      const stream = controllableSseResponse(CONNECTED);
+      const fetchImpl = (async (url: any, init?: any) => {
+        const u = String(url);
+        if (u.endsWith('/yolobridge/attach')) {
+          return jsonResponse(201, {
+            tileId: 'tile-1',
+            attachmentId: 'a1',
+            scopedToken: 'scoped-tok-1',
+            scopedTokenExpiresAt: T0 + 30 * DAY_MS,
+          });
+        }
+        if (u.includes('/yolobridge/stream')) return stream.response;
+        if (u.endsWith('/yolobridge/events')) {
+          heartbeatAuths.push(String(init?.headers?.Authorization ?? ''));
+          return jsonResponse(200, { recorded: true });
+        }
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      let refreshAttempts = 0;
+      const refreshAccessToken: RefreshTokenFn = async () => {
+        refreshAttempts += 1;
+        return { status: 'failed', message: 'auth-service said no' };
+      };
+
+      const timers = fakeTimers();
+      const events: ConnectionEvent[] = [];
+      const resultPromise = runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        refreshAccessToken,
+        log: () => {},
+        clearScreen: () => {},
+        onConnectionEvent: (e) => events.push(e),
+        now: () => clock,
+        timers,
+      });
+
+      await waitUntil(() => timers.intervals.length >= 2);
+      clock = T0 + 3600_000; // the account token is now unrotatable
+      await tickUntil(timers, () => refreshAttempts > 0);
+      const heartbeatsAtFailure = heartbeatAuths.length;
+      await tickUntil(timers, () => heartbeatAuths.length > heartbeatsAtFailure);
+
+      assert.ok(refreshAttempts > 0, 'sanity: the account refresh really was attempted and really failed');
+      assert.equal(refreshAttempts, 1, 'a failure that cannot recover must not be retried on every tick');
+      assert.ok(
+        heartbeatAuths.slice(heartbeatsAtFailure).every((a) => a === 'Bearer scoped-tok-1'),
+        `the session must keep heartbeating on the scoped token, saw ${heartbeatAuths.join(', ')}`,
+      );
+      assert.ok(
+        !events.some((e) => e.state === 'degraded'),
+        'an expected-by-design account rotation failure must not leave `status` reporting a healthy session as degraded',
+      );
+
+      stream.push(DETACHED);
+      const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon across a failed account rotation');
+      assert.deepEqual(
+        result,
+        { ok: true, reason: 'detached-by-server' },
+        'the daemon must end on the server detach, NOT on refresh-failed',
+      );
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('persists the scoped credential — and each RENEWAL of it — into the 0600 attachment record', async () => {
+    const home = realHome();
+    try {
+      let clock = T0;
+      const TTL_MS = 3600_000;
+      saveAuth(
+        { accessToken: 'account-at', refreshToken: 'account-rt', tokenType: 'Bearer', expiresAtMs: T0 + 30 * DAY_MS },
+        home.env,
+      );
+
+      let refreshCalls = 0;
+      const stream = controllableSseResponse(CONNECTED);
+      const fetchImpl = (async (url: any) => {
+        const u = String(url);
+        if (u.endsWith('/yolobridge/attach')) {
+          return jsonResponse(201, {
+            tileId: 'tile-1',
+            attachmentId: 'a1',
+            scopedToken: 'scoped-1',
+            scopedTokenExpiresAt: clock + TTL_MS,
+          });
+        }
+        if (u.includes('/refresh')) {
+          refreshCalls += 1;
+          return jsonResponse(200, { scopedToken: 'scoped-2', scopedTokenExpiresAt: clock + TTL_MS });
+        }
+        if (u.includes('/yolobridge/stream')) return stream.response;
+        if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      const timers = fakeTimers();
+      const resultPromise = runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        log: () => {},
+        clearScreen: () => {},
+        now: () => clock,
+        timers,
+      });
+
+      await waitUntil(() => timers.intervals.length >= 2);
+
+      const atAttach = loadAttachment(home.env);
+      assert.equal(atAttach?.scopedToken, 'scoped-1', 'the minted credential must be on disk for a restart to resume from');
+      assert.equal(atAttach?.scopedTokenExpiresAtMs, T0 + TTL_MS, 'without the expiry a restart cannot schedule around it');
+      assert.equal(atAttach?.attachmentId, 'a1');
+      // Same file, same posture as before this card — no new mode invented.
+      assert.equal(fs.statSync(home.attachmentFile).mode & 0o777, 0o600);
+
+      clock = T0 + Math.floor(TTL_MS * 0.75) + 1;
+      await tickUntil(timers, () => refreshCalls > 0);
+      assert.equal(
+        loadAttachment(home.env)?.scopedToken,
+        'scoped-2',
+        'a restart hours in must resume from the RENEWED credential, not the one attach happened to issue',
+      );
+
+      stream.push(DETACHED);
+      const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon across a persisted renewal');
+      assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+      assert.equal(loadAttachment(home.env), undefined, 'a clean detach must take the stored credential with it');
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('RESUMES from the stored scoped credential — no re-attach, no re-login — when the account token is gone', async () => {
+    // The situation this card creates on purpose: a daemon that ran for days,
+    // whose account access token expired on day one and whose refresh token is
+    // deliberately no longer on disk. Its restart has no account credential at
+    // all — but the workspace-scoped one it still holds is exactly the
+    // credential the attachment's own routes want.
+    const home = realHome();
+    try {
+      const clock = T0;
+      // Post-card-08 auth.json: expired access token, NO refresh token.
+      saveAuth({ accessToken: 'stale-account-at', tokenType: 'Bearer', expiresAtMs: clock - 1000 }, home.env);
+      // A scoped token that expired 5 minutes ago — inside card 07's 15-minute
+      // renewal window, so the server will still renew it.
+      saveAttachment(
+        {
+          workspaceId: 'w1',
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          attachedAt: '2026-08-25T00:00:00.000Z',
+          scopedToken: 'stored-scoped',
+          scopedTokenExpiresAtMs: clock - 5 * 60_000,
+        },
+        home.env,
+      );
+
+      const seen: Array<{ path: string; auth: string }> = [];
+      const stream = controllableSseResponse(CONNECTED);
+      const fetchImpl = (async (url: any, init?: any) => {
+        const u = String(url);
+        const p = u.replace('https://api.example.com', '');
+        seen.push({ path: p, auth: String(init?.headers?.Authorization ?? '') });
+        if (p.endsWith('/yolobridge/attach')) throw new Error('a resume must NEVER create a second attachment');
+        if (p.includes('/refresh')) {
+          return jsonResponse(200, { scopedToken: 'renewed-scoped', scopedTokenExpiresAt: clock + 3600_000 });
+        }
+        if (p.includes('/yolobridge/stream')) return stream.response;
+        if (p.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      let accountRefreshCalls = 0;
+      const refreshAccessToken: RefreshTokenFn = async () => {
+        accountRefreshCalls += 1;
+        return { status: 'failed', message: 'should never be called — there is no refresh token' };
+      };
+
+      const timers = fakeTimers();
+      const logs: string[] = [];
+      const resultPromise = runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        refreshAccessToken,
+        log: (line) => logs.push(line),
+        clearScreen: () => {},
+        now: () => clock,
+        timers,
+      });
+
+      await waitUntil(() => timers.intervals.length >= 2);
+      await tickUntil(timers, () => seen.some((c) => c.path.endsWith('/yolobridge/events')));
+
+      assert.equal(
+        seen.filter((c) => c.path.endsWith('/yolobridge/attach')).length,
+        0,
+        'the resumed daemon must not have re-attached',
+      );
+      assert.equal(accountRefreshCalls, 0, 'with no refresh token stored there is nothing to call auth-service with');
+
+      const renewal = seen.find((c) => c.path.includes('/refresh'));
+      assert.ok(renewal, 'the resumed daemon must renew the credential it picked up off disk');
+      assert.equal(renewal.auth, 'Bearer stored-scoped', 'the renewal proves possession of the STORED token');
+
+      const streamCall = seen.find((c) => c.path.includes('/yolobridge/stream'));
+      assert.equal(streamCall?.auth, 'Bearer renewed-scoped', 'the resumed stream must ride the renewed credential');
+      const heartbeats = seen.filter((c) => c.path.endsWith('/yolobridge/events'));
+      assert.ok(heartbeats.length > 0, 'sanity: the resumed session really is live');
+      for (const hb of heartbeats) assert.equal(hb.auth, 'Bearer renewed-scoped');
+
+      assert.ok(
+        logs.some((l) => /^Resumed\./.test(l)),
+        `the operator should be told this resumed rather than attached, saw: ${logs.join(' | ')}`,
+      );
+      assert.ok(
+        !logs.some((l) => /yolo-bridge login/.test(l)),
+        `resuming must not send the operator back to login, saw: ${logs.join(' | ')}`,
+      );
+
+      stream.push(DETACHED);
+      const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon resuming from disk');
+      assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('a resume OUTSIDE the renewal window ends with card 07\'s re-attach remedy, not a stack trace', async () => {
+    const home = realHome();
+    try {
+      const clock = T0;
+      saveAuth({ accessToken: 'stale-account-at', tokenType: 'Bearer', expiresAtMs: clock - 1000 }, home.env);
+      // Expired 30 minutes ago — past the 15-minute grace window.
+      saveAttachment(
+        {
+          workspaceId: 'w1',
+          tileId: 'tile-1',
+          attachmentId: 'a1',
+          attachedAt: '2026-08-25T00:00:00.000Z',
+          scopedToken: 'long-dead-scoped',
+          scopedTokenExpiresAtMs: clock - 30 * 60_000,
+        },
+        home.env,
+      );
+
+      let streamCalls = 0;
+      const fetchImpl = (async (url: any) => {
+        const u = String(url);
+        if (u.includes('/refresh')) return jsonResponse(401, { error: 'token too old to renew' });
+        if (u.includes('/yolobridge/stream')) {
+          streamCalls += 1;
+          return sseStreamResponse(CONNECTED);
+        }
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      const logs: string[] = [];
+      const events: ConnectionEvent[] = [];
+      const result = await withTimeout(
+        runAttachFromDisk({
+          workspaceId: 'w1',
+          commonApiBaseUrl: 'https://api.example.com',
+          env: home.env,
+          fetchImpl,
+          log: (line) => logs.push(line),
+          clearScreen: () => {},
+          onConnectionEvent: (e) => events.push(e),
+          now: () => clock,
+          timers: fakeTimers(),
+        }),
+        2000,
+        'runAttachDaemon resuming past the renewal window',
+      );
+
+      assert.equal(result.ok, false);
+      assert.equal((result as any).reason, 'refresh-failed');
+      assert.match(
+        (result as any).message,
+        /Run `yolo-bridge attach` again/,
+        'the remedy must be the one card 07 defined',
+      );
+      assert.equal(streamCalls, 0, 'a credential the server will not renew must never open a stream');
+      // Out-of-band, exactly as card 07 requires: the remedy travels as the
+      // returned message and the connection record, never onto the terminal
+      // the local agent may already own.
+      assert.ok(
+        !logs.some((l) => /could not be renewed/.test(l)),
+        `the renewal failure must not be narrated to stdout, saw: ${logs.join(' | ')}`,
+      );
+      const interrupted = events.filter((e) => e.state === 'interrupted');
+      assert.ok(interrupted.length > 0, 'the failure must be visible on the structured channel');
+      assert.match(interrupted[interrupted.length - 1].detail ?? '', /Run `yolo-bridge attach` again/);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('never writes the scoped token to the terminal, the connection record, or `yolo-bridge status`', async () => {
+    const home = realHome();
+    try {
+      let clock = T0;
+      const TTL_MS = 3600_000;
+      const SECRET = 'scoped-SECRET-do-not-log';
+      const RENEWED_SECRET = 'renewed-SECRET-do-not-log';
+      saveAuth(
+        { accessToken: 'account-at', refreshToken: 'account-rt', tokenType: 'Bearer', expiresAtMs: T0 + 30 * DAY_MS },
+        home.env,
+      );
+
+      let refreshCalls = 0;
+      const stream = controllableSseResponse(CONNECTED);
+      const fetchImpl = (async (url: any) => {
+        const u = String(url);
+        if (u.endsWith('/yolobridge/attach')) {
+          return jsonResponse(201, {
+            tileId: 'tile-1',
+            attachmentId: 'a1',
+            scopedToken: SECRET,
+            scopedTokenExpiresAt: clock + TTL_MS,
+          });
+        }
+        if (u.includes('/refresh')) {
+          refreshCalls += 1;
+          return jsonResponse(200, { scopedToken: RENEWED_SECRET, scopedTokenExpiresAt: clock + TTL_MS });
+        }
+        if (u.includes('/yolobridge/stream')) return stream.response;
+        if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+
+      const timers = fakeTimers();
+      const logs: string[] = [];
+      // No `onConnectionEvent`: this test wants the DEFAULT sink, i.e. the real
+      // connection.json a `yolo-bridge status` would read back.
+      const resultPromise = runAttachFromDisk({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        env: home.env,
+        fetchImpl,
+        log: (line) => logs.push(line),
+        clearScreen: () => {},
+        now: () => clock,
+        timers,
+      });
+
+      await waitUntil(() => timers.intervals.length >= 2);
+      clock = T0 + Math.floor(TTL_MS * 0.75) + 1;
+      await tickUntil(timers, () => refreshCalls > 0);
+
+      // Non-vacuous: there IS output, and there IS a connection record.
+      assert.ok(logs.length > 0, 'sanity: the daemon did write to the terminal');
+      assert.ok(fs.existsSync(home.connectionFile), 'sanity: the connection record was written');
+      const connectionRaw = fs.readFileSync(home.connectionFile, 'utf-8');
+      assert.match(connectionRaw, /a1/, 'sanity: the connection record really is about this attachment');
+
+      for (const secret of [SECRET, RENEWED_SECRET]) {
+        assert.ok(!logs.join('\n').includes(secret), `the scoped token must never be logged, saw: ${logs.join(' | ')}`);
+        assert.ok(!connectionRaw.includes(secret), 'the scoped token must never reach connection.json');
+      }
+
+      // ...and `yolo-bridge status`, which renders the attachment record that
+      // legitimately DOES store it, must not print it either.
+      const status = formatStatus(getStatus({ env: home.env, now: () => clock }));
+      assert.match(status, /attachmentId=a1/, 'sanity: status really did read this attachment');
+      for (const secret of [SECRET, RENEWED_SECRET]) {
+        assert.ok(!status.includes(secret), `\`yolo-bridge status\` must not print the credential, got: ${status}`);
+      }
+
+      stream.push(DETACHED);
+      const result = await withTimeout(resultPromise, 2000, 'runAttachDaemon under credential-logging scrutiny');
+      assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    } finally {
+      home.cleanup();
     }
   });
 });

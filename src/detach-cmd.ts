@@ -19,7 +19,13 @@
  */
 
 import { detach as apiDetach, type FetchImpl } from './api-client.js';
-import { loadAuth, loadAttachment, clearAttachment, type ConfigStoreIO } from './config-store.js';
+import {
+  loadAuth,
+  loadAttachment,
+  clearAttachment,
+  clearStoredScopedToken,
+  type ConfigStoreIO,
+} from './config-store.js';
 
 export interface DetachDeps {
   commonApiBaseUrl: string;
@@ -46,9 +52,18 @@ export async function runDetach(deps: DetachDeps): Promise<DetachResult> {
       attachment.attachmentId,
     );
   } catch (err) {
+    // The attachment RECORD is deliberately kept on a genuine failure so the
+    // retry path knows what to retry against — but the workspace-scoped
+    // credential stored alongside it is not part of that retry (this command
+    // authenticates the DELETE with the account token) and the server refuses
+    // it the moment the attachment stops being live. Keeping it would leave a
+    // dead credential sitting in a file whose only remaining risk is being
+    // read by someone else. Card 08.
+    clearStoredScopedToken(deps.env, deps.io);
     return { ok: false, reason: 'error', message: err instanceof Error ? err.message : String(err) };
   }
 
+  clearStoredScopedToken(deps.env, deps.io);
   clearAttachment(deps.env, deps.io);
   return { ok: true };
 }
