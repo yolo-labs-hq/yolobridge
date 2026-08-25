@@ -141,10 +141,36 @@ interface OwnershipMarker {
   permissionEntry?: boolean;
 }
 
+/**
+ * True only when `raw` has EXACTLY this module's own marker shape — no
+ * unexpected keys, and every present field correctly typed (Codex review,
+ * 2026-08-24, round 30): the previous check only confirmed "some object,"
+ * blindly casting it as `OwnershipMarker` — an operator with their OWN
+ * unrelated `_yolobridge` top-level key (however unlikely a name collision
+ * this is) would have it treated as this module's own record, letting
+ * `writeLocalMcpTrust` OVERWRITE it unconditionally and `removeLocalMcpTrust`
+ * later DELETE it outright, destroying data this module never owned. Same
+ * "present-but-invalid is refused" convention this file already applies to
+ * `enabledMcpjsonServers`/`permissions` — this is the one spot that skipped
+ * it.
+ */
+function looksLikeOurOwnMarker(raw: unknown): raw is OwnershipMarker {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const obj = raw as Record<string, unknown>;
+  const allowedKeys = new Set(['attachId', 'enabledServerEntry', 'permissionEntry']);
+  for (const key of Object.keys(obj)) {
+    if (!allowedKeys.has(key)) return false;
+  }
+  if ('attachId' in obj && typeof obj.attachId !== 'string') return false;
+  if ('enabledServerEntry' in obj && typeof obj.enabledServerEntry !== 'boolean') return false;
+  if ('permissionEntry' in obj && typeof obj.permissionEntry !== 'boolean') return false;
+  return true;
+}
+
 function readOwnershipMarker(settings: Record<string, unknown>): OwnershipMarker {
   const raw = settings[OWNERSHIP_MARKER];
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-  return raw as OwnershipMarker;
+  if (!looksLikeOurOwnMarker(raw)) return {};
+  return raw;
 }
 
 export interface McpTrustWriteResult {
@@ -235,6 +261,17 @@ export function writeLocalMcpTrust(cwd: string): McpTrustWriteResult {
     return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
   if (Array.isArray(permissionsObj.allow) && !permissionsObj.allow.every((v) => typeof v === 'string')) {
+    return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
+  }
+  // Present-but-NOT-our-own-shape is refused the same way, for the
+  // OWNERSHIP MARKER key itself (Codex review, 2026-08-24, round 30): an
+  // operator's own unrelated data under `_yolobridge` must never be
+  // silently overwritten (write) or deleted (a later detach) just because
+  // this module wants to write ITS OWN marker there. A genuinely ABSENT key,
+  // or one that already matches this module's own marker shape (a prior,
+  // possibly-crashed attach's own record — the legitimate reclaim case
+  // round 7 introduced this key for), is the only thing safe to overwrite.
+  if (OWNERSHIP_MARKER in settings && !looksLikeOurOwnMarker(settings[OWNERSHIP_MARKER])) {
     return { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false };
   }
 

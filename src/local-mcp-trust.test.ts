@@ -243,6 +243,33 @@ describe('writeLocalMcpTrust', () => {
       assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for: ${content}`);
     }
   });
+
+  it('refuses and leaves the file untouched when an EXISTING _yolobridge key does not match this module\'s own marker shape (Codex review, 2026-08-24, round 30)', () => {
+    // However unlikely an operator independently choosing this exact key
+    // name is, blindly overwriting (write) or later deleting (detach)
+    // unrelated data under it would destroy something this module never
+    // owned -- the same "present-but-invalid is refused" convention this
+    // file already applies to enabledMcpjsonServers/permissions.
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    for (const content of [
+      '{"_yolobridge":"just a string, not our marker shape"}',
+      '{"_yolobridge":{"someOperatorField":"unrelated"}}',
+      '{"_yolobridge":["not","an","object","at","all"]}',
+      '{"_yolobridge":{"attachId":123}}',
+    ]) {
+      writeFileSync(settingsPath(), content);
+      const result = writeLocalMcpTrust(dir);
+      assert.deepEqual(result, { ok: false, addedServerEntry: false, addedPermissionEntry: false, createdFile: false }, `expected refusal for: ${content}`);
+      assert.equal(readFileSync(settingsPath(), 'utf-8'), content, `file must be untouched for: ${content}`);
+    }
+  });
+
+  it('DOES proceed (reclaim) when an existing _yolobridge key already matches this module\'s own marker shape exactly — the legitimate crashed-prior-attach case', () => {
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify({ _yolobridge: { attachId: 'prior-attach-id', enabledServerEntry: true, permissionEntry: true } }));
+    const result = writeLocalMcpTrust(dir);
+    assert.equal(result.ok, true);
+  });
 });
 
 describe('removeLocalMcpTrust', () => {
