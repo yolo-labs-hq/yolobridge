@@ -107,6 +107,10 @@ function printHelp(): void {
       '    [--agent-id <id>]    Registry identity for local MCP access, if different from --agent',
       '                         (e.g. a raw executable path, or an agent whose binary name differs',
       '                         from its registry id like qwen-code/qwen). Defaults to --agent.',
+      '    [--fresh]            Always create a NEW attachment and tile. By default an attach that',
+      '                         finds a still-live attachment for this workspace on this machine',
+      '                         RESUMES it (same tile) instead of adding a duplicate; --fresh skips',
+      '                         that check entirely.',
       '  detach                 Detach the current workspace attachment.',
       '  status                 Print local login/attach state.',
       '  --help                 Print this help.',
@@ -132,6 +136,9 @@ export interface AttachArgs {
   hostLabel?: string;
   agentBin?: string;
   agentId?: string;
+  /** `--fresh` — never resume a stored attachment; always create a new one.
+   *  A bare boolean flag, so unlike the three above it consumes no value. */
+  fresh?: boolean;
 }
 
 export interface AttachArgsError {
@@ -165,8 +172,16 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
   let hostLabel: string | undefined;
   let agentBin: string | undefined;
   let agentId: string | undefined;
+  let fresh = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    // Boolean — handled before the value-taking flags so it never swallows
+    // the following argument (`attach --fresh w1` must still see `w1` as the
+    // positional workspace id).
+    if (a === '--fresh') {
+      fresh = true;
+      continue;
+    }
     if (a === '--label' || a === '--agent' || a === '--agent-id') {
       const value = args[i + 1];
       if (value === undefined || value.startsWith('--')) {
@@ -185,7 +200,7 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
       workspaceId = a;
     }
   }
-  return { workspaceId, hostLabel, agentBin, agentId };
+  return { workspaceId, hostLabel, agentBin, agentId, fresh };
 }
 
 /**
@@ -242,7 +257,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   const parsed = parseAttachArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`yolo-bridge attach: ${parsed.error}\n`);
-    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>]\n');
+    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>] [--fresh]\n');
     return 64;
   }
   let workspaceId = parsed.workspaceId;
@@ -254,6 +269,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   // match, which is every built-in agent this daemon has been used with so
   // far (claude, codex).
   const resolvedAgentId = parsed.agentId ?? agentBin ?? DEFAULT_AGENT_BIN;
+  const fresh = parsed.fresh === true;
   if (workspaceId) {
     const resolved = await resolveWorkspaceIdOrName(workspaceId, { commonApiBaseUrl: apiUrl() });
     if (!resolved.ok) {
@@ -282,7 +298,7 @@ async function cmdAttach(args: string[]): Promise<number> {
           process.stderr.write(`yolo-bridge attach: ${pick.message}\n`);
           break;
       }
-      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>]\n');
+      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>] [--fresh]\n');
       return 64;
     }
     workspaceId = pick.workspaceId;
@@ -320,6 +336,7 @@ async function cmdAttach(args: string[]): Promise<number> {
       commonApiBaseUrl: apiUrl(),
       hostLabel: attachHostInfo.hostLabel,
       remoteHost: attachHostInfo.remoteHost,
+      fresh,
       shouldStop: () => stopRequested,
       // Fires once the real tileId exists (docs/YOLOBRIDGE_PLAN.md's "Local
       // MCP access" section) — starts the local MCP proxy and writes

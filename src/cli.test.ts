@@ -7,32 +7,32 @@ import { parseAttachArgs, resolveAttachHostInfo, resolveWorkspaceIdOrName } from
 describe('parseAttachArgs', () => {
   it('plain workspaceId with no flags', () => {
     const result = parseAttachArgs(['w1']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: undefined });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: undefined, fresh: false });
   });
 
   it('--label before the positional id', () => {
     const result = parseAttachArgs(['--label', 'laptop', 'w1']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: 'laptop', agentBin: undefined, agentId: undefined });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: 'laptop', agentBin: undefined, agentId: undefined, fresh: false });
   });
 
   it('positional id before --agent', () => {
     const result = parseAttachArgs(['w1', '--agent', 'codex']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: 'codex', agentId: undefined });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: 'codex', agentId: undefined, fresh: false });
   });
 
   it('both flags in different order relative to the positional id', () => {
     const result = parseAttachArgs(['--agent', 'codex', '--label', 'laptop', 'w1']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: 'laptop', agentBin: 'codex', agentId: undefined });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: 'laptop', agentBin: 'codex', agentId: undefined, fresh: false });
   });
 
   it('--label with no id at all leaves workspaceId undefined (picker should trigger)', () => {
     const result = parseAttachArgs(['--label', 'laptop']);
-    assert.deepEqual(result, { workspaceId: undefined, hostLabel: 'laptop', agentBin: undefined, agentId: undefined });
+    assert.deepEqual(result, { workspaceId: undefined, hostLabel: 'laptop', agentBin: undefined, agentId: undefined, fresh: false });
   });
 
   it('no args at all leaves everything undefined (picker should trigger)', () => {
     const result = parseAttachArgs([]);
-    assert.deepEqual(result, { workspaceId: undefined, hostLabel: undefined, agentBin: undefined, agentId: undefined });
+    assert.deepEqual(result, { workspaceId: undefined, hostLabel: undefined, agentBin: undefined, agentId: undefined, fresh: false });
   });
 
   it('--label value that looks like a flag is rejected as a missing value, not consumed', () => {
@@ -52,22 +52,41 @@ describe('parseAttachArgs', () => {
 
   it('only the first positional token is taken as the workspaceId', () => {
     const result = parseAttachArgs(['w1', 'w2']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: undefined });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: undefined, fresh: false });
   });
 
   it('--agent-id independent of --agent, for a binary whose registry identity differs (Codex review, 2026-08-24, round 4/5)', () => {
     const result = parseAttachArgs(['w1', '--agent', '/opt/bin/qwen', '--agent-id', 'qwen-code']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: '/opt/bin/qwen', agentId: 'qwen-code' });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: '/opt/bin/qwen', agentId: 'qwen-code', fresh: false });
   });
 
   it('--agent-id alone, with no --agent (defaults the spawn binary elsewhere, only overrides the mint identity)', () => {
     const result = parseAttachArgs(['w1', '--agent-id', 'kiro']);
-    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: 'kiro' });
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: 'kiro', fresh: false });
   });
 
   it('a trailing --agent-id with no following value is rejected', () => {
     const result = parseAttachArgs(['w1', '--agent-id']);
     assert.deepEqual(result, { error: '--agent-id requires a value' });
+  });
+
+  it('--fresh sets the flag and, being a bare boolean, does not swallow the positional id', () => {
+    // The whole hazard of adding a boolean to a parser built around
+    // value-taking flags: `--fresh w1` must NOT consume `w1` as its value and
+    // send the operator to the interactive picker.
+    const result = parseAttachArgs(['--fresh', 'w1']);
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: undefined, agentBin: undefined, agentId: undefined, fresh: true });
+  });
+
+  it('--fresh combines with the value-taking flags in any order', () => {
+    const result = parseAttachArgs(['w1', '--label', 'laptop', '--fresh', '--agent', 'codex']);
+    assert.deepEqual(result, { workspaceId: 'w1', hostLabel: 'laptop', agentBin: 'codex', agentId: undefined, fresh: true });
+  });
+
+  it('--fresh is false when absent, so the default is to resume', () => {
+    const result = parseAttachArgs(['w1']);
+    assert.equal('error' in result, false);
+    assert.equal((result as { fresh?: boolean }).fresh, false);
   });
 });
 

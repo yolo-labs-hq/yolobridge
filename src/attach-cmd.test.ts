@@ -2237,7 +2237,14 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
     }
   });
 
-  it('a resume OUTSIDE the renewal window ends with card 07\'s re-attach remedy, not a stack trace', async () => {
+  it('a stored attachment the server will not renew AND a dead account token ends in the login remedy, not a stack trace', async () => {
+    // Card 10 changed what happens here. The probe (card 07's refresh route)
+    // is now the liveness check, so a credential the server refuses is simply
+    // "nothing to resume" and the daemon falls through to the ordinary attach
+    // path — where, with an expired account access token and no refresh token
+    // on disk, there is genuinely nothing left but `yolo-bridge login`. That
+    // is the honest remedy: card 07's `yolo-bridge attach` advice would have
+    // sent the operator to a command that cannot authenticate either.
     const home = realHome();
     try {
       const clock = T0;
@@ -2256,9 +2263,18 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
       );
 
       let streamCalls = 0;
+      let probeCalls = 0;
+      let attachCalls = 0;
       const fetchImpl = (async (url: any) => {
         const u = String(url);
-        if (u.includes('/refresh')) return jsonResponse(401, { error: 'token too old to renew' });
+        if (u.includes('/refresh')) {
+          probeCalls += 1;
+          return jsonResponse(401, { error: 'token too old to renew' });
+        }
+        if (u.endsWith('/yolobridge/attach')) {
+          attachCalls += 1;
+          return jsonResponse(201, ATTACH_OK);
+        }
         if (u.includes('/yolobridge/stream')) {
           streamCalls += 1;
           return sseStreamResponse(CONNECTED);
@@ -2281,27 +2297,25 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
           timers: fakeTimers(),
         }),
         2000,
-        'runAttachDaemon resuming past the renewal window',
+        'runAttachDaemon past the renewal window with no account credential',
       );
 
+      // "It actually happened": the probe really was sent, exactly once, and
+      // it is what decided there was nothing to resume.
+      assert.equal(probeCalls, 1, 'liveness must be probed exactly once, and a refusal must not be retried');
       assert.equal(result.ok, false);
       assert.equal((result as any).reason, 'refresh-failed');
       assert.match(
         (result as any).message,
-        /Run `yolo-bridge attach` again/,
-        'the remedy must be the one card 07 defined',
+        /no refresh token is stored on this machine/,
+        'with no account credential left, the honest remedy is login',
       );
-      assert.equal(streamCalls, 0, 'a credential the server will not renew must never open a stream');
-      // Out-of-band, exactly as card 07 requires: the remedy travels as the
-      // returned message and the connection record, never onto the terminal
-      // the local agent may already own.
       assert.ok(
-        !logs.some((l) => /could not be renewed/.test(l)),
-        `the renewal failure must not be narrated to stdout, saw: ${logs.join(' | ')}`,
+        logs.some((l) => /Run `yolo-bridge login` again/.test(l)),
+        `the operator must be told what to do, saw: ${logs.join(' | ')}`,
       );
-      const interrupted = events.filter((e) => e.state === 'interrupted');
-      assert.ok(interrupted.length > 0, 'the failure must be visible on the structured channel');
-      assert.match(interrupted[interrupted.length - 1].detail ?? '', /Run `yolo-bridge attach` again/);
+      assert.equal(attachCalls, 0, 'an attach with no usable account token must not even be tried');
+      assert.equal(streamCalls, 0, 'nothing was attached, so nothing may open a stream');
     } finally {
       home.cleanup();
     }
@@ -2384,5 +2398,371 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
     } finally {
       home.cleanup();
     }
+  });
+
+  /**
+   * Card 10 — LIVENESS, not the account token's health, decides whether a
+   * restart resumes.
+   *
+   * Card 08's gate was `!initialRefresh.ok`, so only a daemon whose ACCOUNT
+   * token had died ever resumed. A daemon restarting with a healthy account
+   * token ignored a perfectly good stored attachment and attached again,
+   * leaving the operator with a duplicate tile. These tests pin the request
+   * COUNTS — the returned ids alone would still look right while a second
+   * attachment was quietly created.
+   */
+  describe('resume is the default, gated on server-confirmed liveness (card 10)', () => {
+    const HEALTHY_AUTH = {
+      accessToken: 'account-at',
+      refreshToken: 'account-rt',
+      tokenType: 'Bearer' as const,
+      expiresAtMs: T0 + 30 * DAY_MS,
+    };
+    const LIVE_STORED = {
+      workspaceId: 'w1',
+      tileId: 'tile-1',
+      attachmentId: 'a1',
+      attachedAt: '2026-08-25T00:00:00.000Z',
+      scopedToken: 'stored-scoped',
+      scopedTokenExpiresAtMs: T0 + 1800_000,
+    };
+
+    /** One fake server for all of these: counts every call by kind so a test
+     *  can assert what did NOT happen as well as what did. */
+    function server(opts: {
+      stream: { response: Response };
+      refresh: () => Response;
+      attach?: () => Response;
+    }) {
+      const counts = { attach: 0, refresh: 0, stream: 0, events: 0 };
+      const seen: Array<{ path: string; auth: string }> = [];
+      const fetchImpl = (async (url: any, init?: any) => {
+        const u = String(url);
+        const path = u.replace('https://api.example.com', '');
+        seen.push({ path, auth: String(init?.headers?.Authorization ?? '') });
+        if (path.includes('/refresh')) {
+          counts.refresh += 1;
+          return opts.refresh();
+        }
+        if (path.endsWith('/yolobridge/attach')) {
+          counts.attach += 1;
+          if (!opts.attach) throw new Error('this test forbids attach');
+          return opts.attach();
+        }
+        if (path.includes('/yolobridge/stream')) {
+          counts.stream += 1;
+          return opts.stream.response;
+        }
+        if (path.endsWith('/yolobridge/events')) {
+          counts.events += 1;
+          return jsonResponse(200, { recorded: true });
+        }
+        throw new Error(`unexpected request: ${u}`);
+      }) as any;
+      return { counts, seen, fetchImpl };
+    }
+
+    it('a HEALTHY account token + a live stored attachment resumes it — ZERO attach requests', async () => {
+      const home = realHome();
+      try {
+        const clock = T0;
+        saveAuth(HEALTHY_AUTH, home.env);
+        saveAttachment(LIVE_STORED, home.env);
+
+        const stream = controllableSseResponse(CONNECTED);
+        // No `attach` handler at all: reaching it throws, and the counter
+        // below proves it was never even approached.
+        const { counts, seen, fetchImpl } = server({
+          stream,
+          refresh: () => jsonResponse(200, { scopedToken: 'renewed-scoped', scopedTokenExpiresAt: clock + 3600_000 }),
+        });
+
+        const timers = fakeTimers();
+        const logs: string[] = [];
+        const resultPromise = runAttachFromDisk({
+          workspaceId: 'w1',
+          commonApiBaseUrl: 'https://api.example.com',
+          env: home.env,
+          fetchImpl,
+          log: (line) => logs.push(line),
+          clearScreen: () => {},
+          now: () => clock,
+          timers,
+        });
+
+        await waitUntil(() => timers.intervals.length >= 2);
+        await tickUntil(timers, () => counts.events > 0);
+
+        // THE defect this card fixes, asserted as a COUNT: a healthy account
+        // token must not create a second server-side attachment.
+        assert.equal(counts.attach, 0, 'a healthy account token must not cause a duplicate attach');
+        assert.equal(counts.refresh, 1, 'liveness is probed exactly once, via card 07’s refresh route');
+        assert.ok(counts.events > 0, 'sanity: the resumed session really is live');
+
+        const probe = seen.find((c) => c.path.includes('/refresh'));
+        assert.equal(probe?.auth, 'Bearer stored-scoped', 'the probe proves possession of the STORED credential');
+        assert.equal(
+          probe?.path,
+          '/v1/workspaces/w1/yolobridge/attach/a1/refresh',
+          'the probe must address the STORED attachment',
+        );
+
+        const streamCall = seen.find((c) => c.path.includes('/yolobridge/stream'));
+        assert.equal(streamCall?.auth, 'Bearer renewed-scoped', 'the resumed stream rides the credential the probe returned');
+
+        assert.ok(
+          logs.some((l) => l === 'Resumed. tileId=tile-1 attachmentId=a1'),
+          `the SAME tile/attachment must be adopted, saw: ${logs.join(' | ')}`,
+        );
+        const onDisk = loadAttachment(home.env);
+        assert.equal(onDisk?.attachmentId, 'a1');
+        assert.equal(onDisk?.tileId, 'tile-1');
+        assert.equal(onDisk?.scopedToken, 'renewed-scoped', 'the resumed daemon persists the credential it is actually using');
+
+        stream.push(DETACHED);
+        assert.deepEqual(
+          await withTimeout(resultPromise, 2000, 'runAttachDaemon resuming on a healthy account token'),
+          { ok: true, reason: 'detached-by-server' },
+        );
+      } finally {
+        home.cleanup();
+      }
+    });
+
+    it('a stored attachment the server has DETACHED (probe 403s) falls through to EXACTLY ONE new attach', async () => {
+      const home = realHome();
+      try {
+        const clock = T0;
+        saveAuth(HEALTHY_AUTH, home.env);
+        saveAttachment(LIVE_STORED, home.env);
+
+        const stream = controllableSseResponse('event: connected\ndata: {"attachmentId":"a2","workspaceId":"w1","timestamp":"t"}\n\n');
+        const { counts, fetchImpl } = server({
+          stream,
+          refresh: () =>
+            jsonResponse(403, {
+              error: 'This YoloBridge attachment is no longer active — run `yolo-bridge attach` again',
+              code: 'FORBIDDEN',
+            }),
+          attach: () =>
+            jsonResponse(201, {
+              tileId: 'tile-2',
+              attachmentId: 'a2',
+              scopedToken: 'fresh-scoped',
+              scopedTokenExpiresAt: clock + 3600_000,
+            }),
+        });
+
+        const timers = fakeTimers();
+        const logs: string[] = [];
+        const resultPromise = runAttachFromDisk({
+          workspaceId: 'w1',
+          commonApiBaseUrl: 'https://api.example.com',
+          env: home.env,
+          fetchImpl,
+          log: (line) => logs.push(line),
+          clearScreen: () => {},
+          now: () => clock,
+          timers,
+        });
+
+        await waitUntil(() => timers.intervals.length >= 2);
+        await tickUntil(timers, () => counts.events > 0);
+
+        assert.equal(counts.refresh, 1, 'the dead attachment is probed once and not retried');
+        assert.equal(counts.attach, 1, 'EXACTLY one replacement attachment — not zero, not two');
+        assert.ok(counts.events > 0, 'sanity: the replacement session really is live');
+        assert.ok(
+          logs.some((l) => l === 'Attached. tileId=tile-2 attachmentId=a2'),
+          `the operator gets the NEW tile, saw: ${logs.join(' | ')}`,
+        );
+        assert.ok(
+          logs.some((l) => /no longer resumable/.test(l)),
+          `the fall-through must be explained, saw: ${logs.join(' | ')}`,
+        );
+        assert.equal(loadAttachment(home.env)?.attachmentId, 'a2', 'the stored record must follow the live attachment');
+
+        stream.push('event: detached\ndata: {"attachmentId":"a2"}\n\n');
+        assert.deepEqual(
+          await withTimeout(resultPromise, 2000, 'runAttachDaemon after a detached-attachment fall-through'),
+          { ok: true, reason: 'detached-by-server' },
+        );
+      } finally {
+        home.cleanup();
+      }
+    });
+
+    it('with NO stored attachment the ordinary path is unchanged — one attach, no probe', async () => {
+      const home = realHome();
+      try {
+        const clock = T0;
+        saveAuth(HEALTHY_AUTH, home.env);
+        assert.equal(loadAttachment(home.env), undefined, 'sanity: nothing to resume from');
+
+        const stream = controllableSseResponse(CONNECTED);
+        const { counts, fetchImpl } = server({
+          stream,
+          refresh: () => {
+            throw new Error('there is nothing stored to probe');
+          },
+          attach: () => jsonResponse(201, ATTACH_OK),
+        });
+
+        const timers = fakeTimers();
+        const logs: string[] = [];
+        const resultPromise = runAttachFromDisk({
+          workspaceId: 'w1',
+          commonApiBaseUrl: 'https://api.example.com',
+          env: home.env,
+          fetchImpl,
+          log: (line) => logs.push(line),
+          clearScreen: () => {},
+          now: () => clock,
+          timers,
+        });
+
+        await waitUntil(() => timers.intervals.length >= 2);
+        await tickUntil(timers, () => counts.events > 0);
+
+        assert.equal(counts.refresh, 0, 'no stored credential means no probe to send');
+        assert.equal(counts.attach, 1);
+        assert.ok(
+          logs.some((l) => l === 'Attached. tileId=tile-1 attachmentId=a1'),
+          `saw: ${logs.join(' | ')}`,
+        );
+
+        stream.push(DETACHED);
+        assert.deepEqual(
+          await withTimeout(resultPromise, 2000, 'runAttachDaemon with nothing to resume'),
+          { ok: true, reason: 'detached-by-server' },
+        );
+      } finally {
+        home.cleanup();
+      }
+    });
+
+    it('an account token the auth-service REFUSES still resumes — the ordering win', async () => {
+      // `ensureFreshToken` used to run first and be fatal. It is now only on
+      // the attach path, so a daemon whose account credential is unusable but
+      // whose attachment is live comes back cleanly. Without this the whole
+      // point of persisting the scoped credential regresses silently.
+      const home = realHome();
+      try {
+        const clock = T0;
+        // Expired access token, and a refresh token the auth-service rejects.
+        saveAuth(
+          { accessToken: 'dead-at', refreshToken: 'revoked-rt', tokenType: 'Bearer', expiresAtMs: clock - 1000 },
+          home.env,
+        );
+        saveAttachment(LIVE_STORED, home.env);
+
+        let accountRefreshCalls = 0;
+        const refreshAccessToken: RefreshTokenFn = async () => {
+          accountRefreshCalls += 1;
+          return { status: 'failed', message: 'refresh token revoked' };
+        };
+
+        const stream = controllableSseResponse(CONNECTED);
+        const { counts, fetchImpl } = server({
+          stream,
+          refresh: () => jsonResponse(200, { scopedToken: 'renewed-scoped', scopedTokenExpiresAt: clock + 3600_000 }),
+        });
+
+        const timers = fakeTimers();
+        const logs: string[] = [];
+        const resultPromise = runAttachFromDisk({
+          workspaceId: 'w1',
+          commonApiBaseUrl: 'https://api.example.com',
+          env: home.env,
+          fetchImpl,
+          refreshAccessToken,
+          log: (line) => logs.push(line),
+          clearScreen: () => {},
+          now: () => clock,
+          timers,
+        });
+
+        await waitUntil(() => timers.intervals.length >= 2);
+        await tickUntil(timers, () => counts.events > 0);
+
+        assert.equal(counts.attach, 0, 'the resume must not need an account credential at all');
+        assert.equal(counts.refresh, 1);
+        assert.ok(counts.events > 0, 'sanity: the session really is live despite the dead account token');
+        // "It actually happened": the account rotation WAS attempted (from the
+        // stream loop, where it is best-effort) and failed — and the session
+        // survived it. If this were zero the test would prove nothing about
+        // `ensureFreshToken` no longer being fatal.
+        assert.ok(accountRefreshCalls > 0, 'the account rotation must have been attempted and failed');
+        assert.ok(
+          !logs.some((l) => /yolo-bridge login/.test(l)),
+          `a live attachment must not send the operator back to login, saw: ${logs.join(' | ')}`,
+        );
+
+        stream.push(DETACHED);
+        assert.deepEqual(
+          await withTimeout(resultPromise, 2000, 'runAttachDaemon resuming past a refused account refresh'),
+          { ok: true, reason: 'detached-by-server' },
+        );
+      } finally {
+        home.cleanup();
+      }
+    });
+
+    it('--fresh creates a new attachment even when the stored one is live, and sends NO probe', async () => {
+      const home = realHome();
+      try {
+        const clock = T0;
+        saveAuth(HEALTHY_AUTH, home.env);
+        saveAttachment(LIVE_STORED, home.env);
+
+        const stream = controllableSseResponse('event: connected\ndata: {"attachmentId":"a2","workspaceId":"w1","timestamp":"t"}\n\n');
+        const { counts, fetchImpl } = server({
+          stream,
+          refresh: () => {
+            throw new Error('--fresh must never probe the stored attachment');
+          },
+          attach: () =>
+            jsonResponse(201, {
+              tileId: 'tile-2',
+              attachmentId: 'a2',
+              scopedToken: 'fresh-scoped',
+              scopedTokenExpiresAt: clock + 3600_000,
+            }),
+        });
+
+        const timers = fakeTimers();
+        const logs: string[] = [];
+        const resultPromise = runAttachFromDisk({
+          workspaceId: 'w1',
+          commonApiBaseUrl: 'https://api.example.com',
+          env: home.env,
+          fetchImpl,
+          fresh: true,
+          log: (line) => logs.push(line),
+          clearScreen: () => {},
+          now: () => clock,
+          timers,
+        });
+
+        await waitUntil(() => timers.intervals.length >= 2);
+        await tickUntil(timers, () => counts.events > 0);
+
+        assert.equal(counts.refresh, 0, '--fresh must not send a liveness probe at all');
+        assert.equal(counts.attach, 1, '--fresh always creates a new attachment');
+        assert.ok(
+          logs.some((l) => l === 'Attached. tileId=tile-2 attachmentId=a2'),
+          `saw: ${logs.join(' | ')}`,
+        );
+        assert.equal(loadAttachment(home.env)?.attachmentId, 'a2');
+
+        stream.push('event: detached\ndata: {"attachmentId":"a2"}\n\n');
+        assert.deepEqual(
+          await withTimeout(resultPromise, 2000, 'runAttachDaemon under --fresh'),
+          { ok: true, reason: 'detached-by-server' },
+        );
+      } finally {
+        home.cleanup();
+      }
+    });
   });
 });

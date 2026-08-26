@@ -156,6 +156,17 @@ export interface AttachDaemonDeps {
    * `refreshAccessToken` (the real `POST /api/v1/auth/refresh`). */
   refreshAccessToken?: RefreshTokenFn;
   /**
+   * `--fresh`: skip the resume attempt entirely and always create a NEW
+   * server-side attachment (and therefore a new tile).
+   *
+   * The escape hatch for the one thing resuming takes away — "give me a
+   * clean one". With it set the daemon sends no refresh probe at all, so a
+   * stored attachment is neither consulted nor disturbed; the ordinary
+   * account-token attach path runs exactly as it did before resuming became
+   * the default.
+   */
+  fresh?: boolean;
+  /**
    * Fires once, right after `attach` succeeds (tileId/attachmentId now
    * exist) and before the SSE stream loop begins. This is the ONLY point
    * where the caller can act on a real tileId before the local agent spawns
@@ -576,37 +587,31 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     }
   }
 
-  // Cover the case where the daemon is (re)started against a token that's
-  // already within the refresh buffer of expiry (e.g. `attach` run right
-  // after a long-down period) — refresh before the very first network
-  // call, not just before subsequent reconnects.
-  const initialRefresh = await ensureFreshToken();
-
   /**
    * RESUME an existing attachment from its persisted scoped credential
-   * (card 08), instead of creating a new one.
+   * (card 08), instead of creating a second one.
    *
-   * Deliberately reached ONLY when the account credential cannot do a fresh
-   * attach. A healthy account token takes the ordinary path, byte for byte as
-   * before — resuming is a recovery route, not a new default, so it cannot
-   * change what a normal `yolo-bridge attach` does.
+   * **LIVENESS decides, not the account token's health** (D7). Card 08 gated
+   * this on the account refresh having failed, which meant a daemon restarting
+   * with a healthy account token ignored a perfectly good stored attachment and
+   * called `attach` again — a SECOND server-side attachment and a second tile.
+   * The first stops heartbeating and is reaped, but the operator is left
+   * looking at a duplicate. Account-token health says nothing about whether the
+   * attachment is still alive, so it was never the right question.
    *
-   * The case it exists for is the one this card creates: a daemon that has run
-   * for days renewing its scoped credential, whose account access token expired
-   * on day one and whose refresh token is deliberately no longer on disk. Its
-   * restart has no account credential at all — but it does still hold a
-   * workspace-scoped one, which is precisely the credential the attachment's
-   * own routes want. Without this the operator is sent back to
-   * `yolo-bridge login` for a session that never actually lost anything.
+   * The probe is card 07's own renewal route
+   * (`POST .../yolobridge/attach/:attachmentId/refresh`). That route re-reads
+   * live attachment state on every call and 403s a detached one, so it is
+   * simultaneously the liveness check AND the source of a fresh credential —
+   * there is deliberately no second probe to drift out of agreement with it.
    *
-   * No window check here on purpose: the SERVER is the authority on whether a
-   * credential is still renewable (card 07's grace-window comment), and the
-   * renewal that runs before the stream opens asks it. If the answer is no, the
-   * daemon stops with card 07's own re-attach remedy rather than inventing a
-   * second, possibly-drifted opinion about the window here.
+   * A failure of ANY kind (403 detached, 401 past the renewal window, a
+   * network error) is not fatal here: it just means there is nothing to
+   * resume, and the ordinary attach path below runs. The server, not this
+   * binary's copy of the window, is the authority on which it was.
    */
   let resumed = false;
-  if (!initialRefresh.ok) {
+  if (!deps.fresh) {
     const stored = loadAttachment(env, io);
     if (
       stored &&
@@ -614,19 +619,46 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       stored.scopedToken !== undefined &&
       stored.scopedTokenExpiresAtMs !== undefined
     ) {
-      attachmentId = stored.attachmentId;
-      tileId = stored.tileId;
-      attachedAt = stored.attachedAt;
-      rememberScopedCredential(stored.scopedToken, stored.scopedTokenExpiresAtMs);
-      resumed = true;
-    } else {
-      log(`Token refresh failed: ${initialRefresh.message}`);
-      log('Run `yolo-bridge login` again.');
-      return { ok: false, reason: 'refresh-failed', message: initialRefresh.message };
+      try {
+        // A one-off config rather than `scopedCfg()`: the stored token is not
+        // adopted as THE credential until the server has confirmed it is
+        // still good, so a failed probe leaves the daemon's own state
+        // untouched and the fall-through is a clean ordinary attach.
+        const renewed = await apiClient.refreshScopedToken(
+          { commonApiBaseUrl, accessToken: stored.scopedToken, fetchImpl },
+          workspaceId,
+          stored.attachmentId,
+        );
+        attachmentId = stored.attachmentId;
+        tileId = stored.tileId;
+        attachedAt = stored.attachedAt;
+        rememberScopedCredential(renewed.scopedToken, renewed.scopedTokenExpiresAt);
+        resumed = true;
+      } catch (err) {
+        // Pre-spawn, so `log` is safe here (nothing owns the terminal yet) —
+        // and worth saying out loud: the operator is about to get a NEW tile
+        // where they may have expected the old one back.
+        const message = err instanceof Error ? err.message : String(err);
+        log(`Stored attachment is no longer resumable (${message}) — attaching fresh.`);
+      }
     }
   }
 
   if (!resumed) {
+    // ONLY the attach path needs the account credential — attach is the call
+    // that creates the scope, and nothing after it presents an account token.
+    // Keeping this refresh inside the branch is the ordering win D7 exists
+    // for: a daemon whose account token expired days ago, but whose
+    // attachment is still live, resumes above and never reaches this line.
+    // (It also still covers the original reason it existed: an `attach` run
+    // right after a long-down period, against a token already inside the
+    // refresh buffer, rotates before the very first network call.)
+    const initialRefresh = await ensureFreshToken();
+    if (!initialRefresh.ok) {
+      log(`Token refresh failed: ${initialRefresh.message}`);
+      log('Run `yolo-bridge login` again.');
+      return { ok: false, reason: 'refresh-failed', message: initialRefresh.message };
+    }
     try {
       const result = await apiClient.attach(accountCfg, workspaceId, hostLabel, remoteHost);
       attachmentId = result.attachmentId;
