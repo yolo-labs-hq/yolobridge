@@ -1150,8 +1150,14 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                               endOffset: raw.endOffset,
                               data: raw.data,
                               truncated: raw.truncated,
+                              prologue: raw.prologue,
                             }
                           : undefined,
+                        // The viewer's integrity check compares this against a
+                        // digest of its OWN rendered screen; a mismatch that
+                        // survives the false-positive guards is the only
+                        // available proof that the two parsers have diverged.
+                        screenDigest: raw?.screenDigest,
                       },
                     )
                     .catch((err) =>

@@ -41,10 +41,12 @@ import {
   primeRawStream,
   onLocalAgentData,
   getLocalAgentGeometry,
+  screenDigest,
   __getLocalAgentTerminal,
   RAW_RING_MAX_BYTES,
   type PtySpawnImpl,
   type RawChunkMeta,
+  type DigestTerminal,
 } from './local-agent.js';
 import { OutputStreamBuffer } from './output-stream.js';
 
@@ -101,10 +103,14 @@ class Viewer {
     this.term = new Terminal({ cols, rows, allowProposedApi: true });
   }
 
-  async seed(seed: { epoch: string; endOffset: number; data: string }): Promise<void> {
+  async seed(seed: { epoch: string; endOffset: number; data: string; prologue?: string }): Promise<void> {
     this.term.reset();
     this.epoch = seed.epoch;
     this.nextOffset = seed.endOffset;
+    // Modes first, bytes second — exactly what `YoloBridgeStreamSink.seededRaw`
+    // emits, and in the same order, because the prologue describes the canvas
+    // the bytes were drawn on.
+    if (seed.prologue) await write(this.term, seed.prologue);
     await write(this.term, seed.data);
   }
 
@@ -465,5 +471,349 @@ describe('daemon geometry', () => {
     assert.equal(handle.cols, 132);
     assert.equal(handle.rows, 43);
     assert.equal(takeRawSeed()!.cols, 132);
+  });
+});
+
+// ─── Gap 1: a replay must never begin mid-escape-sequence ───────────────────
+
+/**
+ * The ring's oldest retained byte is wherever the trim happened to land, and
+ * "wherever" is not a boundary any parser respects. Land it inside
+ * `ESC[38;5;196m` and a viewer's xterm reads `5;196m` as TEXT — prints it, and
+ * carries on WITHOUT the colour the daemon has been drawing in ever since.
+ * That is not a transient glitch: nothing in the stream will ever set that
+ * attribute again, so the viewer is wrong until something else re-seeds it.
+ */
+describe('ground-state resolution: a seed never starts inside an escape sequence', () => {
+  const PREFIX_BYTES = 100;
+  const CSI = `${ESC}[38;5;196m`;      // 11 bytes, at offsets 100..110
+  const LINE = `${'z'.repeat(38)}\r\n`; // 40 bytes
+  const LINES = 6553;
+  /** Chosen so the ring's trim lands exactly 5 bytes INTO the CSI above. */
+  const PAD_BYTES = 18;
+
+  /** Every byte the PTY produced, as one ASCII string — so a JS index is also
+   *  a UTF-8 byte offset and the test can name exact positions. */
+  function fullStream(): string {
+    return 'a'.repeat(PREFIX_BYTES) + CSI + LINE.repeat(LINES) + 'y'.repeat(PAD_BYTES);
+  }
+
+  /**
+   * Emits the whole stream and then SETTLES the daemon's terminal, which is
+   * what `attach-cmd.ts` does before every seed (`await captureOutput()`).
+   * The ring is written synchronously but the terminal is fed through an async
+   * write chain, so a seed taken before it drains would report the modes and
+   * the screen of a moment the ring has already left behind.
+   */
+  async function startFlooded(): Promise<void> {
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl,
+      stdout: { write: () => true },
+      stdin: undefined,
+      cols: 40,
+      rows: 8,
+    });
+    pty.emit('a'.repeat(PREFIX_BYTES));
+    pty.emit(CSI);
+    pty.emit(LINE.repeat(LINES));
+    pty.emit('y'.repeat(PAD_BYTES));
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+  }
+
+  it('moves the seed start to a GROUND offset when the ring rolled mid-CSI', async () => {
+    await startFlooded();
+    const full = fullStream();
+    const naiveStart = full.length - RAW_RING_MAX_BYTES;
+
+    // The setup is only interesting if the naive start really is inside the
+    // sequence — pin that, or the test could pass by accident.
+    assert.equal(naiveStart, PREFIX_BYTES + 5, 'the trim lands 5 bytes into the CSI');
+    assert.equal(full.slice(naiveStart, naiveStart + 6), '5;196m', 'i.e. mid-parameters');
+
+    const seed = takeRawSeed()!;
+    assert.equal(seed.truncated, true);
+    assert.equal(
+      seed.baseOffset,
+      PREFIX_BYTES + CSI.length,
+      'the seed begins at the first ground offset, one past the sequence it could not resume',
+    );
+    assert.equal(
+      seed.data.startsWith('z'),
+      true,
+      'the replay begins with real output, not with the tail of an escape',
+    );
+    assert.equal(seed.baseOffset + bytes(seed.data), seed.endOffset, 'offsets still describe the window');
+  });
+
+  it('…and the viewer is still cell-for-cell identical to the daemon', async () => {
+    await startFlooded();
+    const seed = takeRawSeed()!;
+    const viewer = new Viewer(seed.cols, seed.rows);
+    await viewer.seed(seed);
+
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+    assertIdenticalBuffers(__getLocalAgentTerminal()!, viewer.term, 'ground-aligned seed');
+  });
+
+  /**
+   * NEGATIVE CONTROL. Without this the assertion above could be vacuous. A
+   * viewer seeded at the RAW ring offset — the arbitrary byte, no ground
+   * resolution — must end up WRONG, and specifically wrong in the sticky way:
+   * it prints `5;196m` as text and then draws every subsequent character in
+   * the DEFAULT colour, because the SGR that set 196 was consumed as garbage.
+   */
+  it('a seed taken at the arbitrary byte offset does NOT (why this exists)', async () => {
+    await startFlooded();
+    const full = fullStream();
+    const seed = takeRawSeed()!;
+    const naiveStart = full.length - RAW_RING_MAX_BYTES;
+
+    const naive = new Viewer(seed.cols, seed.rows);
+    // Deliberately no prologue either: this is the previous behaviour end to
+    // end, replaying the ring's bytes from the ring's own base offset.
+    await naive.seed({ epoch: seed.epoch, endOffset: seed.endOffset, data: full.slice(naiveStart) });
+
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+    const daemon = __getLocalAgentTerminal()!;
+    assert.throws(
+      () => assertIdenticalBuffers(daemon, naive.term, 'naive seed'),
+      /naive seed/,
+      'starting mid-escape leaves the viewer in the wrong SGR state',
+    );
+
+    // Name the defect precisely rather than settling for "they differ".
+    const daemonCell = daemon.buffer.active.getLine(daemon.buffer.active.viewportY)!.getCell(0)!;
+    const naiveCell = naive.term.buffer.active.getLine(naive.term.buffer.active.viewportY)!.getCell(0)!;
+    assert.equal(daemonCell.getFgColor(), 196, 'the daemon is drawing in colour 196');
+    assert.equal(naiveCell.isFgDefault(), true, 'the naive viewer lost the colour, permanently');
+  });
+
+  it('backs a stream prime UP to the previous ground offset, losing nothing', async () => {
+    // The prime is the milder case and gets the better answer: the bytes
+    // before the cut are still retained, so it moves BACKWARDS to ground
+    // instead of skipping forward. The few extra bytes are deduplicated by the
+    // viewer's offset arithmetic anyway.
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl, stdout: { write: () => true }, stdin: undefined, cols: 40, rows: 8,
+    });
+    // 20 bytes total; a 12-byte prime would naively cut at offset 8, which is
+    // the middle of `ESC[1;32m` (offsets 6..14).
+    pty.emit(`hello!${ESC}[1;32mworld`);
+    const prime = primeRawStream(12);
+    assert.equal(prime.startOffset, 6, 'backed up to just before the escape');
+    assert.equal(prime.data, `${ESC}[1;32mworld`);
+    assert.equal(prime.data.includes('1;32m') && !prime.data.startsWith('1'), true);
+  });
+});
+
+// ─── Gap 2: a rolled ring loses sticky modes; the prologue restores them ────
+
+/**
+ * A raw replay is a WINDOW on a byte stream. When the window has rolled past
+ * the escape that entered the alternate screen or set the scroll region, the
+ * bytes it does hold are drawn on a canvas the viewer has no way to
+ * reconstruct — every one of those modes changes where output LANDS.
+ *
+ * The prologue is derived from the daemon's own terminal (the authority for
+ * alt-screen and wrap) and from the byte-stream tracker (for the scroll
+ * region, cursor visibility and SGR, none of which `@xterm/headless` exposes).
+ */
+describe('mode prologue: a truncated replay lands on the right canvas', () => {
+  const REGION_TOP = 3;
+  const REGION_BOTTOM = 10;
+  const SETUP =
+    `${ESC}[?1049h` +                    // alternate screen
+    `${ESC}[${REGION_TOP};${REGION_BOTTOM}r` + // scroll region (DECSTBM)
+    `${ESC}[?25l` +                      // cursor hidden
+    `${ESC}[38;5;33m` +                  // a sticky colour
+    `${ESC}[${REGION_BOTTOM};1H`;        // park at the region's last row
+
+  /** 40 bytes each, and each one distinguishable from every other. */
+  const line = (i: number) => `L${String(i).padStart(5, '0')}${'z'.repeat(32)}\r\n`;
+  const FLOOD_LINES = 6600; // 264,000 bytes — comfortably past the 256 KiB ring
+
+  /** …and settle the terminal afterwards, for the reason spelled out above:
+   *  the prologue is read from it, and it lags the ring until its async write
+   *  chain drains. `attach-cmd.ts` awaits the same thing before every seed. */
+  async function startFlooded(extraSetup = ''): Promise<void> {
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl,
+      stdout: { write: () => true },
+      stdin: undefined,
+      cols: 40,
+      rows: 12,
+    });
+    pty.emit(SETUP + extraSetup);
+    let batch = '';
+    for (let i = 0; i < FLOOD_LINES; i++) {
+      batch += line(i);
+      if (batch.length > 32 * 1024) { pty.emit(batch); batch = ''; }
+    }
+    if (batch) pty.emit(batch);
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+  }
+
+  it('puts the viewer on the alternate screen, inside the right scroll region', async () => {
+    await startFlooded();
+    const seed = takeRawSeed()!;
+    assert.equal(seed.truncated, true, 'the ring must have rolled for this to be the case under test');
+    assert.equal(typeof seed.prologue, 'string');
+    assert.ok(seed.prologue!.includes(`${ESC}[?1049h`), 'alternate screen (read from the terminal)');
+    assert.ok(seed.prologue!.includes(`${ESC}[${REGION_TOP};${REGION_BOTTOM}r`), 'scroll region (tracked)');
+    assert.ok(seed.prologue!.includes(`${ESC}[?25l`), 'cursor hidden (tracked)');
+    assert.ok(seed.prologue!.includes('38;5;33'), 'SGR (tracked)');
+
+    const viewer = new Viewer(seed.cols, seed.rows);
+    await viewer.seed(seed);
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+    const daemon = __getLocalAgentTerminal()!;
+
+    assert.equal(viewer.term.buffer.active.type, 'alternate', 'on the alternate screen');
+    assert.equal(daemon.buffer.active.type, 'alternate');
+    // The scroll region is what decides which rows moved: rows outside it were
+    // never written by either side and must still be blank in both.
+    const blankRows = [0, 1, REGION_BOTTOM, REGION_BOTTOM + 1];
+    for (const y of blankRows) {
+      const l = viewer.term.buffer.active.getLine(y);
+      assert.equal(l ? l.translateToString(true) : '', '', `viewer row ${y} is outside the region`);
+    }
+    // …and every row INSIDE it holds the same lines, in the same order, in the
+    // same colour, with the cursor in the same place.
+    assertIdenticalBuffers(daemon, viewer.term, 'truncated seed + prologue');
+  });
+
+  /**
+   * NEGATIVE CONTROL for the prologue specifically: the SAME truncated seed,
+   * replayed without it, must be wrong. It draws into the NORMAL buffer with
+   * no scroll region, so the rows the daemon left untouched scroll away.
+   */
+  it('the same seed WITHOUT the prologue lands on the wrong canvas', async () => {
+    await startFlooded();
+    const seed = takeRawSeed()!;
+    const naive = new Viewer(seed.cols, seed.rows);
+    await naive.seed({ epoch: seed.epoch, endOffset: seed.endOffset, data: seed.data });
+
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+    assert.equal(naive.term.buffer.active.type, 'normal', 'never entered the alternate screen');
+    assert.throws(
+      () => assertIdenticalBuffers(__getLocalAgentTerminal()!, naive.term, 'no prologue'),
+      /no prologue/,
+    );
+  });
+
+  it('emits NO prologue when the replay is self-contained', async () => {
+    // An untruncated replay sets its own modes on the way through. Re-asserting
+    // them would be pure risk: DECOM and DECSTBM both move the cursor.
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl, stdout: { write: () => true }, stdin: undefined, cols: 40, rows: 12,
+    });
+    pty.emit(SETUP + 'a few lines\r\n');
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+    const seed = takeRawSeed()!;
+    assert.equal(seed.truncated, false);
+    assert.equal(seed.prologue, undefined);
+  });
+
+  /**
+   * ⚠️ WHAT THE PROLOGUE STILL CANNOT DO, asserted rather than glossed over.
+   *
+   * The prologue restores MODES, not CONTENT. A line painted outside the
+   * scroll region before the ring rolled — a status bar, a header — is gone:
+   * no byte in the retained window redraws it, and reconstructing it from the
+   * daemon's screen dump is exactly the state-reconstruction this whole design
+   * removed. So the viewer is right about the canvas and short one header.
+   *
+   * In practice a real TUI repaints its whole screen many times per 256 KiB
+   * (that is what the ring is sized for), so the header comes back on the next
+   * repaint. When it does not, the divergence check below is what notices —
+   * which is the honest bound: not "this cannot happen", but "this cannot go
+   * unnoticed for long".
+   */
+  it('does NOT restore content painted outside the region before the ring rolled', async () => {
+    await startFlooded(`${ESC}[1;1H${ESC}[7m STATUS BAR ${ESC}[27m${ESC}[${REGION_BOTTOM};1H`);
+    const seed = takeRawSeed()!;
+    const viewer = new Viewer(seed.cols, seed.rows);
+    await viewer.seed(seed);
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+
+    const daemon = __getLocalAgentTerminal()!;
+    assert.match(
+      daemon.buffer.active.getLine(0)!.translateToString(true),
+      /STATUS BAR/,
+      'the daemon still has it — it was painted once and never scrolled',
+    );
+    assert.equal(
+      viewer.term.buffer.active.getLine(0)!.translateToString(true),
+      '',
+      'the viewer does not, and no prologue could have given it back',
+    );
+    // Stated as the limit it is: the modes ARE right, only the stale content
+    // is missing.
+    assert.equal(viewer.term.buffer.active.type, 'alternate');
+    assert.notEqual(screenDigest(daemon as unknown as DigestTerminal),
+                    screenDigest(viewer.term as unknown as DigestTerminal),
+                    'and the integrity check can SEE the difference, which is the point');
+  });
+});
+
+// ─── Gap 3: divergence must be detectable, from any cause ───────────────────
+
+/**
+ * Nothing above proves that no byte sequence will ever desync the two
+ * parsers — that is not a provable claim. What IS provable is that a viewer
+ * which HAS diverged, for any reason at all, can be told so and can converge
+ * again. The daemon's screen digest is the evidence; a re-seed is the cure.
+ *
+ * (The POLICY around this evidence — how long to wait, how many mismatches to
+ * require, how hard to rate-limit the cure — lives in the browser, in
+ * `webapp/lib/grid/screen-integrity.ts`, and is tested there.)
+ */
+describe('divergence detection and recovery', () => {
+  const digestOf = (t: TerminalType) => screenDigest(t as unknown as DigestTerminal);
+
+  it('agrees on a healthy viewer, disagrees on a corrupted one, and converges after a re-seed', async () => {
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl, stdout: { write: () => true }, stdin: undefined, cols: 60, rows: 12,
+    });
+    pty.emit(TUI_PROLOGUE);
+    for (let i = 0; i < 3; i++) pty.emit(repaint(`${SPINNER[i]} thinking…`));
+
+    const seed = takeRawSeed()!;
+    const viewer = new Viewer(seed.cols, seed.rows);
+    await viewer.seed(seed);
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+    const daemon = __getLocalAgentTerminal()!;
+
+    assert.equal(digestOf(viewer.term), digestOf(daemon), 'a faithful replica agrees');
+
+    // Corrupt the viewer the way a desynced parser would: bytes the daemon
+    // never sent, landing on the screen.
+    await write(viewer.term, `${ESC}[6;3Hnot from the daemon`);
+    assert.notEqual(digestOf(viewer.term), digestOf(daemon), 'and corruption is visible');
+
+    // The cure: take a fresh seed and replay it, which is exactly what the
+    // browser does on the monitor's `reseed` verdict.
+    const fresh = takeRawSeed()!;
+    await viewer.seed(fresh);
+    await (await import('./local-agent.js')).captureLocalAgentOutput();
+
+    assert.equal(digestOf(viewer.term), digestOf(daemon), 'and it converges');
+    assertIdenticalBuffers(daemon, viewer.term, 'after recovery');
+  });
+
+  it('reports its own screen digest on every seed, so the check costs no extra round trip', () => {
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl, stdout: { write: () => true }, stdin: undefined, cols: 40, rows: 8,
+    });
+    pty.emit('hello');
+    const seed = takeRawSeed()!;
+    assert.equal(typeof seed.screenDigest, 'string');
+    assert.equal(seed.screenDigest!.length, 8);
   });
 });

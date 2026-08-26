@@ -269,6 +269,13 @@ export interface RawSeedReply {
   endOffset: number;
   data: string;
   truncated: boolean;
+  /**
+   * Sticky-mode escapes to write immediately before `data` — alternate screen,
+   * scroll region, cursor visibility, wrap mode and SGR that the daemon's ring
+   * has rolled past (local-agent.ts's `buildModePrologue`). Only ever sent
+   * with `truncated: true`; an untruncated replay is self-contained.
+   */
+  prologue?: string;
 }
 
 export async function postReadOutputReply(
@@ -284,6 +291,13 @@ export async function postReadOutputReply(
     cols?: number;
     rows?: number;
     raw?: RawSeedReply;
+    /**
+     * Fingerprint of the daemon's own visible screen (local-agent.ts's
+     * `screenDigest`). The viewer digests its rendered screen the same way and
+     * re-seeds when the two disagree — a bounded-time correction for any
+     * desync raw replay did not prevent. Cheap enough to send on every read.
+     */
+    screenDigest?: string;
   },
 ): Promise<boolean> {
   const body = await postEvent(cfg, workspaceId, {
@@ -300,8 +314,10 @@ export async function postReadOutputReply(
           baseOffset: extra.raw.baseOffset,
           endOffset: extra.raw.endOffset,
           truncated: extra.raw.truncated,
+          ...(extra.raw.prologue ? { prologue: extra.raw.prologue } : {}),
         }
       : {}),
+    ...(extra?.screenDigest ? { screenDigest: extra.screenDigest } : {}),
   });
   return Boolean(body?.resolved);
 }

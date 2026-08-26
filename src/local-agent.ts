@@ -38,6 +38,17 @@ import * as pty from 'node-pty';
 import type { IPty } from 'node-pty';
 import type { Terminal as TerminalType } from '@xterm/headless';
 import { splitByUtf8Bytes } from './output-stream.js';
+import {
+  AnsiScanner,
+  TerminalModeTracker,
+  buildModePrologue,
+  resolveGroundStart,
+  type ObservedTerminalModes,
+} from './ansi-replay-state.js';
+import { screenDigest } from './screen-digest.js';
+
+export { screenDigest } from './screen-digest.js';
+export type { DigestTerminal } from './screen-digest.js';
 
 // `@xterm/headless`'s published CJS bundle is a heavily minified/webpacked
 // single file — `cjs-module-lexer` (Node ESM's static CJS-named-export
@@ -323,10 +334,41 @@ interface RawRing {
   baseOffset: number;
   /** Absolute offset one past the last byte the PTY has produced. */
   endOffset: number;
+  /**
+   * Escape-parser state at `baseOffset`, maintained by feeding this scanner
+   * exactly the bytes the ring TRIMS.
+   *
+   * This is what makes ground-state resolution exact rather than a guess: the
+   * oldest retained byte is not the stream's first byte, so "where is the
+   * parser here?" is only answerable by having tracked what came before. Each
+   * trimmed byte is scanned once, on its way out, so the cost is amortised
+   * O(1) per byte and the memory is one small state object — not an index.
+   */
+  baseScanner: AnsiScanner;
+  /**
+   * The same machine run over every byte PUSHED, whose only job is to drive
+   * `modes` below. Its parser state is a by-product nothing reads.
+   */
+  headScanner: AnsiScanner;
+  /**
+   * Sticky modes (scroll region, cursor visibility, SGR) observed across the
+   * WHOLE session — including the bytes the ring has since dropped, which is
+   * precisely what a truncated replay cannot restore on its own.
+   */
+  modes: TerminalModeTracker;
 }
 
-function newRawRing(): RawRing {
-  return { epoch: randomUUID(), chunks: [], bytes: 0, baseOffset: 0, endOffset: 0 };
+function newRawRing(rows: number = DEFAULT_ROWS): RawRing {
+  return {
+    epoch: randomUUID(),
+    chunks: [],
+    bytes: 0,
+    baseOffset: 0,
+    endOffset: 0,
+    baseScanner: new AnsiScanner(),
+    headScanner: new AnsiScanner(),
+    modes: new TerminalModeTracker(rows),
+  };
 }
 
 let rawRing: RawRing = newRawRing();
@@ -337,6 +379,11 @@ let rawRing: RawRing = newRawRing();
 function pushRaw(data: string): RawChunkMeta {
   const startOffset = rawRing.endOffset;
   const bytes = Buffer.byteLength(data, 'utf-8');
+  // Watch the bytes for sticky modes BEFORE they can be trimmed away. This is
+  // the only place that sees every byte of the session exactly once, which is
+  // what lets a truncated replay still be handed the alt-screen/scroll-region/
+  // cursor/SGR state that predates the ring (see `takeRawSeed`).
+  rawRing.headScanner.feed(data, startOffset, rawRing.modes.sink);
   rawRing.chunks.push(data);
   rawRing.bytes += bytes;
   rawRing.endOffset += bytes;
@@ -355,8 +402,7 @@ function trimRawRing(): void {
     const oldestBytes = Buffer.byteLength(oldest, 'utf-8');
     if (oldestBytes <= overflow) {
       rawRing.chunks.shift();
-      rawRing.bytes -= oldestBytes;
-      rawRing.baseOffset += oldestBytes;
+      dropFromFront(oldest, oldestBytes);
       continue;
     }
     const { head, tail } = splitByUtf8Bytes(oldest, overflow);
@@ -365,14 +411,28 @@ function trimRawRing(): void {
       // A single code point wider than the overflow — drop the chunk rather
       // than spin.
       rawRing.chunks.shift();
-      rawRing.bytes -= oldestBytes;
-      rawRing.baseOffset += oldestBytes;
+      dropFromFront(oldest, oldestBytes);
       continue;
     }
     rawRing.chunks[0] = tail;
-    rawRing.bytes -= droppedBytes;
-    rawRing.baseOffset += droppedBytes;
+    dropFromFront(head, droppedBytes);
   }
+}
+
+/**
+ * Account for `text` (exactly `byteLength` UTF-8 bytes) leaving the front of
+ * the ring.
+ *
+ * The scanner feed is the load-bearing part: once these bytes are gone, the
+ * ONLY record that the new `baseOffset` sits (say) three bytes into an OSC
+ * string is the parser state this leaves behind. Without it, a later
+ * `takeRawSeed` would hand a viewer a replay that begins mid-sequence and the
+ * viewer's xterm would print the remainder as text.
+ */
+function dropFromFront(text: string, byteLength: number): void {
+  rawRing.baseScanner.feed(text, rawRing.baseOffset);
+  rawRing.bytes -= byteLength;
+  rawRing.baseOffset += byteLength;
 }
 
 /** A viewer's starting point: raw bytes to replay, and where they end. */
@@ -390,6 +450,24 @@ export interface RawSeed {
   /** `baseOffset > 0` — surfaced explicitly because it is the one case where
    *  replay is not a complete reconstruction. */
   truncated: boolean;
+  /**
+   * Escape sequences to write IMMEDIATELY BEFORE `data`, restoring the sticky
+   * modes the ring rolled past (see `buildModePrologue`).
+   *
+   * Present ONLY when `truncated` is true, and empty even then when the daemon
+   * is in a wholly default mode state. An untruncated replay is self-contained
+   * and a prologue on it would be pure risk.
+   */
+  prologue?: string;
+  /**
+   * Fingerprint of the daemon's OWN visible screen at the instant this seed
+   * was taken (`screen-digest.ts`).
+   *
+   * The authoritative side of the viewer's integrity check: a viewer that
+   * digests its own screen the same way and gets a different answer knows it
+   * has diverged, without either side shipping a whole screen to compare.
+   */
+  screenDigest?: string;
 }
 
 /**
@@ -402,17 +480,71 @@ export interface RawSeed {
  * ≥ `endOffset` and are therefore either spliced on cleanly or (if they were
  * already in `data`) trimmed away by the viewer — never lost, never applied
  * twice.
+ *
+ * ⚠️ CALL THIS ONLY AFTER THE TERMINAL HAS CAUGHT UP WITH THE RING. `prologue`
+ * and `screenDigest` are read from `current.term`, and that terminal is fed
+ * through an ASYNC write chain — so a seed taken mid-burst would describe the
+ * modes and the screen of a moment the ring has already moved past. The ring
+ * itself is written synchronously and is always current, which is exactly what
+ * makes the mismatch silent rather than obvious.
+ *
+ * `attach-cmd.ts` gets this right by construction: its `read-output` handler
+ * `await`s `captureOutput()` (which awaits the write chain) BEFORE calling
+ * this. Any new caller must do the same, and the tests do it deliberately.
  */
 export function takeRawSeed(): RawSeed | undefined {
   if (!current) return undefined;
+  const all = rawRing.chunks.join('');
+  // The ring's oldest retained byte is wherever the trim happened to land, so
+  // it can sit INSIDE an escape sequence. Starting there would feed a viewer's
+  // xterm the tail of a sequence it never saw the head of — which it renders
+  // as text and which can leave it in the wrong SGR or the wrong mode
+  // indefinitely. Nothing earlier than `baseOffset` still exists, so the only
+  // available correction is to skip forward to the next ground boundary; the
+  // few bytes discarded are a fragment no parser could have used.
+  const groundStart = resolveGroundStart(
+    all,
+    rawRing.baseOffset,
+    rawRing.baseScanner.state,
+    rawRing.baseOffset,
+  );
+  const data = groundStart > rawRing.baseOffset
+    ? splitByUtf8Bytes(all, groundStart - rawRing.baseOffset).tail
+    : all;
+  const truncated = rawRing.baseOffset > 0;
   return {
     epoch: rawRing.epoch,
-    baseOffset: rawRing.baseOffset,
+    // The offset the replay ACTUALLY starts at, not the one the ring happens
+    // to hold — the viewer positions itself by these numbers.
+    baseOffset: groundStart,
     endOffset: rawRing.endOffset,
-    data: rawRing.chunks.join(''),
+    data,
     cols: current.cols,
     rows: current.rows,
-    truncated: rawRing.baseOffset > 0,
+    truncated,
+    // Only a truncated replay is missing state that predates it.
+    ...(truncated ? { prologue: buildModePrologue(observedModes(current.term), rawRing.modes) } : {}),
+    screenDigest: screenDigest(current.term),
+  };
+}
+
+/**
+ * The sticky modes readable from the daemon's own terminal's PUBLIC API.
+ *
+ * This is the authority for everything it covers: that `Terminal` consumed
+ * every byte of the session, so what it reports is not an inference from a
+ * screen, it is the parser's own answer. What it does NOT cover — the scroll
+ * region, cursor visibility and current SGR, none of which appear on `IModes`
+ * or `IBuffer` — comes from `TerminalModeTracker` instead, and
+ * `buildModePrologue` documents the split.
+ */
+function observedModes(term: TerminalType): ObservedTerminalModes {
+  return {
+    altScreen: term.buffer.active.type === 'alternate',
+    wraparound: term.modes.wraparoundMode,
+    origin: term.modes.originMode,
+    insert: term.modes.insertMode,
+    reverseWraparound: term.modes.reverseWraparoundMode,
   };
 }
 
@@ -427,15 +559,25 @@ export interface RawStreamPrime {
 export function primeRawStream(maxBytes: number = RAW_STREAM_PRIME_BYTES): RawStreamPrime {
   const all = rawRing.chunks.join('');
   const total = Buffer.byteLength(all, 'utf-8');
-  if (total <= maxBytes) {
-    return { epoch: rawRing.epoch, startOffset: rawRing.baseOffset, data: all };
-  }
-  const { head, tail } = splitByUtf8Bytes(all, total - maxBytes);
-  return {
-    epoch: rawRing.epoch,
-    startOffset: rawRing.baseOffset + Buffer.byteLength(head, 'utf-8'),
-    data: tail,
-  };
+  const naiveStart = total <= maxBytes
+    ? rawRing.baseOffset
+    : rawRing.baseOffset + Buffer.byteLength(splitByUtf8Bytes(all, total - maxBytes).head, 'utf-8');
+  // Same hazard as the seed, one degree milder: `maxBytes` is a budget, not a
+  // boundary, so the cut lands on an arbitrary byte and can sit inside an
+  // escape sequence. Unlike the seed, the bytes BEFORE the cut are still
+  // retained, so the fix here loses nothing at all — back up to the last
+  // boundary where a fresh parser and the daemon's agree. The handful of extra
+  // bytes are deduplicated by the viewer's offset arithmetic anyway.
+  const groundStart = resolveGroundStart(
+    all,
+    rawRing.baseOffset,
+    rawRing.baseScanner.state,
+    naiveStart,
+  );
+  const data = groundStart > rawRing.baseOffset
+    ? splitByUtf8Bytes(all, groundStart - rawRing.baseOffset).tail
+    : all;
+  return { epoch: rawRing.epoch, startOffset: groundStart, data };
 }
 
 /** The PTY's grid, which the tile must render at EXACTLY (it cannot be
@@ -453,8 +595,8 @@ export function isLocalAgentBusy(): boolean {
 }
 
 /** Test seam: forget the ring and start a fresh epoch. */
-export function __resetRawRing(): void {
-  rawRing = newRawRing();
+export function __resetRawRing(rows: number = DEFAULT_ROWS): void {
+  rawRing = newRawRing(rows);
 }
 
 /**
@@ -732,7 +874,7 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
   // that no longer exists, and offsets restart. The fresh `epoch` is what a
   // viewer keyed to the old one sees, and it re-seeds rather than splicing two
   // sessions' bytes together.
-  rawRing = newRawRing();
+  rawRing = newRawRing(rows);
 
   const state: LocalAgentState = {
     ptyProcess,
