@@ -24,6 +24,7 @@ import { hostname } from 'node:os';
 
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
+import { runShare } from './share-cmd.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
@@ -112,6 +113,8 @@ function printHelp(): void {
       '                         RESUMES it (same tile) instead of adding a duplicate; --fresh skips',
       '                         that check entirely.',
       '  detach                 Detach the current workspace attachment.',
+      '  share <path>           Share a local file with the attached workspace, so a cloud',
+      '                         agent can see it. Push only — nothing reads your disk remotely.',
       '  status                 Print local login/attach state.',
       '  version                Print the installed yolo-bridge version (also --version, -v).',
       '  --help                 Print this help.',
@@ -591,6 +594,22 @@ function cmdStatus(): number {
   return 0;
 }
 
+async function cmdShare(args: string[]): Promise<number> {
+  const rawPath = args[0];
+  if (!rawPath || rawPath.startsWith('-')) {
+    process.stderr.write('yolo-bridge share: a file path is required.\n\n  yolo-bridge share ./cut.mp4\n');
+    return 64;
+  }
+  const result = await runShare(rawPath, { commonApiBaseUrl: apiUrl() });
+  if (!result.ok) {
+    // Every one of these is an operator-actionable condition, not a bug, so it
+    // prints as a sentence with no stack trace.
+    process.stderr.write(`yolo-bridge share: ${result.message}\n`);
+    return 1;
+  }
+  return 0;
+}
+
 async function cmdWorkspaces(): Promise<number> {
   const result = await runListWorkspaces({ commonApiBaseUrl: apiUrl() });
   if (!result.ok) {
@@ -643,6 +662,8 @@ async function main(): Promise<number> {
       return cmdAttach(rest);
     case 'detach':
       return cmdDetach();
+    case 'share':
+      return cmdShare(rest);
     case 'status':
       return cmdStatus();
     case 'version':

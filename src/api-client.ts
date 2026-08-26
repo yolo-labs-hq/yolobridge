@@ -403,3 +403,63 @@ async function postEvent(cfg: ApiClientConfig, workspaceId: string, payload: Rec
     return undefined;
   }
 }
+
+export interface PresignedUpload {
+  assetId: string;
+  uploadUrl: string;
+  method: string;
+  headers: Record<string, string>;
+}
+
+/**
+ * Phase 1 of a file share: ask common-api to reserve an asset and hand back a
+ * presigned PUT.
+ *
+ * Note what is NOT sent: no path. Only the basename, the mime type and the
+ * size. The operator's directory layout is not the cloud's business, and the
+ * server has no use for it.
+ *
+ * The tile is chosen SERVER-side from the attachment — there is deliberately no
+ * `tileId` parameter here, because a daemon does not get to pick.
+ */
+export async function presignShare(
+  cfg: ApiClientConfig,
+  workspaceId: string,
+  attachmentId: string,
+  meta: { filename: string; mimeType: string; size: number },
+): Promise<PresignedUpload> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(
+    `${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}/uploads`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders(cfg), 'Content-Type': 'application/json' },
+      body: JSON.stringify(meta),
+    },
+  );
+  if (!res.ok) {
+    const { message, code } = await parseErrorBody(res);
+    throw new YoloBridgeApiError(message, res.status, code);
+  }
+  return (await res.json()) as PresignedUpload;
+}
+
+/** Phase 2: the bytes are in R2; ask the server to verify and seal the asset. */
+export async function finalizeShare(
+  cfg: ApiClientConfig,
+  workspaceId: string,
+  attachmentId: string,
+  assetId: string,
+): Promise<{ assetId: string }> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(
+    `${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}/uploads/${encodeURIComponent(assetId)}/finalize`,
+    { method: 'POST', headers: { ...authHeaders(cfg), 'Content-Type': 'application/json' }, body: '{}' },
+  );
+  if (!res.ok) {
+    const { message, code } = await parseErrorBody(res);
+    throw new YoloBridgeApiError(message, res.status, code);
+  }
+  const body = (await res.json()) as { asset?: { assetId?: string } };
+  return { assetId: body?.asset?.assetId ?? assetId };
+}
