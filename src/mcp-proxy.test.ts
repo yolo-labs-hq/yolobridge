@@ -11,7 +11,7 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { startMcpProxy, SECRET_HEADER, type McpProxyHandle } from './mcp-proxy.js';
+import { startMcpProxy, mergeLocalWithRemoteFailure, SECRET_HEADER, type McpProxyHandle } from './mcp-proxy.js';
 
 const ORIGINAL_MCP_URL = process.env.YOLOBRIDGE_MCP_URL;
 const FAKE_UPSTREAM = 'http://fake-upstream.test';
@@ -902,3 +902,353 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label}: timed out after ${ms}ms`)), ms)),
   ]);
 }
+
+describe('locally-served tools', () => {
+  const LOCAL_TOOL = 'yolobridge_share_file';
+
+  function localCtx(shared: string[]) {
+    return {
+      workspaceId: 'w1',
+      implicitRoots: ['/project'],
+      commonApiBaseUrl: 'https://api.example.com',
+      checkImpl: (() => ({ approved: true, resolvedPath: '/project/real.mp4', root: '/project' })) as any,
+      shareImpl: (async (p: string) => { shared.push(p); return { ok: true, assetId: 'asset-7' }; }) as any,
+    };
+  }
+
+  it('serves a local tool WITHOUT forwarding it or minting a cloud token for it', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const upstreamCalls: any[] = [];
+    const mintCalls: any[] = [];
+    const shared: string[] = [];
+    const fetchImpl = makeFetch({
+      mintCalls,
+      upstream: (init) => {
+        upstreamCalls.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: localCtx(shared),
+    });
+    const mintsAfterStartup = mintCalls.length;
+
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name: LOCAL_TOOL, arguments: { path: '/project/link.mp4' } },
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const body: any = await res.json();
+    assert.match(body.result.content[0].text, /asset-7/);
+
+    // The operator's file must not become a cloud request.
+    assert.deepEqual(upstreamCalls, [], 'a local tool call must never be forwarded');
+    // ...nor cause a delegated cloud credential to be minted for it.
+    assert.equal(mintCalls.length, mintsAfterStartup, 'no extra mint for a local-only call');
+    // ...and the upload opened the RESOLVED path, not the one passed in.
+    assert.deepEqual(shared, ['/project/real.mp4']);
+  });
+
+  it('advertises the local tool in tools/list alongside the forwarded cloud ones', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const fetchImpl = makeFetch({
+      upstream: () => new Response(JSON.stringify({
+        jsonrpc: '2.0', id: 5, result: { tools: [{ name: 'studio_list_tiles' }] },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: localCtx([]),
+    });
+
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list' }),
+    });
+    const names = ((await res.json()) as any).result.tools.map((t: any) => t.name);
+    assert.ok(names.includes('studio_list_tiles'), 'cloud tools must survive augmentation');
+    assert.ok(names.includes(LOCAL_TOOL));
+  });
+
+  it('stays a pure forwarder when no local tools are configured', async () => {
+    // Omitting `localTools` must change nothing — an older attach path, or a
+    // future caller that does not want them, keeps the previous behaviour.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const upstreamCalls: any[] = [];
+    const fetchImpl = makeFetch({
+      upstream: (init) => {
+        upstreamCalls.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {},
+    });
+    await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: LOCAL_TOOL, arguments: { path: '/x' } },
+      }),
+    });
+    assert.equal(upstreamCalls.length, 1, 'with no local tools configured it forwards like anything else');
+  });
+});
+
+describe('locally-served tools — a MIXED batch keeps both halves', () => {
+  it('forwards the cloud calls, answers the local one here, and returns both', async () => {
+    // The batch path is where a half can silently vanish: answer locally and
+    // forget to forward the rest, or forward and drop the local reply.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const upstreamCalls: any[] = [];
+    const shared: string[] = [];
+    const fetchImpl = makeFetch({
+      upstream: (init) => {
+        const sent = JSON.parse(init.body);
+        upstreamCalls.push(sent);
+        return new Response(JSON.stringify(
+          (Array.isArray(sent) ? sent : [sent]).map((m: any) => ({ jsonrpc: '2.0', id: m.id, result: { ok: true } })),
+        ), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {},
+      localTools: {
+        workspaceId: 'w1', implicitRoots: ['/project'],
+        commonApiBaseUrl: 'https://api.example.com',
+        checkImpl: (() => ({ approved: true, resolvedPath: '/project/real.mp4', root: '/project' })) as any,
+        shareImpl: (async (p: string) => { shared.push(p); return { ok: true, assetId: 'asset-9' }; }) as any,
+      },
+    });
+
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'studio_list_tiles' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'yolobridge_share_file', arguments: { path: '/project/link.mp4' } } },
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'studio_read_file' } },
+      ]),
+    });
+
+    // The CLOUD half really went to the cloud, and only that half.
+    assert.equal(upstreamCalls.length, 1);
+    assert.deepEqual(upstreamCalls[0].map((m: any) => m.id), [1, 3], 'the local call must not be forwarded');
+
+    // Both halves come back.
+    const ids = ((await res.json()) as any[]).map((m) => m.id).sort();
+    assert.deepEqual(ids, [1, 2, 3], 'neither half may be lost');
+    assert.deepEqual(shared, ['/project/real.mp4']);
+  });
+});
+
+describe('locally-served tools — failure paths must not leak or lose the local half', () => {
+  function ctxFor(shared: string[]) {
+    return {
+      workspaceId: 'w1', implicitRoots: ['/project'],
+      commonApiBaseUrl: 'https://api.example.com',
+      checkImpl: (() => ({ approved: true, resolvedPath: '/project/real.mp4', root: '/project' })) as any,
+      shareImpl: (async (p: string) => { shared.push(p); return { ok: true, assetId: 'asset-7' }; }) as any,
+    };
+  }
+  const mixedBatch = JSON.stringify([
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'studio_list_tiles' } },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'yolobridge_share_file', arguments: { path: '/project/link.mp4' } } },
+  ]);
+
+  it('never re-forwards the local call on a 401 RETRY', async () => {
+    // The retry path skips the interception, so it is the one place the local
+    // call could reach the cloud despite everything above it.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const forwarded: any[] = [];
+    let n = 0;
+    const fetchImpl = makeFetch({
+      upstream: (init) => {
+        forwarded.push(JSON.parse(init.body));
+        n++;
+        if (n === 1) return new Response('unauthorized', { status: 401 });
+        return new Response(JSON.stringify([{ jsonrpc: '2.0', id: 1, result: { ok: true } }]), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: ctxFor([]),
+    });
+    await fetch(handle!.url, {
+      method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }), body: mixedBatch,
+    });
+
+    assert.ok(forwarded.length >= 2, 'expected an initial send and a retry');
+    for (const sent of forwarded) {
+      const names = (Array.isArray(sent) ? sent : [sent]).map((m: any) => m?.params?.name);
+      assert.ok(!names.includes('yolobridge_share_file'),
+        'the local call must never be forwarded, retry included');
+    }
+  });
+
+  it('still returns the local result when the CLOUD half cannot be sent', () => {
+    // Tested directly on the merge, not through a live proxy: reaching the
+    // token-unavailable branch needs a cached token to expire mid-request, and
+    // the first version of this test guarded on `if (!handle) return`, which
+    // made it assert NOTHING whenever the scenario failed to set up. A test
+    // that can silently skip its own subject is worse than no test.
+    //
+    // The property: the local half already uploaded a file, so its reply must
+    // survive, and each un-forwardable id must be told explicitly rather than
+    // left unanswered.
+    const local = JSON.stringify([{ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: 'Shared as asset asset-7.' }] } }]);
+    const pending = JSON.stringify([{ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'studio_list_tiles' } }]);
+
+    const merged = JSON.parse(mergeLocalWithRemoteFailure(local, pending, 'MCP token unavailable'));
+    const byId = new Map<any, any>(merged.map((m: any) => [m.id, m]));
+
+    assert.ok(byId.get(2)?.result, 'the completed local upload must still be reported');
+    assert.match(byId.get(2).result.content[0].text, /asset-7/);
+    assert.ok(byId.get(1)?.error, 'the id we could not forward must get an explicit error');
+    assert.match(byId.get(1).error.message, /token unavailable/);
+  });
+});
+
+describe('locally-served tools — response rewriting is negotiated, not assumed', () => {
+  function ctxFor(shared: string[]) {
+    return {
+      workspaceId: 'w1', implicitRoots: ['/project'],
+      commonApiBaseUrl: 'https://api.example.com',
+      checkImpl: (() => ({ approved: true, resolvedPath: '/project/real.mp4', root: '/project' })) as any,
+      shareImpl: (async (p: string) => { shared.push(p); return { ok: true, assetId: 'asset-7' }; }) as any,
+    };
+  }
+
+  it('ALWAYS advertises both content types — narrowing them 406s the upstream', async () => {
+    // Load-bearing. An earlier attempt asked for `application/json` only on
+    // requests whose reply gets rewritten, to dodge SSE framing. The MCP SDK's
+    // StreamableHTTPServerTransport returns 406 unless the client accepts BOTH
+    // application/json and text/event-stream, so that would have broken tool
+    // discovery outright rather than simplifying anything.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const accepts: string[] = [];
+    const fetchImpl = makeFetch({
+      upstream: (init) => {
+        accepts.push(String(init.headers?.Accept ?? ''));
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 5, result: { tools: [] } }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: ctxFor([]),
+    });
+    await fetch(handle!.url, {
+      method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list' }),
+    });
+
+    for (const a of accepts) {
+      assert.match(a, /application\/json/);
+      assert.match(a, /text\/event-stream/, 'both are required or the upstream 406s');
+    }
+  });
+
+  it('augments a tools/list delivered as an SSE STREAM, not just as JSON', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const fetchImpl = makeFetch({
+      upstream: () => new Response(
+        `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 5, result: { tools: [{ name: 'studio_list_tiles' }] } })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: ctxFor([]),
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list' }),
+    });
+    const text = await res.text();
+    assert.match(text, /^event: message/m, 'the client negotiated a stream; keep the framing');
+    assert.match(text, /yolobridge_share_file/, 'the local tool must be discoverable over SSE too');
+    assert.match(text, /studio_list_tiles/, 'cloud tools must survive');
+  });
+
+  it('keeps BOTH halves of a mixed batch when the cloud half arrives as SSE', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const shared: string[] = [];
+    const fetchImpl = makeFetch({
+      upstream: () => new Response(
+        `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: ctxFor(shared),
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'studio_list_tiles' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'yolobridge_share_file', arguments: { path: '/project/link.mp4' } } },
+      ]),
+    });
+    const text = await res.text();
+    // Both ids present, in whatever framing the upstream chose.
+    assert.match(text, /"id":1/, 'the cloud half must not be discarded by an SSE reply');
+    assert.match(text, /asset-7/, 'the local half must be reported');
+    assert.deepEqual(shared, ['/project/real.mp4']);
+  });
+
+  it('answers 200 with the local result even when the cloud half errors', async () => {
+    // The file is already uploaded. Propagating a 500 invites the client to
+    // reject the response unread and retry — uploading it twice.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const shared: string[] = [];
+    const fetchImpl = makeFetch({
+      upstream: () => new Response('upstream exploded', { status: 500 }),
+    });
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1',
+      agentId: 'claude', fetchImpl, log: () => {}, localTools: ctxFor(shared),
+    });
+
+    const res = await fetch(handle!.url, {
+      method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'studio_list_tiles' } },
+        { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'yolobridge_share_file', arguments: { path: '/project/link.mp4' } } },
+      ]),
+    });
+
+    assert.equal(res.status, 200, 'a completed local upload must not be hidden behind a cloud 5xx');
+    const body = (await res.json()) as any[];
+    const byId = new Map<any, any>(body.map((m: any) => [m.id, m]));
+    assert.match(byId.get(2).result.content[0].text, /asset-7/, 'the upload is reported');
+    assert.ok(byId.get(1).error, 'the cloud id gets an explicit error rather than silence');
+    assert.deepEqual(shared, ['/project/real.mp4']);
+  });
+});

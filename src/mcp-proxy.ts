@@ -70,6 +70,7 @@
  */
 
 import * as http from 'node:http';
+import { interceptLocalTools, augmentToolsList, parseRpcEnvelope, type LocalToolContext } from './local-mcp-tools.js';
 import type { AddressInfo } from 'node:net';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
@@ -124,6 +125,13 @@ export interface McpProxyOptions {
   callerTileId?: string;
   fetchImpl?: FetchImpl;
   log?: (line: string) => void;
+  /**
+   * Context for the tools this proxy serves ITSELF rather than forwarding
+   * (`local-mcp-tools.ts`). Omit it and the proxy is a pure forwarder, exactly
+   * as before — every local tool disappears from `tools/list` and a call to one
+   * falls through to the cloud, which will not know it.
+   */
+  localTools?: LocalToolContext;
   /** Overrides `STARTUP_MINT_TIMEOUT_MS` — for tests only (a real caller
    *  should never need less than the default). */
   mintTimeoutMs?: number;
@@ -343,7 +351,7 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
       res.end(JSON.stringify({ error: 'missing or invalid proxy credential' }));
       return;
     }
-    handleRequest(req, res, upstream, tokenCache.getToken, tokenCache.forceRefresh, fetchImpl, tracker, log).catch((err) => {
+    handleRequest(req, res, upstream, tokenCache.getToken, tokenCache.forceRefresh, fetchImpl, tracker, log, opts.localTools).catch((err) => {
       log(`yolo-bridge: local MCP proxy error: ${err instanceof Error ? err.message : String(err)}`);
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -562,6 +570,37 @@ function mergeRetryResponses(originalResponseText: string, retryResponseText: st
   }
 }
 
+/**
+ * Answer a mixed batch whose CLOUD half could not be sent, without discarding
+ * the local half that already ran.
+ *
+ * The local calls have side effects — a file is uploaded by the time we get
+ * here — so silently 503ing the whole batch would hide a completed upload and
+ * invite the client to repeat it. Each un-forwardable id gets an explicit
+ * JSON-RPC error instead. (codex P2, gpt-5.6-sol.)
+ */
+export function mergeLocalWithRemoteFailure(localResponseText: string, forwardBody: string | undefined, message: string): string {
+  const local = (() => {
+    try {
+      const parsed = JSON.parse(localResponseText);
+      return Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      return [];
+    }
+  })();
+  const failures: unknown[] = [];
+  try {
+    const pending = JSON.parse(forwardBody ?? '[]');
+    for (const m of (Array.isArray(pending) ? pending : [pending]) as any[]) {
+      if (m?.id === undefined) continue;
+      failures.push({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message } });
+    }
+  } catch {
+    /* nothing forwardable to describe */
+  }
+  return JSON.stringify([...local, ...failures]);
+}
+
 async function forwardOnce(
   upstream: string,
   method: string,
@@ -651,22 +690,74 @@ async function handleRequest(
   fetchImpl: FetchImpl,
   tracker: RequestTracker,
   log: (line: string) => void,
+  localTools?: LocalToolContext,
 ): Promise<void> {
   const method = req.method ?? 'POST';
   const body = method === 'POST' || method === 'DELETE' ? await readBody(req) : undefined;
+
+  // ── Locally-served tools ──────────────────────────────────────────────────
+  // BEFORE `getToken()` deliberately: a local call must never mint a delegated
+  // CLOUD credential, and must never leave this machine. A body that contains
+  // no local tool call falls straight through, paying one JSON.parse.
+  let forwardedAfterLocal = body;
+  let localResponseText: string | undefined;
+  if (localTools && method === 'POST' && body) {
+    const intercepted = await interceptLocalTools(body, localTools);
+    if (intercepted) {
+      if (!intercepted.forwardBody) {
+        if (!intercepted.localResponse) {
+          // Every local message was a NOTIFICATION, which must not be answered.
+          // 202 with an empty body is what the MCP Streamable HTTP transport
+          // returns for a notification-only POST. (codex P2.)
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        // Nothing left for the cloud — answer entirely from here.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(intercepted.localResponse);
+        return;
+      }
+      // A batch that mixed local and cloud tools: forward only the remainder,
+      // and merge our answers back in below so neither half is lost.
+      forwardedAfterLocal = intercepted.forwardBody;
+      localResponseText = intercepted.localResponse;
+    }
+  }
 
   const headers: Record<string, string> = { Accept: 'application/json, text/event-stream' };
   const incomingContentType = req.headers['content-type'];
   if (typeof incomingContentType === 'string') headers['Content-Type'] = incomingContentType;
   else if (body) headers['Content-Type'] = 'application/json';
 
-  let forwardedBody = body;
-  if (method === 'POST' && body) {
+  // ⚠️ DO NOT narrow the Accept header to make the rewrites below easier.
+  //
+  // An earlier attempt asked for `application/json` only on requests whose
+  // response gets rewritten, to dodge SSE framing. That would have broken tool
+  // discovery outright: the MCP SDK's
+  // `WebStandardStreamableHTTPServerTransport.handlePostRequest` returns 406
+  // unless the client accepts BOTH `application/json` and `text/event-stream`
+  // (verified in the installed SDK 1.29.0, not assumed — codex P1,
+  // gpt-5.6-sol). The rewrites handle both shapes instead; see
+  // `parseRpcEnvelope`.
+
+  let forwardedBody = forwardedAfterLocal;
+  if (method === 'POST' && forwardedAfterLocal) {
     try {
       const token = await getToken();
-      forwardedBody = injectToken(body, token);
+      forwardedBody = injectToken(forwardedAfterLocal, token);
     } catch (err) {
       log(`yolo-bridge: MCP token unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      // The local half of a mixed batch has ALREADY RUN by this point — the
+      // file is uploaded. Dropping its reply would leave the client never
+      // learning the assetId and retrying the batch, uploading the same file
+      // again. So answer with what actually happened: local results, plus an
+      // explicit error for each id we could not forward. (codex P2.)
+      if (localResponseText) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(mergeLocalWithRemoteFailure(localResponseText, forwardedAfterLocal, 'MCP token unavailable'));
+        return;
+      }
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'MCP token unavailable', code: 'MCP_TOKEN_UNAVAILABLE', retryable: true }));
       return;
@@ -681,7 +772,12 @@ async function handleRequest(
   // isUnauthorizedToolResult's doc comment) — a real 401 from this upstream
   // has never actually been observed; the in-band case is the one that
   // matters in practice.
-  if (method === 'POST' && body && (result.status === 401 || isUnauthorizedToolResult(result.text))) {
+  // ⚠️ Every path below uses `forwardedAfterLocal`, NEVER `body`. The original
+  // still contains any locally-intercepted call, and re-forwarding it on a
+  // retry would send the operator's local file path to the cloud — breaking the
+  // local-only invariant on the one path that skips the interception. (codex
+  // P1, gpt-5.6-sol.)
+  if (method === 'POST' && forwardedAfterLocal && (result.status === 401 || isUnauthorizedToolResult(result.text))) {
     log(`yolo-bridge: MCP upstream reported an invalid/expired token (status ${result.status}), force-refreshing`);
     try {
       const refreshed = await forceRefresh();
@@ -691,7 +787,7 @@ async function handleRequest(
       // 200-with-mixed-results batch (Codex review, 2026-08-24, round 20)
       // needs the narrower partial-batch retry below -- see
       // `buildUnauthorizedRetryBatch`'s doc comment.
-      const retryBatch = result.status === 401 ? null : buildUnauthorizedRetryBatch(body, result.text);
+      const retryBatch = result.status === 401 ? null : buildUnauthorizedRetryBatch(forwardedAfterLocal, result.text);
       if (retryBatch) {
         const reinjected = injectToken(retryBatch.requestSubset, refreshed);
         const retryResult = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
@@ -714,7 +810,7 @@ async function handleRequest(
           ? { ...retryResult, text: mergedText }
           : { ...result, text: mergedText };
       } else {
-        const reinjected = injectToken(body, refreshed);
+        const reinjected = injectToken(forwardedAfterLocal, refreshed);
         result = await forwardOnce(upstream, method, headers, reinjected, fetchImpl, tracker);
       }
     } catch (err) {
@@ -722,9 +818,56 @@ async function handleRequest(
     }
   }
 
+  let outText = result.text;
+
+  // A `tools/list` reply from the cloud does not know about the tools this
+  // daemon serves itself, so add them — otherwise the agent can only call them
+  // by guessing they exist.
+  if (localTools && method === 'POST' && forwardedAfterLocal) {
+    outText = augmentToolsList(forwardedAfterLocal, outText);
+  }
+
+  // Re-join the halves of a mixed batch. Order does not matter to a JSON-RPC
+  // client (ids correlate the replies), but LOSING one half would.
+  //
+  // ⚠️ STATUS MATTERS AS MUCH AS BODY. The local half already uploaded a file.
+  // If we propagate a non-2xx from the cloud half, a client may reject the whole
+  // HTTP response without reading it and retry the batch — uploading the same
+  // file twice. So once a local result exists, this answers 200 and reports the
+  // cloud failure per-id inside the body. (codex P1, gpt-5.6-sol.)
+  let outStatus = result.status;
+  if (localResponseText) {
+    let merged: string | undefined;
+    if (result.status >= 200 && result.status < 300) {
+      // The upstream half may be plain JSON or an SSE stream — it chooses. The
+      // envelope puts our local results back in whichever shape the client is
+      // already reading, instead of discarding the cloud half on a failed
+      // JSON.parse (codex P2).
+      const envelope = parseRpcEnvelope(outText);
+      if (envelope) {
+        try {
+          const local = JSON.parse(localResponseText);
+          merged = envelope.rebuild([
+            ...envelope.messages,
+            ...(Array.isArray(local) ? local : [local]),
+          ]);
+        } catch {
+          merged = undefined;
+        }
+      }
+    }
+    outText = merged
+      ?? mergeLocalWithRemoteFailure(localResponseText, forwardedAfterLocal, `upstream MCP request failed (status ${result.status})`);
+    outStatus = 200;
+  }
+
   const outHeaders: Record<string, string> = {};
   const contentType = result.headers.get('content-type');
   if (contentType) outHeaders['Content-Type'] = contentType;
-  res.writeHead(result.status, outHeaders);
-  res.end(result.text);
+  // Only force JSON when we could NOT preserve the upstream's shape (the
+  // failure-merge path emits a plain array). A successful merge keeps whatever
+  // framing the upstream chose, so the header must keep matching it.
+  if (localResponseText && !outText.includes('data:')) outHeaders['Content-Type'] = 'application/json';
+  res.writeHead(outStatus, outHeaders);
+  res.end(outText);
 }

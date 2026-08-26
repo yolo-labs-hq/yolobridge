@@ -300,3 +300,74 @@ describe('runShare — preconditions read from disk', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe('runShare — workspace binding', () => {
+  const ENV2 = { HOME: '/home/yolo' };
+  function fakeIO2(): any {
+    const files = new Map<string, string>();
+    return { files, readFile: (p: string) => files.get(p), writeFile: (p: string, c: string) => { files.set(p, c); }, removeFile: (p: string) => { files.delete(p); } };
+  }
+  const AUTH2 = { accessToken: 'acct', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: Date.now() + 1e6 };
+
+  it('refuses when the stored attachment moved to a DIFFERENT workspace, and sends nothing', async () => {
+    // A second `yolo-bridge attach` rewrites the attachment on disk. A caller
+    // that authorised against workspace A must not upload into workspace B.
+    const io = fakeIO2();
+    saveAuth(AUTH2, ENV2, io);
+    saveAttachment({
+      workspaceId: 'ws-NEW', tileId: 't', attachmentId: 'att', attachedAt: new Date().toISOString(),
+      scopedToken: 'scoped', scopedTokenExpiresAtMs: Date.now() + 1e6,
+    }, ENV2, io);
+
+    let called = false;
+    const res = await runShare('/tmp/whatever', {
+      commonApiBaseUrl: 'https://api.example', env: ENV2, io,
+      expectedWorkspaceId: 'ws-OLD',
+      fetchImpl: (async () => { called = true; return new Response('', { status: 200 }); }) as any,
+    });
+    assert.equal(res.ok, false);
+    assert.equal((res as any).reason, 'workspace-changed');
+    assert.equal(called, false, 'nothing may be sent when the workspace changed under us');
+  });
+
+  it('proceeds when the workspace matches', async () => {
+    const io = fakeIO2();
+    saveAuth(AUTH2, ENV2, io);
+    saveAttachment({
+      workspaceId: 'ws-1', tileId: 't', attachmentId: 'att', attachedAt: new Date().toISOString(),
+      scopedToken: 'scoped', scopedTokenExpiresAtMs: Date.now() + 1e6,
+    }, ENV2, io);
+
+    const dir = scratch();
+    try {
+      const f = path.join(dir, 'cut.mp4');
+      writeFileSync(f, 'x');
+      const res = await runShare(f, {
+        commonApiBaseUrl: 'https://api.example', env: ENV2, io,
+        expectedWorkspaceId: 'ws-1', write: () => {},
+        fetchImpl: (async (url: any, init: any) => {
+          const u = String(url);
+          if (u.endsWith('/uploads')) return new Response(JSON.stringify({ assetId: 'a1', uploadUrl: 'https://r2.example/put', method: 'PUT', headers: {} }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+          if (u.startsWith('https://r2.example/')) { init?.body?.destroy?.(); return new Response('', { status: 200 }); }
+          return new Response(JSON.stringify({ asset: { assetId: 'a1' } }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+        }) as any,
+      });
+      assert.equal(res.ok, true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('is unbound when no expected workspace is given — the human command keeps full reach', async () => {
+    const io = fakeIO2();
+    saveAuth(AUTH2, ENV2, io);
+    saveAttachment({
+      workspaceId: 'ws-ANY', tileId: 't', attachmentId: 'att', attachedAt: new Date().toISOString(),
+      scopedToken: 'scoped', scopedTokenExpiresAtMs: Date.now() + 1e6,
+    }, ENV2, io);
+    const res = await runShare('/tmp/definitely-not-here.mp4', {
+      commonApiBaseUrl: 'https://api.example', env: ENV2, io, write: () => {},
+    });
+    // Gets past the workspace gate and fails on the missing FILE instead.
+    assert.equal((res as any).reason, 'error');
+    assert.match((res as any).message, /No such file/);
+  });
+});

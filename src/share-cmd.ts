@@ -203,6 +203,19 @@ export function describeShareFailure(err: unknown): string {
 
 export interface ShareCommandDeps {
   commonApiBaseUrl: string;
+  /**
+   * Refuse unless the stored attachment is for THIS workspace.
+   *
+   * The attachment is reloaded from disk on every call (so a rotated scoped
+   * token is always current), which means it can also have been REPLACED — a
+   * second `yolo-bridge attach` to a different workspace rewrites it. A caller
+   * that authorised something against one workspace must not then upload into
+   * another. (codex P2, gpt-5.6-sol.)
+   *
+   * Omitted by the human-typed `share` command, whose authority is the current
+   * attachment whatever it is.
+   */
+  expectedWorkspaceId?: string;
   env?: Record<string, string | undefined>;
   io?: ConfigStoreIO;
   fetchImpl?: FetchImpl;
@@ -211,7 +224,7 @@ export interface ShareCommandDeps {
 
 export type ShareResult =
   | { ok: true; assetId: string }
-  | { ok: false; reason: 'not-logged-in' | 'not-attached' | 'no-scoped-credential' | 'error'; message: string };
+  | { ok: false; reason: 'not-logged-in' | 'not-attached' | 'no-scoped-credential' | 'workspace-changed' | 'error'; message: string };
 
 /**
  * The disk-backed entry point, mirroring `runDetach`.
@@ -232,6 +245,16 @@ export async function runShare(rawPath: string, deps: ShareCommandDeps): Promise
   const attachment = loadAttachment(deps.env, deps.io);
   if (!attachment) {
     return { ok: false, reason: 'not-attached', message: 'No active attachment — run `yolo-bridge attach` first.' };
+  }
+
+  if (deps.expectedWorkspaceId && attachment.workspaceId !== deps.expectedWorkspaceId) {
+    return {
+      ok: false,
+      reason: 'workspace-changed',
+      message:
+        'This machine is now attached to a different workspace than the one this request was '
+        + 'authorised against. Nothing was sent. Re-run `yolo-bridge attach` or retry.',
+    };
   }
 
   const scopedToken = attachment.scopedToken;

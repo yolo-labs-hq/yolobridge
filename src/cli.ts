@@ -386,6 +386,18 @@ async function cmdAttach(args: string[]): Promise<number> {
             // guess which studio_list_tiles row is itself — and a backwards
             // guess sends the prompt into its OWN input.
             callerTileId: tileId,
+            // Tools the proxy serves ITSELF (local-mcp-tools.ts). A cloud tool
+            // cannot read this machine's disk, so sharing a local file is the
+            // one thing that has to be answered here.
+            //
+            // `implicitRoots` is the directory the daemon was launched in — the
+            // project the agent is already working in and can read anyway.
+            // Anything outside needs `yolo-bridge allow`.
+            localTools: {
+              workspaceId,
+              implicitRoots: [process.cwd()],
+              commonApiBaseUrl: apiUrl(),
+            },
             log: (line) => process.stdout.write(`${line}\n`),
           });
           // Command-line MCP configuration, never a file in the project
