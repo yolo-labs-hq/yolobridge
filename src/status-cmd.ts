@@ -23,6 +23,7 @@
  */
 
 import { loadAuth, loadAttachment, type ConfigStoreIO } from './config-store.js';
+import { listApprovals } from './approved-paths.js';
 import { loadConnectionState, formatConnectionEvent, type ConnectionEvent } from './connection-state.js';
 
 export interface StatusDeps {
@@ -32,6 +33,13 @@ export interface StatusDeps {
 }
 
 export interface StatusReport {
+  /**
+   * Paths the ATTACHED AGENT may send files from, beyond the daemon's own
+   * working directory. Surfaced here because a standing grant the operator has
+   * forgotten about is the failure mode this list has — an approval is not
+   * useful if it is invisible.
+   */
+  approvedPaths?: string[];
   loggedIn: boolean;
   tokenExpiresAtMs?: number;
   tokenExpired?: boolean;
@@ -62,6 +70,10 @@ export function getStatus(deps: StatusDeps = {}): StatusReport {
     loggedIn: Boolean(auth),
     attached: Boolean(attachment),
   };
+  if (attachment) {
+    const approvals = listApprovals(attachment.workspaceId, deps.env, deps.io);
+    if (approvals.length) report.approvedPaths = approvals.map((a) => a.path);
+  }
   if (auth) {
     report.tokenExpiresAtMs = auth.expiresAtMs;
     report.tokenExpired = auth.expiresAtMs <= now();
@@ -112,6 +124,11 @@ export function formatStatus(report: StatusReport): string {
         }
       }
     }
+  }
+  if (report.approvedPaths?.length) {
+    lines.push(`Agent may send files from (${report.approvedPaths.length} approved path(s)):`);
+    for (const p of report.approvedPaths) lines.push(`  ${p}`);
+    lines.push('(plus the daemon\'s working directory. Change with `yolo-bridge allow`.)');
   }
   return lines.join('\n');
 }

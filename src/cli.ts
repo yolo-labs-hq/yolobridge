@@ -25,6 +25,7 @@ import { hostname } from 'node:os';
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runShare } from './share-cmd.js';
+import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
@@ -113,6 +114,9 @@ function printHelp(): void {
       '                         RESUMES it (same tile) instead of adding a duplicate; --fresh skips',
       '                         that check entirely.',
       '  detach                 Detach the current workspace attachment.',
+      '  allow <path>           Let the ATTACHED AGENT send files from this path. You type',
+      '                         this; nothing in the cloud can. Also --list and --remove <path>.',
+      '                         The daemon\'s own working directory is always allowed.',
       '  share <path>           Share a local file with the attached workspace, so a cloud',
       '                         agent can see it. Push only — nothing reads your disk remotely.',
       '  status                 Print local login/attach state.',
@@ -594,6 +598,16 @@ function cmdStatus(): number {
   return 0;
 }
 
+function cmdAllow(args: string[]): number {
+  const result = runAllow(args);
+  if (!result.ok) {
+    process.stderr.write(`yolo-bridge allow: ${result.message}\n`);
+    return 1;
+  }
+  process.stdout.write(`${result.lines.join('\n')}\n`);
+  return 0;
+}
+
 async function cmdShare(args: string[]): Promise<number> {
   const rawPath = args[0];
   if (!rawPath || rawPath.startsWith('-')) {
@@ -662,6 +676,8 @@ async function main(): Promise<number> {
       return cmdAttach(rest);
     case 'detach':
       return cmdDetach();
+    case 'allow':
+      return cmdAllow(rest);
     case 'share':
       return cmdShare(rest);
     case 'status':
