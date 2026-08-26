@@ -20,6 +20,7 @@ import path from 'node:path';
 import {
   presignShare,
   finalizeShare,
+  deliverShare,
   YoloBridgeApiError,
   type ApiClientConfig,
   type FetchImpl,
@@ -115,6 +116,9 @@ export interface ShareDeps {
   cfg: ApiClientConfig;
   workspaceId: string;
   attachmentId: string;
+  /** Also write the file into THIS tile's session pod, so the agent there can
+   *  open it. Omit to leave the asset in the workspace only. */
+  targetTileId?: string;
   /** Injectable for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
   /** Progress/status line sink. Defaults to stdout. */
@@ -127,7 +131,7 @@ export interface ShareDeps {
  * The PUT streams from disk rather than buffering: a 100 MB file must not
  * become a 100 MB string in this process.
  */
-export async function shareFile(rawPath: string, deps: ShareDeps): Promise<{ assetId: string }> {
+export async function shareFile(rawPath: string, deps: ShareDeps): Promise<{ assetId: string; deliveredPath?: string }> {
   const write = deps.write ?? ((line: string) => process.stdout.write(`${line}\n`));
   const file = await inspectLocalFile(rawPath);
   // One fetch for all three legs. Taking it from `deps` too means a caller can
@@ -184,7 +188,26 @@ export async function shareFile(rawPath: string, deps: ShareDeps): Promise<{ ass
 
   const finalized = await finalizeShare(cfg, deps.workspaceId, deps.attachmentId, presigned.assetId);
   write(`Shared ${file.filename} → ${finalized.assetId}`);
-  return finalized;
+
+  if (!deps.targetTileId) return finalized;
+
+  // The upload has ALREADY SUCCEEDED. If delivery fails the file is genuinely
+  // in the workspace, so say that rather than reporting a flat failure and
+  // inviting a re-upload of something already there.
+  try {
+    const delivered = await deliverShare(
+      cfg, deps.workspaceId, deps.attachmentId, finalized.assetId, deps.targetTileId,
+    );
+    write(`Delivered to ${deps.targetTileId} at ${delivered.path}`);
+    return { ...finalized, deliveredPath: delivered.path };
+  } catch (err) {
+    const why = err instanceof YoloBridgeApiError ? err.message : (err as Error)?.message || 'unknown error';
+    throw new ShareError(
+      `${file.filename} was uploaded (asset ${finalized.assetId}) but could not be delivered to `
+      + `${deps.targetTileId}: ${why}. The file IS in the workspace — retry the DELIVERY only, with `
+      + `\`yolo-bridge deliver ${finalized.assetId} --to ${deps.targetTileId}\`, rather than sharing it again.`,
+    );
+  }
 }
 
 /** Turn an API error into something the operator can act on. */
@@ -203,6 +226,8 @@ export function describeShareFailure(err: unknown): string {
 
 export interface ShareCommandDeps {
   commonApiBaseUrl: string;
+  /** Deliver into this tile's pod after uploading. */
+  targetTileId?: string;
   /**
    * Refuse unless the stored attachment is for THIS workspace.
    *
@@ -223,7 +248,7 @@ export interface ShareCommandDeps {
 }
 
 export type ShareResult =
-  | { ok: true; assetId: string }
+  | { ok: true; assetId: string; deliveredPath?: string }
   | { ok: false; reason: 'not-logged-in' | 'not-attached' | 'no-scoped-credential' | 'workspace-changed' | 'error'; message: string };
 
 /**
@@ -234,6 +259,49 @@ export type ShareResult =
  * the config store rather than from daemon memory — the same credential the
  * running daemon uses, and the only one the upload routes accept (Boundary B).
  */
+/**
+ * The preconditions every daemon-credentialed command shares: logged in,
+ * attached, attached to the EXPECTED workspace, and holding a scoped token.
+ *
+ * Factored out so `runShare` and `runDeliver` cannot drift apart on which
+ * checks they perform or what they say when one fails.
+ */
+function resolveShareIdentity(deps: ShareCommandDeps):
+  | { ok: true; cfg: ApiClientConfig; workspaceId: string; attachmentId: string }
+  | { ok: false; reason: 'not-logged-in' | 'not-attached' | 'no-scoped-credential' | 'workspace-changed'; message: string } {
+  if (!loadAuth(deps.env, deps.io)) {
+    return { ok: false, reason: 'not-logged-in', message: 'Not logged in — run `yolo-bridge login` first.' };
+  }
+  const attachment = loadAttachment(deps.env, deps.io);
+  if (!attachment) {
+    return { ok: false, reason: 'not-attached', message: 'No active attachment — run `yolo-bridge attach` first.' };
+  }
+  if (deps.expectedWorkspaceId && attachment.workspaceId !== deps.expectedWorkspaceId) {
+    return {
+      ok: false,
+      reason: 'workspace-changed',
+      message:
+        'This machine is now attached to a different workspace than the one this request was '
+        + 'authorised against. Nothing was sent. Re-run `yolo-bridge attach` or retry.',
+    };
+  }
+  if (!attachment.scopedToken) {
+    return {
+      ok: false,
+      reason: 'no-scoped-credential',
+      message:
+        'No workspace-scoped credential is stored for this attachment, so files cannot be shared '
+        + 'from this machine. Run `yolo-bridge attach` to reconnect.',
+    };
+  }
+  return {
+    ok: true,
+    cfg: { commonApiBaseUrl: deps.commonApiBaseUrl, accessToken: attachment.scopedToken, fetchImpl: deps.fetchImpl },
+    workspaceId: attachment.workspaceId,
+    attachmentId: attachment.attachmentId,
+  };
+}
+
 export async function runShare(rawPath: string, deps: ShareCommandDeps): Promise<ShareResult> {
   // Same precondition ordering as detach: `auth.json` is what makes this a
   // set-up machine, and its absence has a far better remedy to offer than a
@@ -277,14 +345,48 @@ export async function runShare(rawPath: string, deps: ShareCommandDeps): Promise
   };
 
   try {
-    const { assetId } = await shareFile(rawPath, {
+    const { assetId, deliveredPath } = await shareFile(rawPath, {
       cfg,
       workspaceId: attachment.workspaceId,
       attachmentId: attachment.attachmentId,
+      targetTileId: deps.targetTileId,
       fetchImpl: deps.fetchImpl as typeof fetch | undefined,
       write: deps.write,
     });
-    return { ok: true, assetId };
+    return { ok: true, assetId, ...(deliveredPath ? { deliveredPath } : {}) };
+  } catch (err) {
+    return { ok: false, reason: 'error', message: describeShareFailure(err) };
+  }
+}
+
+
+export type DeliverResult =
+  | { ok: true; path: string }
+  | { ok: false; reason: 'not-logged-in' | 'not-attached' | 'no-scoped-credential' | 'workspace-changed' | 'error'; message: string };
+
+/**
+ * Deliver an ALREADY-SHARED asset into a tile's session, without re-uploading.
+ *
+ * WHY THIS EXISTS: `shareFile` tells the operator, after a delivery failure,
+ * that the file IS in the workspace and to retry the delivery rather than the
+ * upload. That instruction was false until this existed — every entry point
+ * began with a fresh presign, so the only available "retry" duplicated the
+ * asset. (codex P2, gpt-5.6-sol.) An error message must name a recovery the
+ * caller can actually perform.
+ */
+export async function runDeliver(
+  assetId: string,
+  targetTileId: string,
+  deps: ShareCommandDeps,
+): Promise<DeliverResult> {
+  const preflight = await resolveShareIdentity(deps);
+  if (!preflight.ok) return preflight;
+
+  try {
+    const delivered = await deliverShare(
+      preflight.cfg, preflight.workspaceId, preflight.attachmentId, assetId, targetTileId,
+    );
+    return { ok: true, path: delivered.path };
   } catch (err) {
     return { ok: false, reason: 'error', message: describeShareFailure(err) };
   }

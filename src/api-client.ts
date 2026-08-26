@@ -463,3 +463,42 @@ export async function finalizeShare(
   const body = (await res.json()) as { asset?: { assetId?: string } };
   return { assetId: body?.asset?.assetId ?? assetId };
 }
+
+export interface DeliveredAsset {
+  /** Where the pod wrote it, e.g. `.yolo-drops/<assetId>-<filename>` — the path
+   *  the target agent should be told to open. */
+  path: string;
+  size?: number;
+  filename?: string;
+}
+
+/**
+ * Phase 3, optional: write an already-shared asset into ANOTHER tile's session
+ * pod, so the agent there can open it as a real file.
+ *
+ * Only DELIVERY crosses to another tile. The asset itself stays on this
+ * attachment's tile — the server enforces that, and nothing here can ask
+ * otherwise.
+ */
+export async function deliverShare(
+  cfg: ApiClientConfig,
+  workspaceId: string,
+  attachmentId: string,
+  assetId: string,
+  targetTileId: string,
+): Promise<DeliveredAsset> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(
+    `${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}/deliver`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders(cfg), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetId, targetTileId }),
+    },
+  );
+  if (!res.ok) {
+    const { message, code } = await parseErrorBody(res);
+    throw new YoloBridgeApiError(message, res.status, code);
+  }
+  return (await res.json()) as DeliveredAsset;
+}

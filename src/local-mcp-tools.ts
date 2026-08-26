@@ -26,7 +26,7 @@
  */
 
 import { checkPathApproved } from './approved-paths.js';
-import { runShare, describeShareFailure, type ShareResult } from './share-cmd.js';
+import { runShare, runDeliver, describeShareFailure, type ShareResult } from './share-cmd.js';
 
 /** Namespaced so it can never collide with a forwarded cloud tool name. */
 export const SHARE_FILE_TOOL = 'yolobridge_share_file';
@@ -45,8 +45,32 @@ export const LOCAL_TOOL_DEFINITIONS = [
           type: 'string',
           description: 'Path to the local file to send. Must be inside an approved directory.',
         },
+        assetId: {
+          type: 'string',
+          description:
+            'Optional. Deliver an ALREADY-shared asset instead of uploading again — use this to '
+            + 'retry a delivery that failed after a successful upload. Requires targetTileId; '
+            + '`path` is ignored when this is given.',
+        },
+        targetTileId: {
+          type: 'string',
+          description:
+            'Optional. A tile in this workspace to ALSO write the file into, so the agent running '
+            + 'there can open it directly. Use studio_list_tiles to find the id. Omit to leave the '
+            + 'file in the workspace only.',
+        },
       },
-      required: ['path'],
+      // TWO CALL SHAPES, so `path` cannot be unconditionally required:
+      //   { path }                  — share a local file
+      //   { assetId, targetTileId } — deliver one already shared, no re-upload
+      // A schema-aware client validates before dispatching, so requiring `path`
+      // outright made the retry form unreachable no matter what the handler
+      // accepted. (codex P1, gpt-5.6-sol — the unit tests call the handler
+      // directly and never saw it.)
+      anyOf: [
+        { required: ['path'] },
+        { required: ['assetId', 'targetTileId'] },
+      ],
       additionalProperties: false,
     },
   },
@@ -67,6 +91,7 @@ export interface LocalToolContext {
    * to avoid on the cloud side of this proxy.
    */
   shareImpl?: typeof runShare;
+  deliverImpl?: typeof runDeliver;
   checkImpl?: typeof checkPathApproved;
 }
 
@@ -114,6 +139,25 @@ export async function runLocalToolCall(
     return isNotification ? undefined : toolResult(id, `Unknown local tool: ${String(name)}`, true);
   }
 
+  const targetTileId = typeof args.targetTileId === 'string' && args.targetTileId ? args.targetTileId : undefined;
+  const retryAssetId = typeof args.assetId === 'string' && args.assetId ? args.assetId : undefined;
+
+  // Delivery-only retry: the bytes are already in the workspace, so there is no
+  // path to approve and nothing to read from disk.
+  if (retryAssetId) {
+    if (!targetTileId) {
+      return isNotification ? undefined : toolResult(id, '`targetTileId` is required when retrying delivery of an assetId.', true);
+    }
+    const redeliver = await (ctx.deliverImpl ?? runDeliver)(retryAssetId, targetTileId, {
+      commonApiBaseUrl: ctx.commonApiBaseUrl,
+      expectedWorkspaceId: ctx.workspaceId,
+    });
+    if (isNotification) return undefined;
+    return redeliver.ok
+      ? toolResult(id, `Delivered asset ${retryAssetId} to tile ${targetTileId} at ${redeliver.path}.`)
+      : toolResult(id, redeliver.message, true);
+  }
+
   const rawPath = typeof args.path === 'string' ? args.path : '';
   if (!rawPath) return isNotification ? undefined : toolResult(id, 'A `path` is required.', true);
 
@@ -126,6 +170,7 @@ export async function runLocalToolCall(
     // Property 2: open what the check RESOLVED, not what the caller passed.
     const result: ShareResult = await (ctx.shareImpl ?? runShare)(check.resolvedPath, {
       commonApiBaseUrl: ctx.commonApiBaseUrl,
+      targetTileId,
       // The approval was checked against THIS workspace. The attachment on disk
       // can have been replaced by a second `attach` since the proxy started, so
       // bind the upload to the same workspace or refuse. (codex P2.)
@@ -134,7 +179,15 @@ export async function runLocalToolCall(
     });
     if (isNotification) return undefined;
     if (!result.ok) return toolResult(id, result.message, true);
-    return toolResult(id, `Shared as asset ${result.assetId}. It is now visible in the cloud workspace.`);
+    // When it was delivered, the PATH is the useful half — it is what the
+    // target agent needs to be told in order to open the file.
+    return toolResult(
+      id,
+      result.deliveredPath
+        ? `Shared as asset ${result.assetId} and written into tile ${targetTileId} at ${result.deliveredPath}. `
+          + 'Tell that tile\'s agent to open that path.'
+        : `Shared as asset ${result.assetId}. It is now visible in the cloud workspace.`,
+    );
   } catch (err) {
     return isNotification ? undefined : toolResult(id, describeShareFailure(err), true);
   }

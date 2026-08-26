@@ -371,3 +371,123 @@ describe('runShare — workspace binding', () => {
     assert.match((res as any).message, /No such file/);
   });
 });
+
+describe('shareFile — delivering into another tile', () => {
+  function fetchFor(calls: Array<{ url: string; init: any }>, deliverStatus = 200) {
+    return async (url: any, init: any) => {
+      const u = String(url);
+      calls.push({ url: u, init });
+      if (u.endsWith('/uploads')) {
+        return new Response(JSON.stringify({ assetId: 'asset-9', uploadUrl: 'https://r2.example/put', method: 'PUT', headers: {} }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (u.startsWith('https://r2.example/')) { init?.body?.destroy?.(); return new Response('', { status: 200 }); }
+      if (u.endsWith('/finalize')) {
+        return new Response(JSON.stringify({ asset: { assetId: 'asset-9' } }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (u.endsWith('/deliver')) {
+        return deliverStatus === 200
+          ? new Response(JSON.stringify({ path: '.yolo-drops/asset-9-cut.mp4', size: 5, filename: 'cut.mp4' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+          : new Response(JSON.stringify({ error: 'Session is not reachable', code: 'SESSION_NOT_FOUND' }), { status: deliverStatus, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('unexpected', { status: 500 });
+    };
+  }
+
+  function withFile(fn: (f: string) => Promise<void>) {
+    const dir = scratch();
+    const f = path.join(dir, 'cut.mp4');
+    writeFileSync(f, 'hello');
+    return fn(f).finally(() => rmSync(dir, { recursive: true, force: true }));
+  }
+
+  it('does NOT deliver when no target is given — the sibling behaviour is unchanged', async () => {
+    await withFile(async (f) => {
+      const calls: Array<{ url: string; init: any }> = [];
+      const res = await shareFile(f, {
+        cfg: { commonApiBaseUrl: 'https://api.example', accessToken: 't' },
+        workspaceId: 'ws1', attachmentId: 'att1',
+        fetchImpl: fetchFor(calls) as unknown as typeof fetch, write: () => {},
+      });
+      assert.equal(res.deliveredPath, undefined);
+      assert.equal(calls.filter((c) => c.url.endsWith('/deliver')).length, 0);
+    });
+  });
+
+  it('delivers after finalize and returns the written path', async () => {
+    await withFile(async (f) => {
+      const calls: Array<{ url: string; init: any }> = [];
+      const res = await shareFile(f, {
+        cfg: { commonApiBaseUrl: 'https://api.example', accessToken: 't' },
+        workspaceId: 'ws1', attachmentId: 'att1', targetTileId: 'tile-2',
+        fetchImpl: fetchFor(calls) as unknown as typeof fetch, write: () => {},
+      });
+      assert.equal(res.deliveredPath, '.yolo-drops/asset-9-cut.mp4');
+
+      const deliver = calls.find((c) => c.url.endsWith('/deliver'))!;
+      assert.deepEqual(JSON.parse(deliver.init.body), { assetId: 'asset-9', targetTileId: 'tile-2' });
+      // Ordering matters: delivering before finalize would target an asset that
+      // is still pending.
+      const order = calls.map((c) => (c.url.endsWith('/finalize') ? 'finalize' : c.url.endsWith('/deliver') ? 'deliver' : 'other'));
+      assert.ok(order.indexOf('finalize') < order.indexOf('deliver'));
+    });
+  });
+
+  it('says the file IS in the workspace when only DELIVERY fails', async () => {
+    // The upload already succeeded. Reporting a flat failure would invite a
+    // re-upload of something that is already there.
+    await withFile(async (f) => {
+      const calls: Array<{ url: string; init: any }> = [];
+      await assert.rejects(
+        () => shareFile(f, {
+          cfg: { commonApiBaseUrl: 'https://api.example', accessToken: 't' },
+          workspaceId: 'ws1', attachmentId: 'att1', targetTileId: 'tile-2',
+          fetchImpl: fetchFor(calls, 409) as unknown as typeof fetch, write: () => {},
+        }),
+        (err: Error) => {
+          assert.match(err.message, /asset-9/, 'name the asset that DID land');
+          assert.match(err.message, /IS in the workspace/);
+          assert.match(err.message, /retry the DELIVERY only/);
+          assert.match(err.message, /yolo-bridge deliver asset-9 --to tile-2/,
+            'and it must name a command that exists');
+          return true;
+        },
+      );
+      assert.equal(calls.filter((c) => c.url.endsWith('/uploads')).length, 1, 'no re-upload attempted');
+    });
+  });
+});
+
+describe('the delivery failure message names a command that EXISTS', () => {
+  it('points at `yolo-bridge deliver <assetId> --to <tile>`, with the real asset id', async () => {
+    // codex P2: the message previously said "retry the delivery rather than the
+    // upload" when no entry point could do that — every path began with a fresh
+    // presign, so the only available retry duplicated the asset.
+    const dir = scratch();
+    const f = path.join(dir, 'cut.mp4');
+    writeFileSync(f, 'hello');
+    try {
+      const calls: Array<{ url: string; init: any }> = [];
+      await assert.rejects(
+        () => shareFile(f, {
+          cfg: { commonApiBaseUrl: 'https://api.example', accessToken: 't' },
+          workspaceId: 'ws1', attachmentId: 'att1', targetTileId: 'tile-2',
+          write: () => {},
+          fetchImpl: (async (url: any, init: any) => {
+            const u = String(url);
+            calls.push({ url: u, init });
+            if (u.endsWith('/uploads')) return new Response(JSON.stringify({ assetId: 'asset-9', uploadUrl: 'https://r2.example/put', method: 'PUT', headers: {} }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+            if (u.startsWith('https://r2.example/')) { init?.body?.destroy?.(); return new Response('', { status: 200 }); }
+            if (u.endsWith('/finalize')) return new Response(JSON.stringify({ asset: { assetId: 'asset-9' } }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+            return new Response(JSON.stringify({ error: 'Session is not reachable' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+          }) as any,
+        }),
+        (err: Error) => {
+          assert.match(err.message, /yolo-bridge deliver asset-9 --to tile-2/,
+            'the instruction must be a command the operator can actually run');
+          return true;
+        },
+      );
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

@@ -24,7 +24,7 @@ import { hostname } from 'node:os';
 
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
-import { runShare } from './share-cmd.js';
+import { runShare, runDeliver } from './share-cmd.js';
 import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
@@ -119,6 +119,10 @@ function printHelp(): void {
       '                         The daemon\'s own working directory is always allowed.',
       '  share <path>           Share a local file with the attached workspace, so a cloud',
       '                         agent can see it. Push only — nothing reads your disk remotely.',
+      '    [--to <tileId>]      Also write it into that tile\'s session, so its agent can open it.',
+      '  deliver <assetId>      Write an ALREADY-shared file into a tile\'s session, without',
+      '    --to <tileId>        uploading it again. This is the retry path when a share',
+      '                         uploaded fine but the delivery failed.',
       '  status                 Print local login/attach state.',
       '  version                Print the installed yolo-bridge version (also --version, -v).',
       '  --help                 Print this help.',
@@ -610,6 +614,23 @@ function cmdStatus(): number {
   return 0;
 }
 
+async function cmdDeliver(args: string[]): Promise<number> {
+  const assetId = args.find((a) => !a.startsWith('-') && a !== args[args.indexOf('--to') + 1]);
+  const toIdx = args.indexOf('--to');
+  const targetTileId = toIdx >= 0 ? args[toIdx + 1] : undefined;
+  if (!assetId || !targetTileId) {
+    process.stderr.write('yolo-bridge deliver: usage — yolo-bridge deliver <assetId> --to <tileId>\n');
+    return 64;
+  }
+  const result = await runDeliver(assetId, targetTileId, { commonApiBaseUrl: apiUrl() });
+  if (!result.ok) {
+    process.stderr.write(`yolo-bridge deliver: ${result.message}\n`);
+    return 1;
+  }
+  process.stdout.write(`${result.path}\n`);
+  return 0;
+}
+
 function cmdAllow(args: string[]): number {
   const result = runAllow(args);
   if (!result.ok) {
@@ -626,13 +647,21 @@ async function cmdShare(args: string[]): Promise<number> {
     process.stderr.write('yolo-bridge share: a file path is required.\n\n  yolo-bridge share ./cut.mp4\n');
     return 64;
   }
-  const result = await runShare(rawPath, { commonApiBaseUrl: apiUrl() });
+  // `--to <tileId>` also writes the file into that tile's session pod.
+  const toIdx = args.indexOf('--to');
+  const targetTileId = toIdx >= 0 ? args[toIdx + 1] : undefined;
+  if (toIdx >= 0 && (!targetTileId || targetTileId.startsWith('-'))) {
+    process.stderr.write('yolo-bridge share: `--to` needs a tile id.\n');
+    return 64;
+  }
+  const result = await runShare(rawPath, { commonApiBaseUrl: apiUrl(), targetTileId });
   if (!result.ok) {
     // Every one of these is an operator-actionable condition, not a bug, so it
     // prints as a sentence with no stack trace.
     process.stderr.write(`yolo-bridge share: ${result.message}\n`);
     return 1;
   }
+  if (result.deliveredPath) process.stdout.write(`${result.deliveredPath}\n`);
   return 0;
 }
 
@@ -690,6 +719,8 @@ async function main(): Promise<number> {
       return cmdDetach();
     case 'allow':
       return cmdAllow(rest);
+    case 'deliver':
+      return cmdDeliver(rest);
     case 'share':
       return cmdShare(rest);
     case 'status':
