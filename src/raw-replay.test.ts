@@ -41,6 +41,7 @@ import {
   primeRawStream,
   onLocalAgentData,
   getLocalAgentGeometry,
+  captureLocalAgentOutput,
   screenDigest,
   __getLocalAgentTerminal,
   RAW_RING_MAX_BYTES,
@@ -458,7 +459,7 @@ describe('raw ring bounds', () => {
 });
 
 describe('daemon geometry', () => {
-  it('reports the PTY grid the screen was composed at', () => {
+  it('reports the PTY grid the screen was composed at, plus how much is in use', () => {
     const pty = fakePty();
     const handle = startLocalAgent({
       spawnImpl: pty.spawnImpl,
@@ -467,10 +468,60 @@ describe('daemon geometry', () => {
       cols: 132,
       rows: 43,
     });
-    assert.deepEqual(getLocalAgentGeometry(), { cols: 132, rows: 43 });
+    // A fresh session has written nothing: one row in use, 43 rows of grid.
+    assert.deepEqual(getLocalAgentGeometry(), { cols: 132, rows: 43, usedRows: 1 });
     assert.equal(handle.cols, 132);
     assert.equal(handle.rows, 43);
     assert.equal(takeRawSeed()!.cols, 132);
+  });
+
+  it('usedRows tracks the output while cols/rows stay EXACTLY the PTY’s', async () => {
+    // ⚠️ THE INVARIANT. `usedRows` is a viewer-scale hint; the grid it is
+    // reported alongside must not move with it, because the viewer replays the
+    // daemon's bytes into a terminal of exactly that grid.
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl,
+      stdout: { write: () => true },
+      stdin: undefined,
+      cols: 132,
+      rows: 43,
+    });
+    pty.emit('one\r\ntwo\r\nthree');
+    // The daemon's terminal is fed through an async write chain; capture awaits
+    // it, which is the documented way to observe a settled screen.
+    const captured = await captureLocalAgentOutput();
+    assert.equal(captured.usedRows, 3);
+    assert.equal(captured.cols, 132);
+    assert.equal(captured.rows, 43);
+
+    const geometry = getLocalAgentGeometry()!;
+    assert.equal(geometry.usedRows, 3);
+    assert.equal(geometry.cols, 132);
+    assert.equal(geometry.rows, 43);
+
+    const seed = takeRawSeed()!;
+    assert.equal(seed.usedRows, 3);
+    assert.equal(seed.cols, 132);
+    assert.equal(seed.rows, 43);
+  });
+
+  it('an ALTERNATE-SCREEN app is reported as using the whole grid', async () => {
+    // A full-screen TUI legitimately paints every row, including ones that
+    // look blank. Reporting anything less would let a viewer crop live UI off
+    // the bottom of the tile.
+    const pty = fakePty();
+    startLocalAgent({
+      spawnImpl: pty.spawnImpl,
+      stdout: { write: () => true },
+      stdin: undefined,
+      cols: 132,
+      rows: 43,
+    });
+    pty.emit('\x1b[?1049hheader\r\nbody');
+    await captureLocalAgentOutput();
+    assert.deepEqual(getLocalAgentGeometry(), { cols: 132, rows: 43, usedRows: 43 });
+    assert.equal(takeRawSeed()!.usedRows, 43);
   });
 });
 

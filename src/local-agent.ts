@@ -447,6 +447,10 @@ export interface RawSeed {
   data: string;
   cols: number;
   rows: number;
+  /** How many of `rows` the screen is actually using (`computeUsedRows`).
+   *  A VIEWER-SCALE hint only — the seed must still be replayed into a
+   *  `cols`×`rows` terminal, never a `cols`×`usedRows` one. */
+  usedRows: number;
   /** `baseOffset > 0` — surfaced explicitly because it is the one case where
    *  replay is not a complete reconstruction. */
   truncated: boolean;
@@ -521,6 +525,7 @@ export function takeRawSeed(): RawSeed | undefined {
     data,
     cols: current.cols,
     rows: current.rows,
+    usedRows: computeUsedRows(current.term),
     truncated,
     // Only a truncated replay is missing state that predates it.
     ...(truncated ? { prologue: buildModePrologue(observedModes(current.term), rawRing.modes) } : {}),
@@ -580,11 +585,92 @@ export function primeRawStream(maxBytes: number = RAW_STREAM_PRIME_BYTES): RawSt
   return { epoch: rawRing.epoch, startOffset: groundStart, data };
 }
 
+/**
+ * Is this cell blank — nothing a viewer could see in it?
+ *
+ * "Blank" is deliberately the SAME notion `serializeTerminalBuffer`'s
+ * right-trim uses: an unwritten or space cell whose PAINT is also default. A
+ * run of spaces carrying a background colour (a status bar, a selection, a
+ * progress bar's filled portion) is real, visible output, and calling it blank
+ * would crop it off the bottom of the screen.
+ */
+function cellIsBlank(cell: {
+  getChars(): string;
+  isBgDefault(): number | boolean;
+  isInverse(): number | boolean;
+  isUnderline(): number | boolean;
+  isStrikethrough(): number | boolean;
+}): boolean {
+  const chars = cell.getChars();
+  if (chars !== '' && chars !== ' ') return false;
+  return (
+    !!cell.isBgDefault() && !cell.isInverse() && !cell.isUnderline() && !cell.isStrikethrough()
+  );
+}
+
+/**
+ * How many of the grid's `rows` the session is actually USING — the last row
+ * with anything visible on it (or the cursor's row), whichever is lower down.
+ *
+ * ⚠️ WHY THE DAEMON COMPUTES THIS AND NOT THE VIEWER. The tile only ever
+ * receives a byte stream; reconstructing "how much of the screen is in use"
+ * from it means re-implementing the parser's own bookkeeping. The daemon
+ * already holds the authoritative `@xterm/headless` buffer, so the answer is a
+ * read rather than an inference.
+ *
+ * ⚠️ ALTERNATE SCREEN ⇒ `rows`, ALWAYS. A full-screen TUI legitimately paints
+ * every row it was given, and plenty of those rows look blank by this
+ * predicate (a padded pane, an empty list body, the gap above a footer).
+ * Cropping there would clip live UI off the bottom of a viewer's tile, so the
+ * alternate screen simply opts out: the whole grid is in use by definition.
+ *
+ * COST: bounded by the number of TRAILING BLANK rows — the walk starts at the
+ * bottom and returns at the first row with content, so a busy screen costs one
+ * row's cells and a mostly-empty one costs `(rows − usedRows) × cols` cell
+ * reads with no allocation. Nothing is serialized: this is called on every
+ * relayed chunk and a screen dump per chunk would be exactly the cost the raw
+ * stream exists to avoid.
+ *
+ * Never returns 0 — a terminal is always showing at least one row, and a zero
+ * would divide straight through the viewer's scale computation.
+ */
+export function computeUsedRows(term: TerminalType): number {
+  const buffer = term.buffer.active;
+  const rows = Math.max(1, term.rows);
+  if (buffer.type === 'alternate') return rows;
+  // The viewport's first line within the buffer. The daemon's terminal is
+  // never scrolled by a human (nobody scrolls it — it is fed and read
+  // programmatically), so the base IS the viewport.
+  const top = buffer.baseY;
+  // The cursor is the session's live edge even on a row that is still empty
+  // (a fresh prompt line, a cleared input box), so it is a floor.
+  let used = Math.min(rows, Math.max(1, buffer.cursorY + 1));
+  for (let y = rows - 1; y >= used; y--) {
+    const line = buffer.getLine(top + y);
+    if (!line) continue;
+    let blank = true;
+    for (let x = 0; x < line.length; x++) {
+      const cell = line.getCell(x);
+      if (!cell) continue;
+      if (!cellIsBlank(cell)) { blank = false; break; }
+    }
+    if (!blank) { used = y + 1; break; }
+  }
+  return used;
+}
+
 /** The PTY's grid, which the tile must render at EXACTLY (it cannot be
- *  resized — the human at the keyboard is watching the same PTY). */
-export function getLocalAgentGeometry(): { cols: number; rows: number } | undefined {
+ *  resized — the human at the keyboard is watching the same PTY), plus how
+ *  much of that grid is in USE.
+ *
+ *  ⚠️ `usedRows` IS NOT A SECOND GEOMETRY. It never changes `cols`/`rows` and
+ *  the viewer never resizes its terminal to it: a viewer's terminal that is
+ *  not exactly `cols`×`rows` cannot replay the daemon's bytes (relative cursor
+ *  moves and the scroll region are defined against the real grid). It exists
+ *  so the viewer can decide how large to draw the text. */
+export function getLocalAgentGeometry(): { cols: number; rows: number; usedRows: number } | undefined {
   if (!current) return undefined;
-  return { cols: current.cols, rows: current.rows };
+  return { cols: current.cols, rows: current.rows, usedRows: computeUsedRows(current.term) };
 }
 
 /** The same recent-activity heuristic `captureLocalAgentOutput` reports, without
@@ -1139,6 +1225,7 @@ export async function captureLocalAgentOutput(): Promise<{
   busy: boolean;
   cols?: number;
   rows?: number;
+  usedRows?: number;
 }> {
   if (!current) return { output: '', busy: false };
   await current.writeChain;
@@ -1147,5 +1234,13 @@ export async function captureLocalAgentOutput(): Promise<{
   // The grid the screen above was laid out FOR. A viewer that renders it at
   // any other width re-wraps every long line — the dump has no width of its
   // own, only the one the PTY composed it at.
-  return { output, busy, cols: current.cols, rows: current.rows };
+  return {
+    output,
+    busy,
+    cols: current.cols,
+    rows: current.rows,
+    // How much of that grid is in use, so the viewer can scale the text to the
+    // rows that carry content instead of to a screenful of blank tail.
+    usedRows: computeUsedRows(current.term),
+  };
 }

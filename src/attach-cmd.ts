@@ -157,7 +157,7 @@ export interface AttachDaemonDeps {
    *  terminal. */
   clearScreen?: () => void;
   deliverPrompt?: (prompt: string) => Promise<void>;
-  captureOutput?: () => Promise<{ output: string; busy: boolean; cols?: number; rows?: number }>;
+  captureOutput?: () => Promise<{ output: string; busy: boolean; cols?: number; rows?: number; usedRows?: number }>;
   /**
    * The raw-replay seed for a browser terminal (local-agent.ts's
    * `takeRawSeed`). Injectable so the tests can drive seed/tap interleaving
@@ -170,9 +170,11 @@ export interface AttachDaemonDeps {
    * (local-agent.ts's `primeRawStream`).
    */
   primeRawStream?: () => RawStreamPrime;
-  /** The PTY's fixed grid, restated on every relayed chunk so a viewer learns
-   *  it with (not after) its first byte. */
-  getAgentGeometry?: () => { cols: number; rows: number } | undefined;
+  /** The PTY's fixed grid — plus how much of it is in USE — restated on every
+   *  relayed chunk so a viewer learns both with (not after) its first byte.
+   *  `usedRows` is a SCALE hint and never a geometry: the viewer's terminal
+   *  stays `cols`×`rows` or the replay stops being byte-exact. */
+  getAgentGeometry?: () => { cols: number; rows: number; usedRows?: number } | undefined;
   /**
    * Raw-PTY-output tap for the DEMAND-DRIVEN live stream
    * (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming"). Defaults to
@@ -895,6 +897,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         startOffset: batch.startOffset,
         cols: geometry?.cols,
         rows: geometry?.rows,
+        usedRows: geometry?.usedRows,
       });
       if (outputStream === session) session.seq += 1;
     } catch (err) {
@@ -1143,6 +1146,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                       {
                         cols: raw?.cols ?? captured.cols,
                         rows: raw?.rows ?? captured.rows,
+                        usedRows: raw?.usedRows ?? captured.usedRows,
                         raw: raw
                           ? {
                               epoch: raw.epoch,

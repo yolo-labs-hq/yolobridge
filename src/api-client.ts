@@ -290,6 +290,9 @@ export async function postReadOutputReply(
      *  pixel-derived size — see YoloBridgeTerminalView. */
     cols?: number;
     rows?: number;
+    /** How many of `rows` carry content (local-agent.ts's `computeUsedRows`).
+     *  A SCALE hint, not a geometry: the tile still renders `cols`×`rows`. */
+    usedRows?: number;
     raw?: RawSeedReply;
     /**
      * Fingerprint of the daemon's own visible screen (local-agent.ts's
@@ -307,6 +310,7 @@ export async function postReadOutputReply(
     output,
     busy,
     ...(extra?.cols && extra?.rows ? { cols: extra.cols, rows: extra.rows } : {}),
+    ...(extra?.usedRows ? { usedRows: extra.usedRows } : {}),
     ...(extra?.raw
       ? {
           raw: extra.raw.data,
@@ -361,6 +365,10 @@ export async function postOutputChunk(
      *  learns the geometry WITH its first chunk rather than after it. */
     cols?: number;
     rows?: number;
+    /** How many of `rows` carry content right now. Restated per chunk for the
+     *  same reason, and for a second one: it MOVES as the session produces
+     *  output, so the viewer's scale would otherwise be stuck at seed time. */
+    usedRows?: number;
   },
 ): Promise<boolean> {
   const body = await postEvent(cfg, workspaceId, {
@@ -373,6 +381,7 @@ export async function postOutputChunk(
     ...(chunk.epoch ? { epoch: chunk.epoch } : {}),
     ...(typeof chunk.startOffset === 'number' ? { startOffset: chunk.startOffset } : {}),
     ...(chunk.cols && chunk.rows ? { cols: chunk.cols, rows: chunk.rows } : {}),
+    ...(chunk.usedRows ? { usedRows: chunk.usedRows } : {}),
   });
   return Boolean(body?.relayed);
 }

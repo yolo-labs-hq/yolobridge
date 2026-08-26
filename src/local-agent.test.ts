@@ -13,6 +13,7 @@ import {
   stopLocalAgent,
   deliverPromptToLocalAgent,
   captureLocalAgentOutput,
+  computeUsedRows,
   serializeTerminalBuffer,
   onLocalAgentData,
   type PtySpawnImpl,
@@ -79,6 +80,79 @@ async function screen(write: string, cols = 40, rows = 6): Promise<string> {
 }
 
 const ESC = '\x1b';
+
+/** Feed a real `@xterm/headless` terminal and report `computeUsedRows`. Real
+ *  parser, real buffer — the whole point is that this is the same engine the
+ *  daemon runs, so an escape sequence behaves here exactly as it does live. */
+async function usedRowsAfter(write: string, cols = 40, rows = 24): Promise<number> {
+  const term = new Terminal({ cols, rows, allowProposedApi: true });
+  await new Promise<void>((resolve) => term.write(write, () => resolve()));
+  return computeUsedRows(term);
+}
+
+describe('computeUsedRows', () => {
+  it('reports the last row with output on it, not the grid height', () => {
+    // The whole point: a 24-row PTY showing three lines is USING three rows,
+    // and the viewer scales to that instead of to 21 rows of nothing.
+    return usedRowsAfter('one\r\ntwo\r\nthree').then((used) => assert.equal(used, 3));
+  });
+
+  it('counts the rows a line WRAPPED onto, because the screen really is using them', async () => {
+    // 100 characters at 40 columns is three rows of screen, however few
+    // "lines" the writer thought it was emitting.
+    assert.equal(await usedRowsAfter('x'.repeat(100), 40, 24), 3);
+  });
+
+  it('ignores trailing blank rows even when the cursor walked past them', async () => {
+    // Cursor-home after output: rows 4-24 are still empty, so the answer is
+    // the content, and the cursor (now at row 1) does not drag it down.
+    assert.equal(await usedRowsAfter(`one\r\ntwo\r\nthree${ESC}[H`), 3);
+  });
+
+  it('counts a row the CURSOR is sitting on, even with nothing written there yet', async () => {
+    // A fresh prompt line is the session's live edge. Cropping above it would
+    // hide the row the next keystroke lands on.
+    assert.equal(await usedRowsAfter(`hello${ESC}[10;1H`), 10);
+  });
+
+  it('counts a row painted with BACKGROUND COLOUR but no glyphs', async () => {
+    // A status bar / progress bar is a run of spaces with paint on them. It is
+    // visible output, and cropping it off the bottom would lose it.
+    const used = await usedRowsAfter(`top${ESC}[5;1H${ESC}[44m${' '.repeat(40)}${ESC}[0m${ESC}[H`);
+    assert.equal(used, 5);
+  });
+
+  it('never reports 0, even for a screen that has had nothing written to it', async () => {
+    // A zero would divide straight through the viewer's scale computation.
+    assert.equal(await usedRowsAfter(''), 1);
+  });
+
+  it('never reports more than the grid', async () => {
+    assert.equal(await usedRowsAfter('line\r\n'.repeat(100), 40, 24), 24);
+  });
+
+  it('⚠️ ALTERNATE SCREEN: reports the WHOLE grid, however blank it looks', async () => {
+    // THE RULE THAT KEEPS FULL-SCREEN TUIs INTACT. An app on the alternate
+    // screen owns every row it was given — a padded pane, an empty list body,
+    // the gap above a footer all look blank to the predicate above and are all
+    // live UI. Cropping there clips the app, so the alternate screen opts out.
+    const rows = 24;
+    // Enter the alternate screen and paint two lines at the top.
+    const used = await usedRowsAfter(`${ESC}[?1049hheader\r\nbody`, 40, rows);
+    assert.equal(used, rows);
+  });
+
+  it('goes back to counting content when the app LEAVES the alternate screen', async () => {
+    // The rule is about which buffer is active, not a latch: a TUI that exits
+    // must not leave every future scale pinned to the whole grid.
+    const used = await usedRowsAfter(
+      `${ESC}[?1049hfullscreen app${ESC}[?1049l` + 'back\r\nhome',
+      40,
+      24,
+    );
+    assert.equal(used, 2);
+  });
+});
 
 /** How many `ESC [ … m` sequences a serialized screen contains. */
 function escapeCount(text: string): number {
