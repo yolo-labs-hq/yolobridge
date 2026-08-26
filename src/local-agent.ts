@@ -219,22 +219,195 @@ function resolveRows(opts: StartLocalAgentOptions): number {
 }
 
 /**
- * Serializes the terminal's current buffer (scrollback + viewport) to
- * plain text — no ANSI/SGR escape codes. Deliberately not using
- * `@xterm/addon-serialize`: that addon's `serialize()` reconstructs a
- * VT100-replayable stream (colors, cursor moves included) for re-feeding
- * into another terminal, which is the wrong shape for `read_tile_output`
- * — the consumer on the other end (an orchestrator tile, possibly an
- * LLM) wants clean text, not escape sequences. Walking `buffer.active`
- * directly and calling `translateToString` per line gives exactly that.
+ * A cell's SGR-relevant attribute state, in the shape we need to emit it.
+ *
+ * Colour MODE is captured as a tag ('default' | 'palette' | 'rgb') rather
+ * than the raw `getFgColorMode()` number: the `@xterm/headless` typings
+ * (`typings/xterm-headless.d.ts`, `IBufferCell`) document that number as
+ * opaque — "can be used to perform quick comparisons of 2 cells" — and
+ * explicitly point at `isFgRGB` / `isFgPalette` / `isFgDefault` as the way
+ * to ask what mode a cell is in. So we ask via the documented predicates
+ * instead of hard-coding constants that the package never promises.
+ */
+interface CellAttrs {
+  bold: boolean;
+  dim: boolean;
+  italic: boolean;
+  underline: boolean;
+  inverse: boolean;
+  strikethrough: boolean;
+  fgMode: 'default' | 'palette' | 'rgb';
+  fgColor: number;
+  bgMode: 'default' | 'palette' | 'rgb';
+  bgColor: number;
+}
+
+const DEFAULT_ATTRS: CellAttrs = {
+  bold: false,
+  dim: false,
+  italic: false,
+  underline: false,
+  inverse: false,
+  strikethrough: false,
+  fgMode: 'default',
+  fgColor: 0,
+  bgMode: 'default',
+  bgColor: 0,
+};
+
+function attrsAreDefault(a: CellAttrs): boolean {
+  return (
+    !a.bold &&
+    !a.dim &&
+    !a.italic &&
+    !a.underline &&
+    !a.inverse &&
+    !a.strikethrough &&
+    a.fgMode === 'default' &&
+    a.bgMode === 'default'
+  );
+}
+
+/** `38;…` / `48;…` (or the compact 30-37/90-97/40-47/100-107 forms). */
+function colorCodes(mode: CellAttrs['fgMode'], color: number, fg: boolean): string[] {
+  if (mode === 'default') return [fg ? '39' : '49'];
+  if (mode === 'rgb') {
+    // Typings: RGB mode packs the colour as 0xRRGGBB.
+    const r = (color >> 16) & 0xff;
+    const g = (color >> 8) & 0xff;
+    const b = color & 0xff;
+    return [`${fg ? 38 : 48};2;${r};${g};${b}`];
+  }
+  // Palette: 0-255. 0-7 and 8-15 have compact single-code forms; the rest
+  // need the indexed form.
+  if (color < 8) return [String((fg ? 30 : 40) + color)];
+  if (color < 16) return [String((fg ? 90 : 100) + (color - 8))];
+  return [`${fg ? 38 : 48};5;${color}`];
+}
+
+/**
+ * The SGR parameters that move `prev` to `next` — EMPTY when nothing
+ * changed, which is what keeps the payload small (see
+ * `serializeTerminalBuffer`).
+ */
+function sgrDiff(prev: CellAttrs, next: CellAttrs): string[] {
+  const codes: string[] = [];
+
+  // Bold and dim share one "off" code (22), so turning either off means
+  // re-asserting whichever of the two survives.
+  if ((prev.bold && !next.bold) || (prev.dim && !next.dim)) {
+    codes.push('22');
+    if (next.bold) codes.push('1');
+    if (next.dim) codes.push('2');
+  } else {
+    if (!prev.bold && next.bold) codes.push('1');
+    if (!prev.dim && next.dim) codes.push('2');
+  }
+  if (prev.italic !== next.italic) codes.push(next.italic ? '3' : '23');
+  if (prev.underline !== next.underline) codes.push(next.underline ? '4' : '24');
+  if (prev.inverse !== next.inverse) codes.push(next.inverse ? '7' : '27');
+  if (prev.strikethrough !== next.strikethrough) codes.push(next.strikethrough ? '9' : '29');
+  if (prev.fgMode !== next.fgMode || prev.fgColor !== next.fgColor) {
+    codes.push(...colorCodes(next.fgMode, next.fgColor, true));
+  }
+  if (prev.bgMode !== next.bgMode || prev.bgColor !== next.bgColor) {
+    codes.push(...colorCodes(next.bgMode, next.bgColor, false));
+  }
+  return codes;
+}
+
+/**
+ * Serializes the terminal's current buffer (scrollback + viewport) to text
+ * that keeps the agent's COLOUR and text styling, as SGR escapes only.
+ *
+ * Still deliberately not `@xterm/addon-serialize`: that addon reconstructs
+ * a fully VT100-replayable stream — cursor moves, scroll regions, mode
+ * switches — for re-feeding into another terminal, which is the wrong
+ * shape for `read_tile_output`. Its consumers (the browser tile, and an
+ * orchestrator/LLM reading the same capture) want the SCREEN as lines,
+ * with the styling that makes an agent's output readable, and nothing
+ * that repositions a cursor. So we walk `buffer.active` cell by cell and
+ * re-emit just the SGR state.
+ *
+ * Payload discipline is the reason this walks cells rather than emitting
+ * per cell: an escape is written ONLY where the attribute state actually
+ * changes, so a screen of unstyled text emits ZERO escapes and is
+ * byte-identical to what the old `translateToString(true)` produced. That
+ * matters — this capture is polled on an interval and crosses the
+ * network on every poll.
+ *
+ * Each line is self-contained: any line that ends with non-default
+ * attributes is closed with a reset, so state cannot bleed into the next
+ * line (the webapp splits this on `\n` and renders lines independently).
+ *
+ * NOT preserved, by design: cursor position, the alternate-screen flag,
+ * scroll regions, hyperlinks (OSC 8), and blink/invisible/overline — none
+ * of them survive into a static, line-split view.
  */
 export function serializeTerminalBuffer(term: TerminalType): string {
   const buffer = term.buffer.active;
   const lines: string[] = [];
+
   for (let i = 0; i < buffer.length; i++) {
     const line = buffer.getLine(i);
-    lines.push(line ? line.translateToString(true) : '');
+    if (!line) {
+      lines.push('');
+      continue;
+    }
+
+    // Collect first, so trailing blanks can be trimmed before any escape
+    // is emitted for them (matching the old `translateToString(true)`).
+    const cells: { text: string; attrs: CellAttrs }[] = [];
+    for (let x = 0; x < line.length; x++) {
+      const cell = line.getCell(x);
+      if (!cell) continue;
+      // Width 0 = the right half of a wide (CJK/emoji) glyph; its content
+      // already came out of the width-2 cell before it. Emitting it too
+      // would duplicate the character.
+      if (cell.getWidth() === 0) continue;
+      // An untouched cell has no content at all; it renders as a space.
+      const chars = cell.getChars();
+      cells.push({
+        text: chars === '' ? ' ' : chars,
+        attrs: {
+          bold: !!cell.isBold(),
+          dim: !!cell.isDim(),
+          italic: !!cell.isItalic(),
+          underline: !!cell.isUnderline(),
+          inverse: !!cell.isInverse(),
+          strikethrough: !!cell.isStrikethrough(),
+          fgMode: cell.isFgRGB() ? 'rgb' : cell.isFgPalette() ? 'palette' : 'default',
+          // In default mode the colour NUMBER is meaningless (the typings
+          // say "should be 0"; the runtime actually reports -1). Normalise
+          // it so two default cells compare equal and emit no escape.
+          fgColor: cell.isFgDefault() ? 0 : cell.getFgColor(),
+          bgMode: cell.isBgRGB() ? 'rgb' : cell.isBgPalette() ? 'palette' : 'default',
+          bgColor: cell.isBgDefault() ? 0 : cell.getBgColor(),
+        },
+      });
+    }
+
+    // Right-trim, as before — but only cells that are blank AND unstyled.
+    // A run of spaces carrying a background colour is real, visible output
+    // (a status bar, a selection); dropping it would lose the paint.
+    while (cells.length > 0) {
+      const last = cells[cells.length - 1];
+      if (last.text === ' ' && attrsAreDefault(last.attrs)) cells.pop();
+      else break;
+    }
+
+    let out = '';
+    let state = DEFAULT_ATTRS;
+    for (const cell of cells) {
+      const codes = sgrDiff(state, cell.attrs);
+      if (codes.length > 0) out += `\x1b[${codes.join(';')}m`;
+      out += cell.text;
+      state = cell.attrs;
+    }
+    if (!attrsAreDefault(state)) out += '\x1b[0m';
+    lines.push(out);
   }
+
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   return lines.join('\n');
 }

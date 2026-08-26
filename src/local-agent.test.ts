@@ -71,24 +71,110 @@ afterEach(() => {
   stopLocalAgent();
 });
 
+async function screen(write: string, cols = 40, rows = 6): Promise<string> {
+  const term = new Terminal({ cols, rows, allowProposedApi: true });
+  await new Promise<void>((resolve) => term.write(write, () => resolve()));
+  return serializeTerminalBuffer(term);
+}
+
+const ESC = '\x1b';
+
+/** How many `ESC [ … m` sequences a serialized screen contains. */
+function escapeCount(text: string): number {
+  return (text.match(/\x1b\[[0-9;]*m/g) || []).length;
+}
+
 describe('serializeTerminalBuffer', () => {
-  it('produces plain text with ANSI/SGR escapes stripped, not a replayable VT100 stream', async () => {
-    const term = new Terminal({ cols: 40, rows: 5, allowProposedApi: true });
-    await new Promise<void>((resolve) => {
-      // Bold-red "hello" + a cursor move + plain "world" on the next line.
-      term.write('[1;31mhello[0m\r\n[2Cworld', () => resolve());
-    });
-    const text = serializeTerminalBuffer(term);
-    assert.ok(!text.includes('['), 'no raw escape sequences should survive');
-    assert.match(text, /hello/);
-    assert.match(text, /world/);
+  it('emits NO escapes at all for a plain, unstyled screen (the common case stays byte-identical)', async () => {
+    const text = await screen('hello\r\nworld');
+    assert.equal(text, 'hello\nworld');
+    assert.equal(escapeCount(text), 0);
   });
 
   it('trims trailing blank lines from an otherwise-empty buffer', async () => {
-    const term = new Terminal({ cols: 20, rows: 10, allowProposedApi: true });
-    await new Promise<void>((resolve) => term.write('only line', () => resolve()));
-    const text = serializeTerminalBuffer(term);
+    const text = await screen('only line', 20, 10);
     assert.equal(text, 'only line');
+  });
+
+  it('drops cursor-movement and other non-SGR control sequences', async () => {
+    // A cursor-forward before "world": the SPACES it skips over survive
+    // (that is what the screen looks like), the escape itself does not.
+    const text = await screen('hello\r\n\x1b[2Cworld');
+    assert.equal(text, 'hello\n  world');
+    assert.equal(escapeCount(text), 0);
+  });
+
+  it('round-trips a foreground colour, emitting ONE escape for the run, not one per cell', async () => {
+    const text = await screen('\x1b[31mhello\x1b[0m');
+    // Opening escape + the closing end-of-line reset. Five red cells, two
+    // escapes — not ten.
+    assert.equal(text, `${ESC}[31mhello${ESC}[0m`);
+    assert.equal(escapeCount(text), 2);
+  });
+
+  it('round-trips bold and underline', async () => {
+    const bold = await screen('\x1b[1;31mhi\x1b[0m');
+    assert.equal(bold, `${ESC}[1;31mhi${ESC}[0m`);
+
+    const underline = await screen('\x1b[4mhi\x1b[0m');
+    assert.equal(underline, `${ESC}[4mhi${ESC}[0m`);
+  });
+
+  it('round-trips a 256-colour palette index', async () => {
+    const fg = await screen('\x1b[38;5;208mX\x1b[0m');
+    assert.equal(fg, `${ESC}[38;5;208mX${ESC}[0m`);
+
+    const bg = await screen('\x1b[48;5;17mX\x1b[0m');
+    assert.equal(bg, `${ESC}[48;5;17mX${ESC}[0m`);
+  });
+
+  it('round-trips a truecolor (RGB) foreground and background', async () => {
+    const fg = await screen('\x1b[38;2;10;20;30mX\x1b[0m');
+    assert.equal(fg, `${ESC}[38;2;10;20;30mX${ESC}[0m`);
+
+    const bg = await screen('\x1b[48;2;200;100;50mX\x1b[0m');
+    assert.equal(bg, `${ESC}[48;2;200;100;50mX${ESC}[0m`);
+  });
+
+  it('emits escapes only where the attribute state CHANGES', async () => {
+    const text = await screen('\x1b[31maaa\x1b[32mbbb\x1b[0mccc');
+    // red-open, green-switch, back-to-default — three, for nine cells.
+    assert.equal(text, `${ESC}[31maaa${ESC}[32mbbb${ESC}[39mccc`);
+    assert.equal(escapeCount(text), 3);
+  });
+
+  it('closes every styled line with a reset so state cannot bleed across lines', async () => {
+    // No reset is written by the source at all: the terminal itself carries
+    // red onto the second row, and each SERIALIZED line must still stand
+    // alone rather than depending on the line before it.
+    const text = await screen('\x1b[31mred\r\nstill red');
+    const lines = text.split('\n');
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0], `${ESC}[31mred${ESC}[0m`);
+    assert.equal(lines[1], `${ESC}[31mstill red${ESC}[0m`);
+  });
+
+  it('does not leak style onto a line that is genuinely unstyled', async () => {
+    const text = await screen('\x1b[31mred\x1b[0m\r\nplain');
+    const lines = text.split('\n');
+    assert.equal(lines[1], 'plain');
+  });
+
+  it('emits a wide (CJK) glyph exactly once', async () => {
+    const text = await screen('\x1b[32m你好\x1b[0m');
+    assert.equal(text, `${ESC}[32m你好${ESC}[0m`);
+  });
+
+  it('keeps a background-painted run of spaces but still right-trims unstyled padding', async () => {
+    const text = await screen('\x1b[44m   \x1b[0m');
+    assert.equal(text, `${ESC}[44m   ${ESC}[0m`);
+  });
+
+  it('re-asserts the surviving half when bold or dim is turned off', async () => {
+    // 22 clears BOTH bold and dim, so dropping bold while dim stays must
+    // re-emit the dim.
+    const text = await screen('\x1b[1;2maa\x1b[22;2mbb\x1b[0m');
+    assert.equal(text, `${ESC}[1;2maa${ESC}[22;2mbb${ESC}[0m`);
   });
 });
 
