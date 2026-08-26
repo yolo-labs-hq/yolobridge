@@ -142,6 +142,15 @@ export interface AgentOutputSink {
   write(data: string): unknown;
 }
 
+/** A minimal "my window changed size" surface (matches `process.stdout`, and
+ *  test doubles). Node emits `'resize'` on the TTY stdout stream on SIGWINCH. */
+export interface TerminalResizeSource {
+  columns?: number;
+  rows?: number;
+  on(event: 'resize', listener: () => void): unknown;
+  removeListener?(event: 'resize', listener: () => void): unknown;
+}
+
 /** A minimal readable-stream surface (matches `process.stdin`, and test doubles). */
 export interface AgentInputSource {
   on(event: 'data', listener: (data: Buffer | string) => void): unknown;
@@ -178,6 +187,11 @@ export interface StartLocalAgentOptions {
   /** Bounded wait for readiness before `deliverPromptToLocalAgent` proceeds anyway. */
   readinessTimeoutMs?: number;
   readinessPollMs?: number;
+  /** Where "the human resized their terminal" comes from. Defaults to the real
+   *  `process.stdout` when no `stdout` sink was injected (i.e. a genuine
+   *  interactive `attach`). Pass explicitly to drive resizes in a test; pass
+   *  `undefined` WITH a `stdout` sink to disable resize handling entirely. */
+  resizeSource?: TerminalResizeSource;
   /** Test injection point — swap the real `node-pty` spawn for a fake IPty. */
   spawnImpl?: PtySpawnImpl;
 }
@@ -185,15 +199,21 @@ export interface StartLocalAgentOptions {
 export interface LocalAgentHandle {
   /** Kills the PTY process and tears down stdio wiring. Safe to call more than once. */
   stop(): void;
-  /** The PTY's column count. Fixed at spawn — the daemon does not handle
-   *  SIGWINCH and nothing resizes this PTY, least of all the cloud (the human
-   *  at the keyboard is watching the same PTY through `process.stdout`). */
+  /** The PTY's column count AT SPAWN.
+   *
+   *  ⚠️ This is a snapshot, not the live size. The human at the keyboard is
+   *  watching this same PTY through `process.stdout`, and they can resize
+   *  their window — which is exactly why the CLOUD must never resize it, and
+   *  is NOT a reason the size never changes. Read `getLocalAgentGeometry()`
+   *  for the current grid. */
   cols: number;
-  /** The PTY's row count. Same fixed-at-spawn contract as `cols`. */
+  /** The PTY's row count at spawn. Same snapshot caveat as `cols`. */
   rows: number;
 }
 
 interface LocalAgentState {
+  resizeSource?: TerminalResizeSource;
+  resizeListener?: () => void;
   ptyProcess: IPty;
   term: TerminalType;
   cols: number;
@@ -659,9 +679,15 @@ export function computeUsedRows(term: TerminalType): number {
   return used;
 }
 
-/** The PTY's grid, which the tile must render at EXACTLY (it cannot be
- *  resized — the human at the keyboard is watching the same PTY), plus how
+/** The PTY's CURRENT grid, which the tile must render at EXACTLY, plus how
  *  much of that grid is in USE.
+ *
+ *  The viewer must not resize this grid — the human at the keyboard is
+ *  watching the same PTY, so a cloud-side resize would reach over and reflow
+ *  their real screen. But the human themselves CAN resize it, and when they
+ *  do the ring restarts under a fresh epoch (see `handleLocalResize`), so a
+ *  viewer holding the old geometry re-seeds rather than replaying old bytes
+ *  against a grid that no longer exists.
  *
  *  ⚠️ `usedRows` IS NOT A SECOND GEOMETRY. It never changes `cols`/`rows` and
  *  the viewer never resizes its terminal to it: a viewer's terminal that is
@@ -946,6 +972,14 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
   // field (which defaults to wiring up the real `process.stdin`).
   const inStream: AgentInputSource | undefined = 'stdin' in opts ? opts.stdin : (process.stdin as unknown as AgentInputSource);
 
+  // Same defaulting rule as `resolveCols`/`resolveRows`: only reach for the real
+  // `process.stdout` when nothing was injected, so a test with a fake sink does
+  // not silently pick up the CI runner's terminal.
+  const resizeSource: TerminalResizeSource | undefined =
+    'resizeSource' in opts
+      ? opts.resizeSource
+      : (opts.stdout === undefined ? (process.stdout as unknown as TerminalResizeSource) : undefined);
+
   const ptyProcess = spawnImpl(agentBin, agentArgs, {
     name: 'xterm-256color',
     cols,
@@ -976,8 +1010,15 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
     writeChain: Promise.resolve(),
     stdin: inStream,
     rawModeEnabled: false,
+    resizeSource,
   };
   current = state;
+
+  if (resizeSource && typeof resizeSource.on === 'function') {
+    const resizeListener = () => handleLocalResize(state);
+    state.resizeListener = resizeListener;
+    resizeSource.on('resize', resizeListener);
+  }
 
   ptyProcess.onData((data: string) => {
     state.lastOutputAt = Date.now();
@@ -1032,7 +1073,53 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
  * exit code 124. With `stdin.pause()` added below, the same repro exits
  * cleanly on its own well under a second — no timeout/kill needed.
  */
+/**
+ * The human at the keyboard resized their terminal window.
+ *
+ * WHY THIS EXISTS: the PTY size used to be treated as fixed at spawn, on the
+ * reasoning that "nothing resizes this PTY, least of all the cloud". The cloud
+ * half of that is right and still enforced — a viewer must never reach over and
+ * reflow the operator's real screen. The other half was simply wrong: the human
+ * watching this PTY through `process.stdout` can drag their window, Node raises
+ * `'resize'` on SIGWINCH, and we ignored it. The child kept rendering to the old
+ * grid, so the operator's own terminal garbled and the tile kept reporting a
+ * geometry that no longer matched anything.
+ *
+ * Everything retained in the ring was captured against a grid that no longer
+ * exists — relative cursor moves and the scroll region are defined against the
+ * REAL grid, so replaying those bytes at the new size garbles rather than
+ * degrades. A fresh epoch is the honest answer: the viewer re-seeds from the
+ * current buffer instead of splicing two geometries together.
+ */
+function handleLocalResize(state: LocalAgentState): void {
+  const src = state.resizeSource;
+  if (!src) return;
+
+  const cols = src.columns ?? 0;
+  const rows = src.rows ?? 0;
+  // A stdout that has stopped being a TTY (piped, or the window is gone)
+  // reports 0/undefined. Resizing a PTY to zero wedges the child.
+  if (cols < 1 || rows < 1) return;
+  // SIGWINCH also fires for changes that are not a size change. Resizing to the
+  // size we already have would burn an epoch and force a pointless re-seed.
+  if (cols === state.cols && rows === state.rows) return;
+
+  state.cols = cols;
+  state.rows = rows;
+  state.term.resize(cols, rows);
+  rawRing = newRawRing(rows);
+
+  try {
+    state.ptyProcess.resize(cols, rows);
+  } catch {
+    // The child is already gone; onExit will clear `current`.
+  }
+}
+
 function teardownStdio(state: LocalAgentState): void {
+  if (state.resizeSource && state.resizeListener && typeof state.resizeSource.removeListener === 'function') {
+    state.resizeSource.removeListener('resize', state.resizeListener);
+  }
   const { stdin, stdinListener } = state;
   if (stdin && stdinListener && typeof stdin.removeListener === 'function') {
     stdin.removeListener('data', stdinListener);

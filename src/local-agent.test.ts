@@ -13,6 +13,8 @@ import {
   stopLocalAgent,
   deliverPromptToLocalAgent,
   captureLocalAgentOutput,
+  getLocalAgentGeometry,
+  takeRawSeed,
   computeUsedRows,
   serializeTerminalBuffer,
   onLocalAgentData,
@@ -28,6 +30,7 @@ function fakePty() {
   let dataCb: ((d: string) => void) | undefined;
   let exitCb: ((e: { exitCode: number; signal?: number }) => void) | undefined;
   const writes: string[] = [];
+  const resizes: Array<{ cols: number; rows: number }> = [];
   let killed = false;
 
   const ipty = {
@@ -45,11 +48,15 @@ function fakePty() {
     kill: () => {
       killed = true;
     },
+    resize: (cols: number, rows: number) => {
+      resizes.push({ cols, rows });
+    },
   };
 
   return {
     spawnImpl: (() => ipty as unknown as IPty) as PtySpawnImpl,
     writes,
+    resizes,
     emitData: (d: string) => dataCb?.(d),
     emitExit: (info: { exitCode: number; signal?: number }) => exitCb?.(info),
     get killed() {
@@ -631,5 +638,125 @@ describe('onLocalAgentData — the raw PTY tap the live stream reads from', () =
       unsubscribeBad();
       unsubscribeGood();
     }
+  });
+});
+
+
+describe('local terminal resize (SIGWINCH)', () => {
+  /**
+   * A fake `process.stdout`-as-resize-source: mutable size plus an emitter.
+   */
+  function fakeResizeSource(cols: number, rows: number) {
+    const listeners: Array<() => void> = [];
+    return {
+      columns: cols,
+      rows,
+      on(_event: 'resize', listener: () => void) {
+        listeners.push(listener);
+      },
+      removeListener(_event: 'resize', listener: () => void) {
+        const i = listeners.indexOf(listener);
+        if (i >= 0) listeners.splice(i, 1);
+      },
+      /** Resize the "window" and fire SIGWINCH, the way Node does. */
+      resizeTo(nextCols: number, nextRows: number) {
+        this.columns = nextCols;
+        this.rows = nextRows;
+        for (const l of [...listeners]) l();
+      },
+      fire() {
+        for (const l of [...listeners]) l();
+      },
+      get listenerCount() {
+        return listeners.length;
+      },
+    };
+  }
+
+  function start(pty: ReturnType<typeof fakePty>, src: ReturnType<typeof fakeResizeSource>) {
+    return startLocalAgent({
+      agentBin: 'fake',
+      cols: src.columns,
+      rows: src.rows,
+      stdout: { write: () => {} },
+      stdin: undefined,
+      resizeSource: src,
+      spawnImpl: pty.spawnImpl,
+    });
+  }
+
+  it('resizes the PTY, our emulator, and the reported geometry', () => {
+    const pty = fakePty();
+    const src = fakeResizeSource(80, 24);
+    start(pty, src);
+
+    assert.deepEqual(
+      { cols: getLocalAgentGeometry()?.cols, rows: getLocalAgentGeometry()?.rows },
+      { cols: 80, rows: 24 },
+    );
+
+    src.resizeTo(120, 40);
+
+    // The child must be told, or it keeps rendering to the old grid — which is
+    // precisely the garbling the operator saw.
+    assert.deepEqual(pty.resizes, [{ cols: 120, rows: 40 }], 'the PTY child was not resized');
+    assert.deepEqual(
+      { cols: getLocalAgentGeometry()?.cols, rows: getLocalAgentGeometry()?.rows },
+      { cols: 120, rows: 40 },
+      'reported geometry still describes a grid that no longer exists',
+    );
+  });
+
+  it('starts a FRESH EPOCH, because retained bytes cannot replay at a new size', () => {
+    const pty = fakePty();
+    const src = fakeResizeSource(80, 24);
+    start(pty, src);
+
+    pty.emitData('hello');
+    const before = takeRawSeed()?.epoch;
+    assert.ok(before, 'expected an epoch before the resize');
+
+    src.resizeTo(100, 30);
+
+    const after = takeRawSeed()?.epoch;
+    assert.ok(after);
+    assert.notEqual(after, before, 'epoch unchanged — a viewer would replay old-grid bytes at the new size');
+  });
+
+  it('ignores a SIGWINCH that is not a size change, rather than burning an epoch', () => {
+    const pty = fakePty();
+    const src = fakeResizeSource(80, 24);
+    start(pty, src);
+    const before = takeRawSeed()?.epoch;
+
+    src.fire(); // SIGWINCH with identical dimensions
+
+    assert.deepEqual(pty.resizes, [], 'resized the PTY for a no-op SIGWINCH');
+    assert.equal(takeRawSeed()?.epoch, before, 'forced a pointless re-seed');
+  });
+
+  it('ignores a zero/undefined size, which would wedge the child', () => {
+    const pty = fakePty();
+    const src = fakeResizeSource(80, 24);
+    start(pty, src);
+
+    src.resizeTo(0, 0); // stdout stopped being a TTY
+
+    assert.deepEqual(pty.resizes, [], 'resized the PTY to zero');
+    assert.deepEqual(
+      { cols: getLocalAgentGeometry()?.cols, rows: getLocalAgentGeometry()?.rows },
+      { cols: 80, rows: 24 },
+    );
+  });
+
+  it('unwires the listener on stop, so a stopped session cannot be resized', () => {
+    const pty = fakePty();
+    const src = fakeResizeSource(80, 24);
+    start(pty, src);
+    assert.equal(src.listenerCount, 1);
+
+    stopLocalAgent();
+
+    assert.equal(src.listenerCount, 0, 'listener leaked past stop');
   });
 });
