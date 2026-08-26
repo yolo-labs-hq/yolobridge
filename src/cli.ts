@@ -589,7 +589,13 @@ async function cmdAttach(args: string[]): Promise<number> {
     // to reach that point is usually still valid for one more request, so
     // this detach call has a real chance of succeeding rather than just
     // failing the same way the refresh did.
-    if (result.reason === 'refresh-failed') {
+    // `credential-rejected` (2026-08-26) joins it for the same reason: it too
+    // fires mid-session, long after the attachment was created, so skipping the
+    // cleanup would leave the same stale attachment behind. Best-effort in the
+    // strongest sense here — the detach call presents the very credential the
+    // server just refused, so it will usually fail too; `.catch` swallows that,
+    // and the server's own heartbeat-staleness window is the backstop.
+    if (result.reason === 'refresh-failed' || result.reason === 'credential-rejected') {
       await runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
     }
     return 1;

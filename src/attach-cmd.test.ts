@@ -962,6 +962,353 @@ describe('runAttachDaemon — connection state never enters the terminal output 
     const history = stored.recent.map((e) => e.state);
     assert.deepEqual(history, ['connecting', 'interrupted', 'reconnecting', 'connected']);
   });
+
+  // ---------------------------------------------------------------------
+  // A PERMANENT refusal is not a transient drop (operator report, 2026-08-26).
+  //
+  // These live INSIDE this describe deliberately, so the new terminal path is
+  // held to the same "nothing about the connection reaches the terminal" rule
+  // as the transient one above — via the very same CONNECTION_NARRATION regex,
+  // rather than a second, weaker copy of it. That matters more here than
+  // anywhere: this fires mid-session with the local agent's TUI on screen.
+  // ---------------------------------------------------------------------
+
+  /** The exact body common-api's Boundary B returns
+   *  (`common-api/src/middleware/yolobridge-token-boundary.ts`). Copied rather
+   *  than paraphrased so a test that "passes" cannot be passing against a
+   *  shape the server never sends. */
+  const SCOPED_REQUIRED_BODY = {
+    error:
+      'This YoloBridge route requires a workspace-scoped daemon credential. '
+      + 'Upgrade yolo-bridge (versions before 0.7.0 cannot request one), then run '
+      + '`yolo-bridge attach` again to reconnect this machine.',
+    code: 'YOLOBRIDGE_SCOPED_TOKEN_REQUIRED',
+  };
+
+  /** Boundary A's / Boundary B's other refusal: a real scoped claim pointed at
+   *  something it is not scoped to. Equally unfixable by waiting. */
+  const TOKEN_FORBIDDEN_BODY = {
+    error: 'This action is unavailable to a workspace-scoped YoloBridge token',
+    code: 'YOLOBRIDGE_TOKEN_FORBIDDEN',
+  };
+
+  /** Runs the daemon against a `GET .../stream` that always answers `status`
+   *  with `body`, and reports everything an assertion might need. */
+  async function runAgainstRefusingStream(
+    status: number,
+    body: unknown,
+  ): Promise<{
+    result: Awaited<ReturnType<typeof runAttachDaemon>>;
+    streamCalls: number;
+    sleeps: number[];
+    events: ConnectionEvent[];
+    logs: string[];
+  }> {
+    let streamCalls = 0;
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
+      if (u.includes('/yolobridge/stream')) {
+        streamCalls += 1;
+        return jsonResponse(status, body);
+      }
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const sleeps: number[] = [];
+    const events: ConnectionEvent[] = [];
+    const logs: string[] = [];
+    const result = await withTimeout(
+      runAttachDaemon({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        auth: AUTH,
+        env: ENV,
+        io: fakeIO(),
+        fetchImpl,
+        log: (line) => logs.push(line),
+        onConnectionEvent: (event) => events.push(event),
+        clearScreen: () => {},
+        captureOutput: async () => ({ output: '', busy: false }),
+        shouldStop: () => false,
+        // Records the backoff instead of serving it: a daemon that DID retry
+        // forever would spin here rather than hang, so a failure of the fix
+        // shows up as a wrong assertion, not as a timed-out test.
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      }),
+      3000,
+      `runAttachDaemon against a ${status} stream`,
+    );
+    return { result, streamCalls, sleeps, events, logs };
+  }
+
+  it('stops on the FIRST 403 YOLOBRIDGE_SCOPED_TOKEN_REQUIRED from openStream — one attempt, no backoff, nothing on the terminal', async () => {
+    // The reported transcript: "Reconnecting in 4542ms (attempt 3)… (attempt
+    // 4)… (attempt 5)… 28576ms (attempt 6)…". That 403 means this daemon can
+    // never open this stream — waiting changes nothing — so the ONLY correct
+    // attempt count is 1.
+    const { result, streamCalls, sleeps, events, logs } = await runAgainstRefusingStream(
+      403,
+      SCOPED_REQUIRED_BODY,
+    );
+
+    assert.equal(streamCalls, 1, 'a permanent refusal must not be retried even once');
+    assert.deepEqual(sleeps, [], 'and no backoff may be scheduled or slept through');
+    // "It actually happened" — the empty arrays above are only meaningful
+    // alongside proof the daemon really reached and refused this stream.
+    assert.equal(events.length, 2, 'the daemon connected, was refused, and reported it');
+    assert.deepEqual(events.map((e) => e.state), ['connecting', 'interrupted']);
+    assert.deepEqual(events.filter((e) => e.state === 'reconnecting'), []);
+
+    assert.equal(result.ok, false, 'a refused credential is a FAILURE — cli.ts exits non-zero on it');
+    assert.equal((result as { reason: string }).reason, 'credential-rejected');
+
+    // Legible, not a bare status code — and it names BOTH remedies.
+    const message = (result as { message: string }).message;
+    assert.match(message, /HTTP 403 YOLOBRIDGE_SCOPED_TOKEN_REQUIRED/);
+    assert.match(message, /permanently refused/i);
+    assert.match(message, /Upgrade yolo-bridge/i);
+    assert.match(message, /yolo-bridge attach/);
+
+    // Reported through the out-of-band channel, exactly once...
+    const interrupted = events.filter((e) => e.state === 'interrupted');
+    assert.equal(interrupted.length, 1, 'reported once, not once per attempt');
+    assert.equal(interrupted[0]!.detail, message, 'the same actionable text, not a truncated one');
+
+    // ...and never onto the stream the agent's TUI is rendering into.
+    assert.deepEqual(
+      logs.filter((line) => CONNECTION_NARRATION.test(line)),
+      [],
+      'a mid-session credential failure must not corrupt the local agent\'s screen',
+    );
+  });
+
+  it('treats 403 YOLOBRIDGE_TOKEN_FORBIDDEN the same way — a token cannot re-scope itself by waiting', async () => {
+    const { result, streamCalls, sleeps, events, logs } = await runAgainstRefusingStream(
+      403,
+      TOKEN_FORBIDDEN_BODY,
+    );
+
+    assert.equal(streamCalls, 1);
+    assert.deepEqual(sleeps, []);
+    assert.equal(result.ok, false);
+    assert.equal((result as { reason: string }).reason, 'credential-rejected');
+    assert.match((result as { message: string }).message, /HTTP 403 YOLOBRIDGE_TOKEN_FORBIDDEN/);
+    assert.deepEqual(events.map((e) => e.state), ['connecting', 'interrupted']);
+    assert.deepEqual(logs.filter((line) => CONNECTION_NARRATION.test(line)), []);
+  });
+
+  it('a 500 still reconnects with backoff — the fatal classification is NARROW, not "every failure ends the daemon"', async () => {
+    // The no-regression pin. If this ever goes green only because the daemon
+    // now dies on the first hiccup, the fix traded one bug for a worse one.
+    let streamCalls = 0;
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
+      if (u.includes('/yolobridge/stream')) {
+        streamCalls += 1;
+        if (streamCalls <= 2) return jsonResponse(500, { error: 'Internal error' });
+        return sseStreamResponse(sse);
+      }
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const sleeps: number[] = [];
+    const events: ConnectionEvent[] = [];
+    const result = await withTimeout(
+      runAttachDaemon({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        auth: AUTH,
+        env: ENV,
+        io: fakeIO(),
+        fetchImpl,
+        log: () => {},
+        onConnectionEvent: (event) => events.push(event),
+        clearScreen: () => {},
+        captureOutput: async () => ({ output: '', busy: false }),
+        shouldStop: () => false,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      }),
+      3000,
+      'runAttachDaemon across two 500s',
+    );
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(streamCalls, 3, 'two refused attempts and then a successful one');
+    assert.deepEqual(
+      events.filter((e) => e.state === 'reconnecting').map((e) => e.attempt),
+      [1, 2],
+      'the backoff counter still advances across genuine transients',
+    );
+    assert.equal(sleeps.length, 2, 'and the daemon really did wait between them');
+    assert.ok(sleeps.every((ms) => ms > 0), `backoff delays must be real, got ${JSON.stringify(sleeps)}`);
+  });
+
+  it('a 403 with an UNRECOGNISED code is still transient — a status alone never proves "permanent"', async () => {
+    // A proxy/WAF 403, or some future unrelated refusal. Guessing "permanent"
+    // from the status would turn a recoverable blip into a dead daemon.
+    let streamCalls = 0;
+    const sse =
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n' +
+      'event: detached\ndata: {"attachmentId":"a1"}\n\n';
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
+      if (u.includes('/yolobridge/stream')) {
+        streamCalls += 1;
+        if (streamCalls === 1) return jsonResponse(403, { error: 'Blocked by upstream' });
+        return sseStreamResponse(sse);
+      }
+      if (u.endsWith('/yolobridge/events')) return jsonResponse(200, { recorded: true });
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const events: ConnectionEvent[] = [];
+    const result = await withTimeout(
+      runAttachDaemon({
+        workspaceId: 'w1',
+        commonApiBaseUrl: 'https://api.example.com',
+        auth: AUTH,
+        env: ENV,
+        io: fakeIO(),
+        fetchImpl,
+        log: () => {},
+        onConnectionEvent: (event) => events.push(event),
+        clearScreen: () => {},
+        captureOutput: async () => ({ output: '', busy: false }),
+        shouldStop: () => false,
+        sleep: async () => {},
+      }),
+      3000,
+      'runAttachDaemon across an uncoded 403',
+    );
+
+    assert.deepEqual(result, { ok: true, reason: 'detached-by-server' });
+    assert.equal(streamCalls, 2, 'it retried, and the retry worked');
+    assert.equal(events.filter((e) => e.state === 'reconnecting').length, 1);
+  });
+
+  /** Drives a LIVE session (stream open, heartbeating) whose heartbeat POSTs
+   *  start being refused with a fatal code from `failFromHeartbeat` onwards. */
+  async function runUntilHeartbeatRefused(failFromHeartbeat: number): Promise<{
+    result: Awaited<ReturnType<typeof runAttachDaemon>>;
+    streamCalls: number;
+    heartbeats: number;
+    sleeps: number[];
+    events: ConnectionEvent[];
+    logs: string[];
+  }> {
+    let streamCalls = 0;
+    let heartbeats = 0;
+    const stream = controllableSseResponse(
+      'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n',
+    );
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) return jsonResponse(201, ATTACH_OK);
+      if (u.includes('/yolobridge/stream')) {
+        streamCalls += 1;
+        return stream.response;
+      }
+      if (u.endsWith('/yolobridge/events')) {
+        heartbeats += 1;
+        if (heartbeats < failFromHeartbeat) return jsonResponse(200, { recorded: true });
+        return jsonResponse(403, SCOPED_REQUIRED_BODY);
+      }
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const timers = fakeTimers();
+    const sleeps: number[] = [];
+    const events: ConnectionEvent[] = [];
+    const logs: string[] = [];
+    const running = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => logs.push(line),
+      onConnectionEvent: (event) => events.push(event),
+      clearScreen: () => {},
+      captureOutput: async () => ({ output: '', busy: false }),
+      shouldStop: () => false,
+      timers,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    // Wait for the session to be genuinely established (stream open, first
+    // heartbeat away) before driving the ticks that reach the refused one.
+    await waitUntil(() => heartbeats >= 1);
+    await tickUntil(timers, () => heartbeats >= failFromHeartbeat);
+    // The teardown runs off the daemon's own stop-poll INTERVAL, so with
+    // injected timers nothing happens until the test keeps ticking.
+    await drainTicks(timers);
+
+    const result = await withTimeout(running, 3000, 'runAttachDaemon after a refused heartbeat');
+    return { result, streamCalls, heartbeats, sleeps, events, logs };
+  }
+
+  it('treats the SAME 403 on the HEARTBEAT path as terminal — not a degraded link the next tick might recover', async () => {
+    // The heartbeat hits the identical boundary and gets the identical 403.
+    // Left as `degraded` it would repeat every ~10s for as long as the daemon
+    // ran, with the session already dead from the server's point of view.
+    const { result, streamCalls, heartbeats, sleeps, events, logs } = await runUntilHeartbeatRefused(2);
+
+    assert.ok(heartbeats >= 2, `the refused heartbeat really was sent, got ${heartbeats}`);
+    assert.equal(streamCalls, 1, 'and the daemon did NOT go around the reconnect loop');
+    assert.deepEqual(sleeps, []);
+
+    assert.equal(result.ok, false);
+    assert.equal((result as { reason: string }).reason, 'credential-rejected');
+    assert.match((result as { message: string }).message, /HTTP 403 YOLOBRIDGE_SCOPED_TOKEN_REQUIRED/);
+    assert.match((result as { message: string }).message, /Upgrade yolo-bridge/i);
+
+    assert.deepEqual(
+      events.filter((e) => e.state === 'degraded'),
+      [],
+      'a permanent refusal is not a struggling link — `yolo-bridge status` must not say it is',
+    );
+    assert.deepEqual(events.filter((e) => e.state === 'reconnecting'), []);
+    const interrupted = events.filter((e) => e.state === 'interrupted');
+    assert.equal(interrupted.length, 1, 'once — the stream teardown must not add a second, vaguer one');
+    assert.match(interrupted[0]!.detail ?? '', /YOLOBRIDGE_SCOPED_TOKEN_REQUIRED/);
+    // Sanity: the session really did come up first, so this is the heartbeat
+    // path and not the stream-open one under another name.
+    assert.deepEqual(events.map((e) => e.state), ['connecting', 'connected', 'interrupted']);
+
+    assert.deepEqual(logs.filter((line) => CONNECTION_NARRATION.test(line)), []);
+  });
+
+  it('also ends on the IMMEDIATE post-connect heartbeat being refused, not only the recurring tick', async () => {
+    const { result, streamCalls, heartbeats, events, logs } = await runUntilHeartbeatRefused(1);
+
+    assert.ok(heartbeats >= 1, 'the immediate heartbeat really was sent and refused');
+    assert.equal(streamCalls, 1, 'no reconnect attempt followed');
+    assert.equal(result.ok, false);
+    assert.equal((result as { reason: string }).reason, 'credential-rejected');
+    assert.deepEqual(events.filter((e) => e.state === 'degraded'), []);
+    // The tick already in flight when the stream is torn down can land one
+    // more refused POST. That must not produce a second report: `interrupted`
+    // stays at one, carrying the FIRST (explanatory) message.
+    const interrupted = events.filter((e) => e.state === 'interrupted');
+    assert.equal(interrupted.length, 1, 'reported once regardless of how many refusals arrive');
+    assert.match(interrupted[0]!.detail ?? '', /YOLOBRIDGE_SCOPED_TOKEN_REQUIRED/);
+    assert.deepEqual(logs.filter((line) => CONNECTION_NARRATION.test(line)), []);
+  });
 });
 
 describe('runAttachDaemon — access-token refresh (Bug 2)', () => {

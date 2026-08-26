@@ -22,7 +22,12 @@ import * as readline from 'node:readline';
 import { SseFrameParser } from './sse-frame-parser.js';
 import { actionForFrame } from './frame-actions.js';
 import { startHeartbeat, defaultTimers, type HeartbeatScheduler, type TimerImpl } from './heartbeat.js';
-import { nextBackoffMs, type BackoffOptions } from './reconnect.js';
+import {
+  nextBackoffMs,
+  isFatalCredentialRefusal,
+  fatalCredentialRefusalMessage,
+  type BackoffOptions,
+} from './reconnect.js';
 import {
   deliverPromptToLocalAgent,
   captureLocalAgentOutput,
@@ -260,7 +265,14 @@ export interface AttachDaemonDeps {
 
 export type AttachDaemonResult =
   | { ok: true; reason: 'detached-by-server' | 'stopped' }
-  | { ok: false; reason: 'attach-failed' | 'refresh-failed'; message: string };
+  /**
+   * `credential-rejected` (2026-08-26) is its own reason rather than another
+   * `refresh-failed`: nothing was being refreshed. A credential this daemon
+   * already holds was PERMANENTLY refused by the server's YoloBridge boundary
+   * (reconnect.ts's `isFatalCredentialRefusal`), and the remedy differs — an
+   * upgrade and/or a re-attach, not `yolo-bridge login`.
+   */
+  | { ok: false; reason: 'attach-failed' | 'refresh-failed' | 'credential-rejected'; message: string };
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -994,6 +1006,49 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * message and may use stdout, this one fires mid-session while the local
    * agent's TUI owns the terminal and must not. */
   let scopedRefreshFailed: { message: string } | undefined;
+  /**
+   * Set when the server PERMANENTLY refuses this daemon's credential — a 403
+   * carrying one of reconnect.ts's `FATAL_CREDENTIAL_REFUSAL_CODES`, from
+   * either the stream open or a heartbeat POST.
+   *
+   * A third terminal flag rather than folding into `scopedRefreshFailed`,
+   * because the two describe different facts and a future reader must not have
+   * to guess which: that one means "the renewal window closed", this one means
+   * "the credential we are holding right now is not accepted, and will not be
+   * on the next attempt either". Both share the reporting RULE, though — this
+   * fires mid-session while the local agent's TUI owns the terminal, so it goes
+   * out of band via `noteConnection` and never through `log`.
+   */
+  let credentialRejected: { message: string } | undefined;
+
+  /**
+   * Classify one failure. Returns true when it was a PERMANENT credential
+   * refusal — recorded out of band, and the caller should take its terminal
+   * branch instead of its retry/degrade one. Returns false for everything else,
+   * which keeps its existing behaviour untouched.
+   *
+   * One helper for all three call sites (stream open, the recurring heartbeat,
+   * the immediate first heartbeat) on purpose: the whole defect was one path
+   * treating this refusal differently from another, and three hand-written
+   * copies of the same `if` is how that comes back.
+   *
+   * FIRST one wins. Tearing the stream down after a refused heartbeat makes the
+   * `for await` throw its own (uninformative) abort error a moment later; the
+   * first failure is the one that explains why the daemon is stopping, so a
+   * later one must not overwrite the message or push a second `interrupted`.
+   */
+  function noteCredentialRejection(err: unknown): boolean {
+    if (!isFatalCredentialRefusal(err)) return false;
+    if (!credentialRejected) {
+      const message = fatalCredentialRefusalMessage(err);
+      credentialRejected = { message };
+      // OUT OF BAND, never `log()` — connection-state.ts's module header: the
+      // local agent's PTY is piped to this process's stdout, so a human-readable
+      // line here lands inside a frame its TUI believes it drew.
+      noteConnection('interrupted', { detail: message });
+    }
+    return true;
+  }
 
   try {
     while (!shouldStop()) {
@@ -1054,7 +1109,14 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         // above) instead of riding out the connection to its next natural
         // event.
         const stopPollHandle = timers.setInterval(() => {
-          if (shouldStop() || refreshFailed || scopedRefreshFailed) {
+          // `credentialRejected` joins this list for the HEARTBEAT case: a
+          // heartbeat POST refused with a fatal code proves the credential is
+          // dead, but the SSE connection it was opened on can stay open
+          // indefinitely afterwards (the server only pushes keepalives). Without
+          // this the daemon would sit on a live socket it can no longer
+          // heartbeat for, and the tile would age out to `stopped` while the
+          // process pretended to be attached.
+          if (shouldStop() || refreshFailed || scopedRefreshFailed || credentialRejected) {
             nodeStream.destroy();
           }
         }, STOP_POLL_INTERVAL_MS);
@@ -1106,19 +1168,27 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                       }
                       await apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId);
                     },
-                    (err) =>
+                    (err) => {
+                      // The heartbeat hits the SAME boundary as the stream open
+                      // and gets the SAME 403, so it needs the same answer: a
+                      // permanent refusal is not a `degraded` link that the next
+                      // tick might recover from — every subsequent tick is
+                      // refused identically, forever, ten seconds apart.
+                      if (noteCredentialRejection(err)) return;
                       noteConnection('degraded', {
                         detail: `heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
-                      }),
+                      });
+                    },
                     undefined,
                     deps.timers,
                   );
                   // Send one immediately so status isn't stale for the first ~10s.
-                  apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId).catch((err) =>
+                  apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId).catch((err) => {
+                    if (noteCredentialRejection(err)) return;
                     noteConnection('degraded', {
                       detail: `initial heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
-                    }),
-                  );
+                    });
+                  });
                   break;
                 case 'ping':
                   break;
@@ -1193,10 +1263,22 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
           timers.clearInterval(stopPollHandle);
         }
       } catch (err) {
-        // The reported bug's primary symptom: this is the transient-drop
-        // path, and it used to write straight into the agent's PTY stream.
-        noteConnection('interrupted', { detail: err instanceof Error ? err.message : String(err) });
-        if (err instanceof apiClient.YoloBridgeApiError && err.status === 404) sawGone = true;
+        // A PERMANENT refusal short-circuits here (2026-08-26): it is recorded
+        // by `noteCredentialRejection` with the remedy attached, and must NOT
+        // also be narrated as an ordinary transient interruption — that framing
+        // is what sent it into the backoff path and produced the endless
+        // "Reconnecting in 28576ms (attempt 6)…". Also covers the case where a
+        // refused HEARTBEAT already set the flag and the stop-poll destroyed
+        // this stream: the abort error that surfaces here explains nothing, and
+        // the real reason is already recorded.
+        if (credentialRejected || noteCredentialRejection(err)) {
+          // recorded; fall through to the terminal break below.
+        } else {
+          // The reported bug's primary symptom: this is the transient-drop
+          // path, and it used to write straight into the agent's PTY stream.
+          noteConnection('interrupted', { detail: err instanceof Error ? err.message : String(err) });
+          if (err instanceof apiClient.YoloBridgeApiError && err.status === 404) sawGone = true;
+        }
       }
 
       heartbeat?.stop();
@@ -1211,6 +1293,10 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         clearAttachment(env, io);
         return { ok: true, reason: 'detached-by-server' };
       }
+      // BEFORE `attempt += 1`, deliberately: the acceptance criterion is that a
+      // fatal refusal stops on the FIRST occurrence, so no second attempt is
+      // counted, scheduled or slept through.
+      if (credentialRejected) break;
       if (refreshFailed || scopedRefreshFailed) break;
       if (shouldStop()) break;
 
@@ -1226,6 +1312,18 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     // behind, or the daemon would keep streaming with nobody watching — the
     // exact failure this whole mechanism exists to prevent.
     stopOutputStream();
+  }
+
+  if (credentialRejected) {
+    // OUT-OF-BAND ONLY, for exactly the reason spelled out in the
+    // `scopedRefreshFailed` branch below: this fires from inside a live session
+    // with the agent's TUI on the terminal. `noteCredentialRejection` already
+    // recorded the `interrupted` event with this same message, so there is
+    // nothing more to narrate here — the remedy still reaches the operator, via
+    // `yolo-bridge status` and via `message`, which cli.ts prints on STDERR
+    // once the PTY is gone. cli.ts exits 1 on any `ok: false`, which is what
+    // makes the daemon's death visible to a supervisor rather than silent.
+    return { ok: false, reason: 'credential-rejected', message: credentialRejected.message };
   }
 
   if (scopedRefreshFailed) {
