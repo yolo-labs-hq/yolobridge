@@ -18,7 +18,8 @@
  */
 
 import { fileURLToPath } from 'node:url';
-import { realpathSync } from 'node:fs';
+import path from 'node:path';
+import { realpathSync, existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 
 import { runLogin } from './login-cmd.js';
@@ -112,6 +113,7 @@ function printHelp(): void {
       '                         that check entirely.',
       '  detach                 Detach the current workspace attachment.',
       '  status                 Print local login/attach state.',
+      '  version                Print the installed yolo-bridge version (also --version, -v).',
       '  --help                 Print this help.',
       '',
       `API base:   ${apiUrl()} (override: YOLOBRIDGE_API_URL)`,
@@ -603,6 +605,33 @@ async function cmdWorkspaces(): Promise<number> {
   return 0;
 }
 
+/**
+ * This package's own version, read from the package.json that ships beside
+ * `dist/`.
+ *
+ * Resolved from `import.meta.url`, NOT `process.argv[1]`: the global install
+ * puts a symlink on PATH, and argv[1] is that symlink's unresolved path, so
+ * walking up from it lands outside the package. Same reasoning as
+ * `isMainModule` below.
+ *
+ * Returns `'unknown'` rather than throwing — a version probe must never be the
+ * thing that stops the CLI from starting.
+ */
+export function readOwnVersion(): string {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    // dist/cli.js -> package root. Walk up a couple of levels so this holds
+    // whether it is run from `dist/` or from a ts-node-style layout.
+    for (const rel of ['..', '../..']) {
+      const candidate = path.join(here, rel, 'package.json');
+      if (!existsSync(candidate)) continue;
+      const parsed = JSON.parse(readFileSync(candidate, 'utf-8')) as { name?: string; version?: string };
+      if (parsed.name === '@yolo-labs/yolobridge' && typeof parsed.version === 'string') return parsed.version;
+    }
+  } catch { /* fall through */ }
+  return 'unknown';
+}
+
 async function main(): Promise<number> {
   const [, , cmd, ...rest] = process.argv;
   switch (cmd) {
@@ -616,6 +645,11 @@ async function main(): Promise<number> {
       return cmdDetach();
     case 'status':
       return cmdStatus();
+    case 'version':
+    case '--version':
+    case '-v':
+      process.stdout.write(`${readOwnVersion()}\n`);
+      return 0;
     case '--help':
     case '-h':
     case undefined:

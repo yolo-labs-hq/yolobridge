@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { hostname } from 'node:os';
 
-import { parseAttachArgs, resolveAttachHostInfo, resolveWorkspaceIdOrName } from './cli.js';
+import { parseAttachArgs, resolveAttachHostInfo, resolveWorkspaceIdOrName, readOwnVersion } from './cli.js';
 
 describe('parseAttachArgs', () => {
   it('plain workspaceId with no flags', () => {
@@ -188,5 +188,27 @@ describe('resolveAttachHostInfo', () => {
     assert.equal(result.remoteHost.cwd, process.cwd());
     assert.equal(result.remoteHost.platform, process.platform);
     assert.equal(typeof result.hostLabel, 'string');
+  });
+});
+
+describe('readOwnVersion', () => {
+  // WHY THIS TEST EXISTS: `yolo-bridge --version` did not exist at all until a
+  // stalled publish left an operator running 0.13.0 with no way to find that
+  // out. The failure mode to guard is not "wrong number" — it is the resolver
+  // silently returning 'unknown' because the layout moved underneath it. That
+  // degrades to a useless answer rather than an error, so nothing else catches
+  // it.
+  it('reports this package\'s real version, not the unknown fallback', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const path = (await import('node:path')).default;
+
+    const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    const expected = JSON.parse(readFileSync(pkgPath, 'utf-8')).version;
+
+    const actual = readOwnVersion();
+    assert.notEqual(actual, 'unknown', 'resolver fell back to unknown — the package.json lookup is broken');
+    assert.equal(actual, expected);
+    assert.match(actual, /^\d+\.\d+\.\d+/);
   });
 });
