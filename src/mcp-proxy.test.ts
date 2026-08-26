@@ -719,6 +719,160 @@ describe('proxy authentication (Codex review, 2026-08-24, round 10)', () => {
     assert.equal(res.status, 401);
   });
 
+  it('accepts the SAME secret as an Authorization: Bearer token — the only form codex can send', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({
+      upstream: () => {
+        forwardCount++;
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'codex', fetchImpl, log: () => {},
+    });
+
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      // Deliberately NO `SECRET_HEADER` at all: codex's MCP client has no
+      // custom-header support whatsoever, so this is exactly the request
+      // shape it produces from `bearer_token_env_var`.
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${handle!.secret}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    assert.equal(res.status, 200);
+    // Paired "it actually happened" assertion: a 200 alone could come from
+    // anywhere, so prove the request really was authenticated and forwarded.
+    assert.equal(forwardCount, 1, 'an authenticated bearer request must reach the upstream');
+    assert.deepEqual(JSON.parse(await res.text()), { jsonrpc: '2.0', id: 1, result: { ok: true } });
+  });
+
+  it('accepts a lowercase `bearer` scheme (RFC 7235 says the scheme is case-insensitive)', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({
+      upstream: () => { forwardCount++; return new Response('{}', { status: 200 }); },
+    });
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'codex', fetchImpl, log: () => {},
+    });
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `bearer ${handle!.secret}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(forwardCount, 1);
+  });
+
+  it('rejects the WRONG secret in the bearer position too, without minting or forwarding', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mintCount = 0;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({
+      mintToken: () => { mintCount++; return mintResponse('tok-1'); },
+      upstream: () => { forwardCount++; return new Response('{}', { status: 200 }); },
+    });
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'codex', fetchImpl, log: () => {},
+    });
+    const startupMintCount = mintCount;
+
+    // Both a same-length wrong value and a different-length one -- the
+    // constant-time compare rejects on length before comparing, so the two
+    // take different code paths and both must fail closed.
+    // Flip one character: same length as the real secret, so this one gets
+    // all the way to the constant-time compare rather than being rejected
+    // by the length check.
+    const wrongSameLength = (handle!.secret[0] === 'a' ? 'b' : 'a') + handle!.secret.slice(1);
+    assert.equal(wrongSameLength.length, handle!.secret.length);
+    assert.notEqual(wrongSameLength, handle!.secret);
+    for (const wrong of [`${handle!.secret}-wrong`, wrongSameLength, '']) {
+      const res = await fetch(handle!.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${wrong}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+      });
+      assert.equal(res.status, 401, `bearer "${wrong}" must be refused`);
+    }
+    assert.equal(mintCount, startupMintCount, 'no additional mint beyond the one at startup');
+    assert.equal(forwardCount, 0, 'must never reach the upstream without a valid secret');
+  });
+
+  it('rejects an Authorization header that is not a Bearer scheme, even when it carries the right secret', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({ upstream: () => { forwardCount++; return new Response('{}', { status: 200 }); } });
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'codex', fetchImpl, log: () => {},
+    });
+    for (const value of [handle!.secret, `Basic ${handle!.secret}`, `Bearer${handle!.secret}`]) {
+      const res = await fetch(handle!.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: value },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {} }),
+      });
+      assert.equal(res.status, 401, `Authorization: ${value} must be refused`);
+    }
+    assert.equal(forwardCount, 0);
+  });
+
+  it('a WRONG custom header does not become valid just because a correct bearer is also present (and vice versa)', async () => {
+    // The two accepted locations must not be able to rescue each other into
+    // a weaker check: each candidate goes through the same constant-time
+    // compare, and one valid candidate is what authenticates -- so a request
+    // carrying one good and one bad credential is accepted (the good one is
+    // genuinely valid), while one carrying two bad ones is not.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let forwardCount = 0;
+    const fetchImpl = makeFetch({ upstream: () => { forwardCount++; return new Response('{}', { status: 200 }); } });
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {} });
+
+    const bothWrong = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', [SECRET_HEADER]: 'nope', Authorization: 'Bearer nope' },
+      body,
+    });
+    assert.equal(bothWrong.status, 401);
+    assert.equal(forwardCount, 0, 'two wrong credentials must not add up to one right one');
+
+    const oneRight = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', [SECRET_HEADER]: 'nope', Authorization: `Bearer ${handle!.secret}` },
+      body,
+    });
+    assert.equal(oneRight.status, 200);
+    assert.equal(forwardCount, 1);
+  });
+
+  it('a secret from a PRIOR proxy start does not authenticate a new one via the bearer path either', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'codex', fetchImpl: makeFetch({}), log: () => {},
+    });
+    const staleSecret = handle!.secret;
+    await handle!.stop();
+
+    let forwardCount = 0;
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'codex',
+      fetchImpl: makeFetch({ upstream: () => { forwardCount++; return new Response('{}', { status: 200 }); } }), log: () => {},
+    });
+    assert.notEqual(handle!.secret, staleSecret);
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${staleSecret}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {} }),
+    });
+    assert.equal(res.status, 401);
+    assert.equal(forwardCount, 0);
+  });
+
   it('issues a different secret on each proxy start', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     handle = await startMcpProxy({

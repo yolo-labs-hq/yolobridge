@@ -52,19 +52,21 @@
  * credential of its own. `startMcpProxy` generates a random secret and
  * hands it back in `McpProxyHandle.secret`.
  *
- * The secret itself is NEVER written into `.mcp.json` (round 12 — moved off
- * round 10/11's original design, which wrote it directly into the entry's
- * `headers`): many repos, including this one's own root, already track a
- * `.mcp.json`, and a spawned coding agent running with YOLO-mode autonomy
- * could commit/push it, publishing a live full-workspace credential.
- * Instead `local-mcp-config.ts` writes a `${SECRET_ENV_VAR}` TEMPLATE string
- * as the header value — safe to commit, since it resolves to nothing
- * without the right environment — and `cli.ts` sets the real secret on
+ * The secret is never written to disk and never appears in an argument
+ * vector. As of 2026-08-26 the agent is configured entirely on its COMMAND
+ * LINE (`agent-mcp-args.ts`) — no `.mcp.json` is written into the project
+ * tree at all any more — and what that command line carries is a REFERENCE
+ * to `SECRET_ENV_VAR`, never its value: a `${SECRET_ENV_VAR}` template
+ * inside claude's inline `--mcp-config` JSON, and the variable's NAME via
+ * codex's `bearer_token_env_var`. `cli.ts` sets the real secret on
  * `SECRET_ENV_VAR` in its OWN `process.env` right before spawning the local
- * agent, which inherits it. Claude Code expands `${VAR}` in `.mcp.json`
- * string fields against its own process env at load time, so the actual
- * value only ever exists in memory: this server's, the daemon's, and the
- * locally-spawned agent's.
+ * agent, which inherits it. argv is world-readable (`ps`,
+ * `/proc/<pid>/cmdline`) while `/proc/<pid>/environ` is owner-only, so the
+ * actual value only ever exists in memory: this server's, the daemon's, and
+ * the locally-spawned agent's.
+ *
+ * TWO request locations are accepted for it, because the two agents this
+ * proxy serves have disjoint capabilities — see `providedSecrets` below.
  */
 
 import * as http from 'node:http';
@@ -137,24 +139,27 @@ export interface McpProxyHandle {
   stop(): Promise<void>;
 }
 
-/** Header the local agent must echo back with the value from `.mcp.json`'s
- *  `headers` for this server entry (Codex review, 2026-08-24, round 10).
- *  Exported so `local-mcp-config.ts` writes the exact same key it checks. */
+/** Header Claude Code sends the per-attach secret in (Codex review,
+ *  2026-08-24, round 10), from the `headers` map in the inline
+ *  `--mcp-config` JSON. Exported so `agent-mcp-args.ts` builds the exact
+ *  same key this file checks. Codex cannot send a custom header at all and
+ *  uses `Authorization: Bearer` instead — see `providedSecrets`. */
 export const SECRET_HEADER = 'x-yolobridge-proxy-secret';
 
 /**
  * Env var the per-attach secret is exported under before the local agent is
- * spawned — `.mcp.json`'s `headers` value (Codex review, 2026-08-24,
- * round 12) is `${YOLOBRIDGE_MCP_PROXY_SECRET}` (a literal template string,
- * expanded by Claude Code's OWN `${VAR}` support for `.mcp.json` at load
- * time using ITS process env, inherited from this daemon), never the raw
- * secret. Round 10/11 wrote the actual random value straight into the
- * entry — safe against another local OS user reading the file (round 11's
- * chmod fix), but not against Git: many repos (including this one's own
- * root) already track a `.mcp.json`, and a spawned coding agent running
- * with YOLO-mode autonomy can commit/push a live full-workspace credential
- * without anyone reviewing the diff. The secret itself now never touches
- * any file this daemon writes into the project tree.
+ * spawned. Both agents are pointed at it by NAME, never by value:
+ *   - claude receives the literal template `${YOLOBRIDGE_MCP_PROXY_SECRET}`
+ *     as the `SECRET_HEADER` value inside its inline `--mcp-config` JSON,
+ *     expanded by Claude Code's own `${VAR}` support at load time against
+ *     ITS process env, inherited from this daemon (verified on the wire,
+ *     2026-08-26 — a probe MCP server received the expanded value).
+ *   - codex receives this string as `bearer_token_env_var` and reads the
+ *     variable itself, sending `Authorization: Bearer <value>`.
+ *
+ * This daemon writes NO file into the project tree, so the secret cannot be
+ * committed; and it puts no literal into argv, so it cannot be read out of
+ * `ps` by another local user.
  */
 export const SECRET_ENV_VAR = 'YOLOBRIDGE_MCP_PROXY_SECRET';
 
@@ -572,17 +577,69 @@ async function forwardOnce(
   });
 }
 
-/** Constant-time comparison against the request's `SECRET_HEADER` value —
- *  missing, wrong-length, or mismatched all fail closed. `timingSafeEqual`
- *  throws on a length mismatch rather than returning false, so length is
- *  checked first. */
-function hasValidSecret(req: http.IncomingMessage, secret: string): boolean {
-  const provided = req.headers[SECRET_HEADER];
-  if (typeof provided !== 'string') return false;
+/** Constant-time string comparison — wrong-length or mismatched both fail
+ *  closed. `timingSafeEqual` throws on a length mismatch rather than
+ *  returning false, so length is checked first.
+ *
+ *  The ONE comparison both accepted credential locations below go through
+ *  (2026-08-26): two hand-rolled compares would be free to drift apart in
+ *  strictness (one timing-safe, one `===`; one length-checked, one not),
+ *  which is exactly the divergence a second auth path invites. */
+function secretsMatch(provided: string, secret: string): boolean {
   const providedBuf = Buffer.from(provided, 'utf-8');
   const secretBuf = Buffer.from(secret, 'utf-8');
   if (providedBuf.length !== secretBuf.length) return false;
   return timingSafeEqual(providedBuf, secretBuf);
+}
+
+/**
+ * Every location this request could be carrying the per-attach secret in.
+ *
+ * TWO of them, because the two agents this proxy serves cannot both use the
+ * same one (2026-08-26):
+ *   1. `SECRET_HEADER` (`x-yolobridge-proxy-secret`) — what Claude Code
+ *      sends, from the `headers` map in the inline `--mcp-config` JSON.
+ *   2. `Authorization: Bearer <secret>` — what Codex sends. Codex's MCP
+ *      client has exactly one credential mechanism,
+ *      `bearer_token_env_var`, reported by `codex mcp list` as
+ *      "Auth: Bearer token"; it has NO custom-header support at all, so
+ *      without accepting the bearer form there is no way to authenticate a
+ *      Codex client to this proxy.
+ *
+ * Both are the SAME credential, checked by the SAME `secretsMatch` — this
+ * is a second transport for one secret, not a second, weaker credential.
+ * Anything unparseable (no `Bearer ` prefix, an array-valued header from a
+ * duplicated header line) simply contributes no candidate and therefore
+ * cannot authenticate.
+ */
+function providedSecrets(req: http.IncomingMessage): string[] {
+  const candidates: string[] = [];
+  const headerValue = req.headers[SECRET_HEADER];
+  if (typeof headerValue === 'string') candidates.push(headerValue);
+  const authorization = req.headers.authorization;
+  if (typeof authorization === 'string') {
+    // Scheme match is case-insensitive per RFC 7235; the token itself is
+    // taken verbatim (no trim of the token) so a mangled value fails the
+    // constant-time compare rather than being silently "repaired" into a
+    // match.
+    const match = /^bearer +(.*)$/i.exec(authorization);
+    if (match) candidates.push(match[1]);
+  }
+  return candidates;
+}
+
+/** Accepts the per-attach secret from EITHER location (see
+ *  `providedSecrets`) — missing, wrong-length, or mismatched all fail
+ *  closed, identically for both. */
+function hasValidSecret(req: http.IncomingMessage, secret: string): boolean {
+  let valid = false;
+  // Deliberately NOT `.some()` (which short-circuits): every candidate is
+  // compared, so the number of constant-time compares performed does not
+  // depend on WHICH location happened to carry a matching value.
+  for (const candidate of providedSecrets(req)) {
+    if (secretsMatch(candidate, secret)) valid = true;
+  }
+  return valid;
 }
 
 async function handleRequest(

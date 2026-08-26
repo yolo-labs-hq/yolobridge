@@ -29,8 +29,7 @@ import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 import { startMcpProxy, mcpUrl, SECRET_ENV_VAR, type McpProxyHandle } from './mcp-proxy.js';
-import { writeLocalMcpConfig, removeLocalMcpConfig } from './local-mcp-config.js';
-import { writeLocalMcpTrust, removeLocalMcpTrust } from './local-mcp-trust.js';
+import { buildAgentMcpArgs } from './agent-mcp-args.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
@@ -269,6 +268,11 @@ async function cmdAttach(args: string[]): Promise<number> {
   // match, which is every built-in agent this daemon has been used with so
   // far (claude, codex).
   const resolvedAgentId = parsed.agentId ?? agentBin ?? DEFAULT_AGENT_BIN;
+  // The string actually spawned — and therefore the one whose `--help` is
+  // authoritative about which flags it accepts (`buildAgentMcpArgs`).
+  // `startLocalAgent` applies the same default, so probing anything else
+  // would ask the wrong binary.
+  const resolvedAgentBin = agentBin ?? DEFAULT_AGENT_BIN;
   const fresh = parsed.fresh === true;
   if (workspaceId) {
     const resolved = await resolveWorkspaceIdOrName(workspaceId, { commonApiBaseUrl: apiUrl() });
@@ -326,8 +330,13 @@ async function cmdAttach(args: string[]): Promise<number> {
     agent: resolvedAgentId,
   });
   let mcpProxyHandle: McpProxyHandle | undefined;
-  let mcpConfigCleanup: { expectedProxyUrl: string; createdFile: boolean } | undefined;
-  let mcpTrustRemoval: { removeServerEntry: boolean; removePermissionEntry: boolean; createdFile: boolean; attachId?: string } | undefined;
+  // argv fragment pointing the spawned agent at the local MCP proxy, or
+  // `[]` when MCP isn't wired in — see `agent-mcp-args.ts`. Nothing else is
+  // tracked for cleanup any more: as of 2026-08-26 `attach` writes NOTHING
+  // into the project tree, so there is no `.mcp.json` or trust file to
+  // remove on the way out (and, more to the point, nothing a `kill -9`
+  // could leave behind for the operator's own next `claude` to trip over).
+  let agentMcpArgs: string[] = [];
 
   let result: Awaited<ReturnType<typeof runAttachFromDisk>>;
   try {
@@ -339,18 +348,18 @@ async function cmdAttach(args: string[]): Promise<number> {
       fresh,
       shouldStop: () => stopRequested,
       // Fires once the real tileId exists (docs/YOLOBRIDGE_PLAN.md's "Local
-      // MCP access" section) — starts the local MCP proxy and writes
-      // `.mcp.json` BEFORE spawning the local agent, since Claude Code reads
-      // that file at process launch. A proxy-start failure is logged and
-      // skipped, not fatal — MCP access is an enhancement on a tile that
-      // already works without it (send_to_tile/read_tile_output are
-      // unaffected either way).
+      // MCP access" section) — starts the local MCP proxy and resolves the
+      // agent's MCP argv BEFORE spawning it, since both agents read their
+      // MCP configuration once, at process launch. A proxy-start failure is
+      // logged and skipped, not fatal — MCP access is an enhancement on a
+      // tile that already works without it (send_to_tile/read_tile_output
+      // are unaffected either way).
       onAttached: async ({ tileId, getAccessToken, clearScreen }) => {
         // Isolated from `startLocalAgent` below on purpose (Codex review,
         // 2026-08-24): `startMcpProxy` itself never throws, but
-        // `writeLocalMcpConfig`/`writeLocalMcpTrust` do plain synchronous
-        // `fs` writes (e.g. a read-only `spawnCwd` throws EACCES) — without
-        // this try/catch, that exception propagates out of the WHOLE
+        // `buildAgentMcpArgs` spawns a real `<bin> --help` probe, and a
+        // synchronous throw there (or from anything else added to this
+        // block later) would otherwise propagate out of the WHOLE
         // `onAttached` callback (`runAttachDaemon`'s own best-effort wrapper
         // only logs it), and `startLocalAgent` — later in this same
         // callback — never runs. That leaves a daemon holding a live
@@ -370,80 +379,45 @@ async function cmdAttach(args: string[]): Promise<number> {
             callerTileId: tileId,
             log: (line) => process.stdout.write(`${line}\n`),
           });
-          // `.mcp.json` + `.claude/settings.json` are Claude Code-specific
-          // conventions — Codex reads `~/.codex/config.toml`'s
-          // `[mcp_servers.*]` instead (`containers/services/container-api/
-          // mcp-config-writer.js:5-7`). Writing Claude's files for a
-          // non-Claude `--agent` would silently configure nothing that
-          // binary ever reads (Codex review, 2026-08-24) — the proxy still
-          // starts (harmless, agent-agnostic), but only Claude gets it
-          // wired in until a Codex-format writer exists.
+          // Command-line MCP configuration, never a file in the project
+          // tree (2026-08-26 — replaces `local-mcp-config.ts` +
+          // `local-mcp-trust.ts`, both deleted; see `agent-mcp-args.ts`'s
+          // header for the full reasoning). The daemon-spawned agent is
+          // the ONLY process that could ever have used that config, and it
+          // is configured here directly, at spawn — so a `kill -9` or a
+          // crash now leaves nothing behind to break the operator's own
+          // standalone `claude` in this same directory afterwards.
           //
-          // Keyed on `resolvedAgentId`, NOT `agentBin`/`resolvedAgentBin`
-          // (Codex review, round 5): `--agent-id` exists precisely to assert
-          // "this really is claude" even when spawned via a nonstandard path
-          // or name (`--agent /opt/bin/claude --agent-id claude`) — keying
-          // this decision on the raw spawn string instead would mint
-          // successfully but still skip writing the config a real Claude
-          // Code process would actually read.
-          if (mcpProxyHandle && resolvedAgentId !== 'claude') {
-            // A non-claude agent never reads `.mcp.json`/`${SECRET_ENV_VAR}`
-            // at all, so exporting the secret here is harmless (nothing
-            // ever consumes it) — kept for that case only; see below for
-            // why the claude case is NOT unconditional.
-            process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
-            process.stdout.write(`yolo-bridge: local MCP auto-config is only implemented for claude (resolved agent id "${resolvedAgentId}") — the proxy is running at ${mcpProxyHandle.url} but nothing points the local agent at it.\n`);
-          } else if (mcpProxyHandle) {
-            const configResult = writeLocalMcpConfig(spawnCwd, mcpProxyHandle.url);
-            if (!configResult.ok) {
-              // Deliberately does NOT export `${SECRET_ENV_VAR}` here (Codex
-              // review, 2026-08-24, round 29): the most common refusal
-              // reason is a SIBLING attach in the same directory that
-              // already owns the shared `.mcp.json` entry — `.mcp.json`
-              // still points at THAT sibling's proxy URL, unrelated to
-              // this process's own secret. Exporting our own secret anyway
-              // used to make this session's Claude authenticate against
-              // the sibling's proxy with the WRONG secret — a consistent,
-              // confusing 401 on every MCP tool call, not the "left
-              // unconfigured" degrade this log line describes. Leaving the
-              // var unset doesn't fully fix that (Claude still sees the
-              // sibling's entry either way — `.mcp.json` is shared, not
-              // per-process), but it stops actively contributing a
-              // guaranteed-wrong credential to an entry this process
-              // doesn't own.
-              process.stdout.write(`yolo-bridge: could not configure local MCP access (${spawnCwd}/.mcp.json is unparseable, already has its own "yolo-studio" entry — possibly from a live sibling attach in this same directory — or would not be safe from a future commit) — leaving it as-is rather than overwrite/dirty it.\n`);
-            } else {
-              // Exported on THIS process's env, before `startLocalAgent`
-              // spawns the local agent below (which inherits it) — the
-              // actual secret never touches `.mcp.json` itself (Codex
-              // review, 2026-08-24, round 12: that file is a
-              // `${SECRET_ENV_VAR}` template Claude Code expands against its
-              // own inherited env at load time). Set ONLY after confirming
-              // THIS process actually owns the `.mcp.json` entry it points
-              // at — see the refusal branch above for why setting it
-              // unconditionally was wrong.
+          // Keyed on `resolvedAgentId`, NOT the raw spawn string (Codex
+          // review, round 5): `--agent-id` exists precisely to assert
+          // "this really is claude" even when spawned via a nonstandard
+          // path or name (`--agent /opt/bin/claude --agent-id claude`).
+          // The BINARY is what gets probed for flag support, though — a
+          // nonstandard path is exactly the case where the installed
+          // build's own `--help` is the only honest source.
+          if (mcpProxyHandle) {
+            const mcpArgs = buildAgentMcpArgs({
+              agentId: resolvedAgentId,
+              agentBin: resolvedAgentBin,
+              proxyUrl: mcpProxyHandle.url,
+            });
+            if (mcpArgs.ok) {
+              agentMcpArgs = mcpArgs.args;
+              // Exported on THIS process's env before `startLocalAgent`
+              // spawns the agent below (which inherits it). The real
+              // secret only ever exists in memory — the argv both agents
+              // receive carries a REFERENCE to this variable
+              // (`${SECRET_ENV_VAR}` for claude, `bearer_token_env_var`
+              // for codex), never its value, because argv is
+              // world-readable via `ps`/`/proc/<pid>/cmdline` while
+              // `/proc/<pid>/environ` is owner-only.
               process.env[SECRET_ENV_VAR] = mcpProxyHandle.secret;
-              mcpConfigCleanup = { expectedProxyUrl: mcpProxyHandle.url, createdFile: configResult.createdFile };
-              // Pre-trusts ONLY the yolo-studio server (server-discovery trust +
-              // its own tool-call approvals) so Claude Code doesn't sit on an
-              // interactive "New MCP server found" / per-tool-call prompt with
-              // nobody watching. Best-effort: a failure here still leaves the
-              // MCP server configured and usable, just with the normal
-              // approval prompts, so it's logged rather than fatal.
-              const trustResult = writeLocalMcpTrust(spawnCwd);
-              if (!trustResult.ok) {
-                process.stdout.write(`yolo-bridge: could not pre-trust the local MCP server (${spawnCwd}/.claude/settings.local.json is unparseable, or would not be safe from a future commit) — MCP tool calls will need manual approval.\n`);
-              } else {
-                // Only remove on cleanup what THIS attach actually inserted —
-                // an entry the operator already had (added_*Entry: false)
-                // was their own standing trust grant, not ours to revoke.
-                mcpTrustRemoval = {
-                  removeServerEntry: trustResult.addedServerEntry,
-                  removePermissionEntry: trustResult.addedPermissionEntry,
-                  createdFile: trustResult.createdFile,
-                  attachId: trustResult.attachId,
-                };
-              }
+            } else {
+              // Deliberately does NOT export the secret: nothing in this
+              // launch can consume it, and putting a live full-workspace
+              // credential into the environment of a process with no way
+              // to use it is pure exposure for no benefit.
+              process.stdout.write(`yolo-bridge: local MCP is not wired into the agent (${mcpArgs.message}) — the proxy is running at ${mcpProxyHandle.url}, but the agent starts without it rather than with a flag it would reject.\n`);
             }
           }
         } catch (err) {
@@ -483,6 +457,11 @@ async function cmdAttach(args: string[]): Promise<number> {
         try {
           startLocalAgent({
             agentBin,
+            // Empty unless the MCP block above successfully resolved argv
+            // for THIS agent binary — a probe that came back without the
+            // flags leaves this `[]`, i.e. a normal launch with no MCP,
+            // never a launch carrying a flag the binary would reject.
+            agentArgs: agentMcpArgs,
             cwd: spawnCwd,
             onExit: ({ exitCode, signal }) => {
               localAgentExited = true;
@@ -531,39 +510,21 @@ async function cmdAttach(args: string[]): Promise<number> {
     // the PTY session `attach` spawned. Safe no-op if it already exited.
     stopLocalAgent();
     // Same "nothing left running detached" discipline for the local MCP
-    // proxy: stop the server (drops the delegated token from memory) and
-    // remove the .mcp.json entry we added, if we added one. Each step is
-    // wrapped individually (Codex review, 2026-08-24, round 12): the removal
-    // helpers' own `writeFileSync`/`unlinkSync` calls are unguarded, and an
-    // exception from any one of them — a permission change or a full disk
-    // mid-session — would otherwise propagate out of this whole cleanup
-    // sequence and skip the SERVER-side detach below entirely, leaving the
-    // tile live on the server even though the local process is exiting. Local
-    // cleanup is best-effort; the server detach is not.
+    // proxy: stop the server, which drops the delegated token from memory.
+    //
+    // That is now the ENTIRE local teardown. There is no `.mcp.json` or
+    // `.claude/settings.local.json` to remove any more (2026-08-26): the
+    // agent's MCP configuration is passed on its command line and dies with
+    // its process. The removal helpers this block used to call were the
+    // wrong shape of fix — a `finally` cannot run after `kill -9`, a crash,
+    // or a reboot, and every skipped run left a file that broke the
+    // operator's own standalone `claude` in that directory. Nothing written
+    // is nothing to clean up.
     if (mcpProxyHandle) {
       try {
         await mcpProxyHandle.stop();
       } catch (err) {
         process.stdout.write(`yolo-bridge: local MCP proxy shutdown failed (${err instanceof Error ? err.message : String(err)}).\n`);
-      }
-    }
-    if (mcpTrustRemoval) {
-      try {
-        removeLocalMcpTrust(spawnCwd, mcpTrustRemoval);
-      } catch (err) {
-        process.stdout.write(`yolo-bridge: local MCP trust cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
-      }
-    }
-    // removeLocalMcpConfig only deletes the entry if its CURRENT value still
-    // matches the exact URL captured in mcpConfigCleanup, and only unlinks
-    // the whole file if THIS attachment is the one that created it
-    // (createdFile) -- an undefined mcpConfigCleanup (nothing was ever
-    // successfully written) correctly skips the call.
-    if (mcpConfigCleanup) {
-      try {
-        removeLocalMcpConfig(spawnCwd, mcpConfigCleanup.expectedProxyUrl, mcpConfigCleanup.createdFile);
-      } catch (err) {
-        process.stdout.write(`yolo-bridge: local MCP config cleanup failed (${err instanceof Error ? err.message : String(err)}).\n`);
       }
     }
   }
