@@ -14,7 +14,22 @@ export type DaemonAction =
   | { kind: 'connected'; attachmentId: string; workspaceId: string }
   | { kind: 'ping' }
   | { kind: 'prompt'; attachmentId: string; prompt: string }
-  | { kind: 'read-output'; attachmentId: string; requestId: string }
+  /**
+   * A screen read. `mode` picks WHICH primitive answers it, and they are not
+   * interchangeable:
+   *
+   *   - `'screen'` (the default, and what an older server sends by omitting
+   *     the field) — the serialized headless-terminal buffer. A static text
+   *     snapshot: right for `read_tile_output`, where an agent is reading
+   *     glyphs, wrong for resuming a live view because it carries no cursor
+   *     position, scroll region, alt-screen state or wrap mode.
+   *   - `'raw'` — the browser terminal's seed. Answered with the raw PTY byte
+   *     tail plus its absolute offsets (local-agent.ts's `takeRawSeed`) so the
+   *     viewer's xterm reaches the daemon's state by parsing the same bytes,
+   *     with no state reconstruction anywhere. The serialized screen rides
+   *     along too, because the viewer's stuck-stream watchdog compares screens.
+   */
+  | { kind: 'read-output'; attachmentId: string; requestId: string; mode: 'screen' | 'raw' }
   /**
    * DEMAND SIGNAL — "a browser is watching this tile right now, start pushing
    * output" (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming").
@@ -64,6 +79,9 @@ export function actionForFrame(frame: SseFrame): DaemonAction {
         kind: 'read-output',
         attachmentId: String(data.attachmentId ?? ''),
         requestId: String(data.requestId ?? ''),
+        // Anything unrecognized (including an absent field, which is what a
+        // server predating raw seeding sends) means the old screen dump.
+        mode: data.mode === 'raw' ? 'raw' : 'screen',
       };
     case 'output-stream-start': {
       const raw = typeof data.leaseMs === 'number' ? data.leaseMs : NaN;

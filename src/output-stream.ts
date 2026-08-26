@@ -66,6 +66,11 @@ export interface OutputStreamBufferOptions {
   maxBytesPerSecond?: number;
   /** Injectable clock so the token bucket is testable without real waiting. */
   now?: () => number;
+  /**
+   * Absolute UTF-8 byte offset, within the PTY session's own byte stream, of
+   * the next byte this buffer will be handed (see `setBaseOffset`).
+   */
+  startOffset?: number;
 }
 
 export interface OutputBatch {
@@ -75,6 +80,19 @@ export interface OutputBatch {
   /** How many bytes were skipped IMMEDIATELY BEFORE `data`. 0 on the happy
    *  path. */
   droppedBytes: number;
+  /**
+   * Absolute UTF-8 byte offset of `data[0]` within the PTY session's byte
+   * stream (`RawChunkMeta.startOffset` in local-agent.ts).
+   *
+   * ⚠️ THIS IS THE CORRECTNESS PRIMITIVE OF THE WHOLE LIVE-TERMINAL PATH, not
+   * a diagnostic. `seq` orders only what was actually SENT, so it cannot tell
+   * a viewer whether the bytes it holds continue from the screen it seeded, or
+   * overlap it, or leave a hole. An absolute offset can: the viewer knows the
+   * offset its seed ended at, so it can drop a duplicated prefix, splice an
+   * exact continuation, and detect a gap — which is what makes the seed and
+   * the tap safe to be two separate, racing operations.
+   */
+  startOffset: number;
 }
 
 /**
@@ -132,6 +150,14 @@ export class OutputStreamBuffer {
   private queuedBytesValue = 0;
   private droppedBytes = 0;
 
+  /** Absolute offset of the first byte still queued (== `writeOffset` when the
+   *  queue is empty). Advanced by everything that LEAVES the queue, whether it
+   *  was drained or trimmed, so it always names the next byte a viewer has not
+   *  been offered. */
+  private headOffset = 0;
+  /** Absolute offset one past the last byte ever pushed. */
+  private writeOffset = 0;
+
   /** Token bucket, in bytes. Starts FULL so the first burst after an idle
    *  period (the common case — a viewer opens the tile and the agent starts
    *  talking) is never throttled. */
@@ -145,6 +171,24 @@ export class OutputStreamBuffer {
     this.now = opts.now ?? Date.now;
     this.tokens = this.maxBytesPerSecond;
     this.lastRefillAt = this.now();
+    this.headOffset = opts.startOffset ?? 0;
+    this.writeOffset = this.headOffset;
+  }
+
+  /**
+   * Rebase this buffer onto a new absolute byte position. Only meaningful on
+   * an EMPTY buffer — it is called when a streaming episode starts (priming
+   * from local-agent.ts's raw ring) and when the PTY session underneath is
+   * replaced, both of which discard whatever was queued first.
+   */
+  setBaseOffset(offset: number): void {
+    this.headOffset = offset;
+    this.writeOffset = offset;
+  }
+
+  /** Absolute offset of the next byte a viewer has not been offered yet. */
+  get nextOffset(): number {
+    return this.headOffset;
   }
 
   get queuedBytes(): number {
@@ -167,7 +211,9 @@ export class OutputStreamBuffer {
   push(chunk: string): void {
     if (!chunk) return;
     this.chunks.push(chunk);
-    this.queuedBytesValue += Buffer.byteLength(chunk, 'utf-8');
+    const pushed = Buffer.byteLength(chunk, 'utf-8');
+    this.queuedBytesValue += pushed;
+    this.writeOffset += pushed;
     this.trim();
   }
 
@@ -192,6 +238,7 @@ export class OutputStreamBuffer {
         this.chunks.shift();
         this.queuedBytesValue -= oldestBytes;
         this.droppedBytes += oldestBytes;
+        this.headOffset += oldestBytes;
         continue;
       }
       // Partially trim the oldest chunk: drop exactly the overflow off its
@@ -202,6 +249,7 @@ export class OutputStreamBuffer {
       this.chunks[0] = kept;
       this.queuedBytesValue -= dropped;
       this.droppedBytes += dropped;
+      this.headOffset += dropped;
       // `splitByUtf8Bytes` can stop just SHORT of `overflow` when the next
       // code point straddles the boundary; loop again rather than assuming one
       // pass is enough.
@@ -211,6 +259,7 @@ export class OutputStreamBuffer {
         this.chunks.shift();
         this.queuedBytesValue -= oldestBytes;
         this.droppedBytes += oldestBytes;
+        this.headOffset += oldestBytes;
       }
     }
   }
@@ -241,6 +290,7 @@ export class OutputStreamBuffer {
     const allowance = Math.min(this.maxBatchBytes, Math.floor(this.tokens));
     if (allowance <= 0) return null;
 
+    const startOffset = this.headOffset;
     let taken = '';
     let takenBytes = 0;
     while (this.chunks.length > 0 && takenBytes < allowance) {
@@ -267,7 +317,8 @@ export class OutputStreamBuffer {
     if (takenBytes === 0 && droppedBytes === 0) return null;
     this.droppedBytes = 0;
     this.tokens -= takenBytes;
-    return { data: taken, droppedBytes };
+    this.headOffset += takenBytes;
+    return { data: taken, droppedBytes, startOffset };
   }
 
   /** Forget everything queued. Used when a stream ends — those bytes belong to
@@ -277,5 +328,6 @@ export class OutputStreamBuffer {
     this.chunks = [];
     this.queuedBytesValue = 0;
     this.droppedBytes = 0;
+    this.headOffset = this.writeOffset;
   }
 }

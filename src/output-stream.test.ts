@@ -59,15 +59,15 @@ describe('OutputStreamBuffer', () => {
     const buf = new OutputStreamBuffer();
     buf.push('hello ');
     buf.push('world');
-    assert.deepEqual(buf.drain(), { data: 'hello world', droppedBytes: 0 });
+    assert.deepEqual(buf.drain(), { data: 'hello world', droppedBytes: 0, startOffset: 0 });
     assert.equal(buf.drain(), null, 'a drained buffer has nothing left');
   });
 
   it('caps ONE batch at maxBatchBytes and keeps the remainder queued', () => {
     const buf = new OutputStreamBuffer({ maxBatchBytes: 4, maxBytesPerSecond: 1_000_000 });
     buf.push('abcdefgh');
-    assert.deepEqual(buf.drain(), { data: 'abcd', droppedBytes: 0 });
-    assert.deepEqual(buf.drain(), { data: 'efgh', droppedBytes: 0 });
+    assert.deepEqual(buf.drain(), { data: 'abcd', droppedBytes: 0, startOffset: 0 });
+    assert.deepEqual(buf.drain(), { data: 'efgh', droppedBytes: 0, startOffset: 4 });
   });
 
   it('drops the OLDEST bytes when the backlog overflows, and REPORTS the gap', () => {
@@ -143,13 +143,15 @@ describe('OutputStreamBuffer', () => {
     const first = buf.drain()!;
     buf.noteDropped(bytes(first.data)); // the POST failed
     buf.push('second');
-    assert.deepEqual(buf.drain(), { data: 'second', droppedBytes: 5 });
+    // `startOffset` skips the 5 lost bytes outright, which is what tells the
+    // viewer there is a hole rather than a continuation.
+    assert.deepEqual(buf.drain(), { data: 'second', droppedBytes: 5, startOffset: 5 });
   });
 
   it('emits a gap-only batch when there is nothing left to carry it', () => {
     const buf = new OutputStreamBuffer({ maxBytesPerSecond: 1_000_000 });
     buf.noteDropped(42);
-    assert.deepEqual(buf.drain(), { data: '', droppedBytes: 42 });
+    assert.deepEqual(buf.drain(), { data: '', droppedBytes: 42, startOffset: 0 });
     assert.equal(buf.drain(), null, 'a reported gap is not re-reported');
   });
 

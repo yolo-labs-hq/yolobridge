@@ -27,9 +27,21 @@ describe('actionForFrame', () => {
     assert.deepEqual(action, { kind: 'prompt', attachmentId: 'a1', prompt: 'hello world' });
   });
 
+  it('maps read-output with mode: raw', () => {
+    const action = actionForFrame(frame('read-output', { attachmentId: 'a1', requestId: 'r1', mode: 'raw' }));
+    assert.deepEqual(action, { kind: 'read-output', attachmentId: 'a1', requestId: 'r1', mode: 'raw' });
+  });
+
+  it('treats an unrecognized read-output mode as the screen dump', () => {
+    const action = actionForFrame(frame('read-output', { attachmentId: 'a1', requestId: 'r1', mode: 'nonsense' }));
+    assert.equal(action.kind === 'read-output' && action.mode, 'screen');
+  });
+
   it('maps read-output', () => {
     const action = actionForFrame(frame('read-output', { attachmentId: 'a1', requestId: 'r1' }));
-    assert.deepEqual(action, { kind: 'read-output', attachmentId: 'a1', requestId: 'r1' });
+    // No `mode` on the wire is a server that predates raw seeding — the old
+    // serialized-screen answer, never the raw one.
+    assert.deepEqual(action, { kind: 'read-output', attachmentId: 'a1', requestId: 'r1', mode: 'screen' });
   });
 
   it('maps detached', () => {

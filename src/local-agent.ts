@@ -33,9 +33,11 @@
  */
 
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import * as pty from 'node-pty';
 import type { IPty } from 'node-pty';
 import type { Terminal as TerminalType } from '@xterm/headless';
+import { splitByUtf8Bytes } from './output-stream.js';
 
 // `@xterm/headless`'s published CJS bundle is a heavily minified/webpacked
 // single file — `cjs-module-lexer` (Node ESM's static CJS-named-export
@@ -51,8 +53,8 @@ const { Terminal } = require('@xterm/headless') as typeof import('@xterm/headles
 /** Default agent binary: overridable via `--agent` (cli.ts) or this env var. */
 export const DEFAULT_AGENT_BIN = process.env.YOLOBRIDGE_AGENT_BIN || 'claude';
 
-const DEFAULT_COLS = 120;
-const DEFAULT_ROWS = 40;
+export const DEFAULT_COLS = 120;
+export const DEFAULT_ROWS = 40;
 
 /** How recently the PTY must have produced output to be considered "busy". */
 const DEFAULT_BUSY_WINDOW_MS = 2_000;
@@ -172,11 +174,19 @@ export interface StartLocalAgentOptions {
 export interface LocalAgentHandle {
   /** Kills the PTY process and tears down stdio wiring. Safe to call more than once. */
   stop(): void;
+  /** The PTY's column count. Fixed at spawn — the daemon does not handle
+   *  SIGWINCH and nothing resizes this PTY, least of all the cloud (the human
+   *  at the keyboard is watching the same PTY through `process.stdout`). */
+  cols: number;
+  /** The PTY's row count. Same fixed-at-spawn contract as `cols`. */
+  rows: number;
 }
 
 interface LocalAgentState {
   ptyProcess: IPty;
   term: TerminalType;
+  cols: number;
+  rows: number;
   lastOutputAt: number;
   busyWindowMs: number;
   readinessQuietMs: number;
@@ -209,7 +219,22 @@ let current: LocalAgentState | undefined;
  * `AttachDaemonDeps.log`), and echoing its own output back into it would both
  * corrupt the frame and loop.
  */
-type RawDataListener = (data: string) => void;
+/**
+ * Where a chunk of raw PTY output sits in the session's byte stream.
+ *
+ * `epoch` names ONE PTY session (a new one on every `startLocalAgent`, since
+ * that spawns a fresh agent whose first bytes continue from nothing).
+ * `startOffset` is the absolute UTF-8 byte offset of `data[0]` within that
+ * epoch. Together they are what lets a remote viewer splice a seed and a live
+ * tap together without a gap and without a double-render — see
+ * `takeRawSeed` below.
+ */
+export interface RawChunkMeta {
+  epoch: string;
+  startOffset: number;
+}
+
+type RawDataListener = (data: string, meta: RawChunkMeta) => void;
 const rawDataListeners = new Set<RawDataListener>();
 
 /**
@@ -226,15 +251,220 @@ export function onLocalAgentData(listener: RawDataListener): () => void {
 /** Fan a PTY chunk out to every tap. A throwing tap must never break the
  *  human's own view of the session, which is the very next thing that would
  *  happen if this propagated out of the `onData` handler. */
-function fanOutRawData(data: string): void {
+function fanOutRawData(data: string, meta: RawChunkMeta): void {
   if (rawDataListeners.size === 0) return;
   for (const listener of rawDataListeners) {
     try {
-      listener(data);
+      listener(data, meta);
     } catch {
       // A broken tap degrades the remote view, never the local session.
     }
   }
+}
+
+// ─── The raw replay ring (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming")
+//
+// ⚠️ WHY THIS EXISTS AT ALL, given `serializeTerminalBuffer` already produces a
+// perfectly good screen dump.
+//
+// A line dump is the right primitive for a STATIC snapshot (`read_tile_output`
+// still uses it). It is the WRONG primitive for resuming a LIVE stream, and
+// the difference is not cosmetic. A dump carries the glyphs and their colours
+// and nothing else: not the cursor position, not the scroll region (DECSTBM),
+// not whether the alternate screen is active, not the saved cursor, not
+// autowrap mode. A real TUI — Claude Code, codex, anything with a spinner or a
+// redrawn prompt box — repaints using RELATIVE moves (`\x1b[A`, `\x1b[K`, a
+// bare `\r`). Seed a viewer from a dump and every one of those moves is applied
+// from the wrong origin, so redraws land on the wrong rows: text drawn on top
+// of other text, prompt boxes marching down the screen. That is a state
+// reconstruction bug, and the only fix that does not have a next instance is
+// to stop reconstructing state.
+//
+// So: keep the last `RAW_RING_MAX_BYTES` of the RAW PTY byte stream and replay
+// those bytes into the viewer's terminal. The viewer's xterm then parses
+// exactly what the daemon's terminal parsed and arrives at exactly the same
+// state — no cursor inference, no mode inference, no seam to get wrong.
+//
+// Every byte is stamped with an absolute offset, which is what makes the seed
+// and the tap safe to be two independent, racing operations: overlap is
+// deduplicated by offset and a hole is detected by offset. Neither is possible
+// with `seq`, which only orders what was actually sent.
+
+/**
+ * Raw PTY bytes retained for seeding a viewer. 256 KiB.
+ *
+ * The number is chosen for what it has to CONTAIN, not for memory: a viewer
+ * seeded mid-session needs the bytes back to (at least) the TUI's most recent
+ * full repaint, and a repainting agent redraws its whole screen many times per
+ * minute — a 120×40 full repaint with colour is on the order of 10-30 KiB, so
+ * this holds many of them. It is also comfortably under the server's 5 MB JSON
+ * body limit, since the whole ring can travel in one seed reply.
+ */
+export const RAW_RING_MAX_BYTES = 256 * 1024;
+
+/**
+ * How much of the ring is replayed into a NEW streaming episode's queue.
+ *
+ * The tap and the seed are separate round trips, so a viewer's seed can end at
+ * an offset slightly before (or after) the point the tap starts at. Priming
+ * the episode with a recent tail guarantees the stream covers the seam from
+ * below; the viewer trims the duplicate prefix by offset. 64 KiB is ~1000×
+ * more than one HTTP round trip's worth of agent output, and a miss is not
+ * fatal anyway — it reads as a gap and costs one extra re-seed.
+ */
+export const RAW_STREAM_PRIME_BYTES = 64 * 1024;
+
+interface RawRing {
+  epoch: string;
+  chunks: string[];
+  bytes: number;
+  /** Absolute offset of the first byte still retained. > 0 once the ring has
+   *  rolled, which is exactly the "seed may be incomplete" condition. */
+  baseOffset: number;
+  /** Absolute offset one past the last byte the PTY has produced. */
+  endOffset: number;
+}
+
+function newRawRing(): RawRing {
+  return { epoch: randomUUID(), chunks: [], bytes: 0, baseOffset: 0, endOffset: 0 };
+}
+
+let rawRing: RawRing = newRawRing();
+
+/** Append to the ring and return where the chunk landed. Synchronous and
+ *  called from `onData`, so a tap and a seed taken in the same tick can never
+ *  disagree about the offset. */
+function pushRaw(data: string): RawChunkMeta {
+  const startOffset = rawRing.endOffset;
+  const bytes = Buffer.byteLength(data, 'utf-8');
+  rawRing.chunks.push(data);
+  rawRing.bytes += bytes;
+  rawRing.endOffset += bytes;
+  trimRawRing();
+  return { epoch: rawRing.epoch, startOffset };
+}
+
+/** Drop from the FRONT until the ring is within its cap, advancing
+ *  `baseOffset` by exactly what was dropped. Cuts only at code-point
+ *  boundaries (`splitByUtf8Bytes`) so a replayed tail is never a lone
+ *  surrogate. */
+function trimRawRing(): void {
+  while (rawRing.bytes > RAW_RING_MAX_BYTES && rawRing.chunks.length > 0) {
+    const overflow = rawRing.bytes - RAW_RING_MAX_BYTES;
+    const oldest = rawRing.chunks[0];
+    const oldestBytes = Buffer.byteLength(oldest, 'utf-8');
+    if (oldestBytes <= overflow) {
+      rawRing.chunks.shift();
+      rawRing.bytes -= oldestBytes;
+      rawRing.baseOffset += oldestBytes;
+      continue;
+    }
+    const { head, tail } = splitByUtf8Bytes(oldest, overflow);
+    const droppedBytes = Buffer.byteLength(head, 'utf-8');
+    if (droppedBytes === 0) {
+      // A single code point wider than the overflow — drop the chunk rather
+      // than spin.
+      rawRing.chunks.shift();
+      rawRing.bytes -= oldestBytes;
+      rawRing.baseOffset += oldestBytes;
+      continue;
+    }
+    rawRing.chunks[0] = tail;
+    rawRing.bytes -= droppedBytes;
+    rawRing.baseOffset += droppedBytes;
+  }
+}
+
+/** A viewer's starting point: raw bytes to replay, and where they end. */
+export interface RawSeed {
+  epoch: string;
+  /** Absolute offset of `data[0]`. Non-zero means the ring has rolled and the
+   *  replay does NOT start at the beginning of the session. */
+  baseOffset: number;
+  /** Absolute offset one past the last byte in `data` — the offset a viewer
+   *  that has applied this seed is now positioned at. */
+  endOffset: number;
+  data: string;
+  cols: number;
+  rows: number;
+  /** `baseOffset > 0` — surfaced explicitly because it is the one case where
+   *  replay is not a complete reconstruction. */
+  truncated: boolean;
+}
+
+/**
+ * Take the current replay tail plus the PTY's grid size, as ONE synchronous
+ * observation.
+ *
+ * Atomic by construction: nothing can interleave between reading the ring and
+ * reading the offsets, so `endOffset` is exactly the position a viewer reaches
+ * by writing `data`. Bytes the PTY produces after this call carry offsets
+ * ≥ `endOffset` and are therefore either spliced on cleanly or (if they were
+ * already in `data`) trimmed away by the viewer — never lost, never applied
+ * twice.
+ */
+export function takeRawSeed(): RawSeed | undefined {
+  if (!current) return undefined;
+  return {
+    epoch: rawRing.epoch,
+    baseOffset: rawRing.baseOffset,
+    endOffset: rawRing.endOffset,
+    data: rawRing.chunks.join(''),
+    cols: current.cols,
+    rows: current.rows,
+    truncated: rawRing.baseOffset > 0,
+  };
+}
+
+/** What a new streaming episode starts its queue from (see
+ *  `RAW_STREAM_PRIME_BYTES`). */
+export interface RawStreamPrime {
+  epoch: string;
+  startOffset: number;
+  data: string;
+}
+
+export function primeRawStream(maxBytes: number = RAW_STREAM_PRIME_BYTES): RawStreamPrime {
+  const all = rawRing.chunks.join('');
+  const total = Buffer.byteLength(all, 'utf-8');
+  if (total <= maxBytes) {
+    return { epoch: rawRing.epoch, startOffset: rawRing.baseOffset, data: all };
+  }
+  const { head, tail } = splitByUtf8Bytes(all, total - maxBytes);
+  return {
+    epoch: rawRing.epoch,
+    startOffset: rawRing.baseOffset + Buffer.byteLength(head, 'utf-8'),
+    data: tail,
+  };
+}
+
+/** The PTY's grid, which the tile must render at EXACTLY (it cannot be
+ *  resized — the human at the keyboard is watching the same PTY). */
+export function getLocalAgentGeometry(): { cols: number; rows: number } | undefined {
+  if (!current) return undefined;
+  return { cols: current.cols, rows: current.rows };
+}
+
+/** The same recent-activity heuristic `captureLocalAgentOutput` reports, without
+ *  paying for a buffer serialization. */
+export function isLocalAgentBusy(): boolean {
+  if (!current) return false;
+  return Date.now() - current.lastOutputAt < current.busyWindowMs;
+}
+
+/** Test seam: forget the ring and start a fresh epoch. */
+export function __resetRawRing(): void {
+  rawRing = newRawRing();
+}
+
+/**
+ * Test seam: the daemon's OWN headless terminal — the thing a remote viewer
+ * must end up cell-for-cell identical to. Exposed only so a test can assert
+ * that equality directly (glyphs, attributes AND cursor position) instead of
+ * eyeballing a serialized dump, which cannot see cursor drift at all.
+ */
+export function __getLocalAgentTerminal(): TerminalType | undefined {
+  return current?.term;
 }
 
 function sanitizeEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
@@ -498,9 +728,17 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
 
   const term = new Terminal({ cols, rows, allowProposedApi: true });
 
+  // A NEW PTY is a new byte stream: everything retained belongs to a screen
+  // that no longer exists, and offsets restart. The fresh `epoch` is what a
+  // viewer keyed to the old one sees, and it re-seeds rather than splicing two
+  // sessions' bytes together.
+  rawRing = newRawRing();
+
   const state: LocalAgentState = {
     ptyProcess,
     term,
+    cols,
+    rows,
     lastOutputAt: Date.now(),
     busyWindowMs,
     readinessQuietMs,
@@ -519,7 +757,11 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
     state.writeChain = state.writeChain.then(
       () => new Promise<void>((resolve) => term.write(data, () => resolve())),
     );
-    fanOutRawData(data);
+    // Ring FIRST, then the taps, with the offset the ring assigned — a tap and
+    // a `takeRawSeed()` taken in the same tick must agree on where this chunk
+    // sits, or the viewer's dedupe/gap logic is reasoning about two different
+    // coordinate systems.
+    fanOutRawData(data, pushRaw(data));
   });
 
   if (inStream && typeof inStream.on === 'function') {
@@ -542,7 +784,7 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
     opts.onExit?.({ exitCode, signal });
   });
 
-  return { stop: stopLocalAgent };
+  return { stop: stopLocalAgent, cols, rows };
 }
 
 /**
@@ -750,10 +992,18 @@ export async function deliverPromptToLocalAgent(prompt: string): Promise<void> {
  * own busy-detection (recent-activity-based) without depending on any
  * pod-only primitive.
  */
-export async function captureLocalAgentOutput(): Promise<{ output: string; busy: boolean }> {
+export async function captureLocalAgentOutput(): Promise<{
+  output: string;
+  busy: boolean;
+  cols?: number;
+  rows?: number;
+}> {
   if (!current) return { output: '', busy: false };
   await current.writeChain;
   const output = serializeTerminalBuffer(current.term);
   const busy = Date.now() - current.lastOutputAt < current.busyWindowMs;
-  return { output, busy };
+  // The grid the screen above was laid out FOR. A viewer that renders it at
+  // any other width re-wraps every long line — the dump has no width of its
+  // own, only the one the PTY composed it at.
+  return { output, busy, cols: current.cols, rows: current.rows };
 }

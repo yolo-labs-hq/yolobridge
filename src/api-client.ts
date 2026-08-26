@@ -258,6 +258,19 @@ export async function postHeartbeat(cfg: ApiClientConfig, workspaceId: string, a
   return Boolean(body?.recorded);
 }
 
+/**
+ * The raw-replay half of a `read-output` reply (see frame-actions.ts's
+ * `read-output` doc). Omitted entirely when the server asked for a plain
+ * screen, or when there is no live PTY to take a seed from.
+ */
+export interface RawSeedReply {
+  epoch: string;
+  baseOffset: number;
+  endOffset: number;
+  data: string;
+  truncated: boolean;
+}
+
 export async function postReadOutputReply(
   cfg: ApiClientConfig,
   workspaceId: string,
@@ -265,6 +278,13 @@ export async function postReadOutputReply(
   requestId: string,
   output: string,
   busy: boolean,
+  extra?: {
+    /** The PTY's grid. The tile renders at EXACTLY this, never at its own
+     *  pixel-derived size — see YoloBridgeTerminalView. */
+    cols?: number;
+    rows?: number;
+    raw?: RawSeedReply;
+  },
 ): Promise<boolean> {
   const body = await postEvent(cfg, workspaceId, {
     attachmentId,
@@ -272,6 +292,16 @@ export async function postReadOutputReply(
     requestId,
     output,
     busy,
+    ...(extra?.cols && extra?.rows ? { cols: extra.cols, rows: extra.rows } : {}),
+    ...(extra?.raw
+      ? {
+          raw: extra.raw.data,
+          epoch: extra.raw.epoch,
+          baseOffset: extra.raw.baseOffset,
+          endOffset: extra.raw.endOffset,
+          truncated: extra.raw.truncated,
+        }
+      : {}),
   });
   return Boolean(body?.resolved);
 }
@@ -301,7 +331,21 @@ export async function postOutputChunk(
   cfg: ApiClientConfig,
   workspaceId: string,
   attachmentId: string,
-  chunk: { streamId: string; seq: number; data: string; droppedBytes: number },
+  chunk: {
+    streamId: string;
+    seq: number;
+    data: string;
+    droppedBytes: number;
+    /** PTY session identity + absolute byte position of `data[0]`. These are
+     *  what let the viewer splice this chunk onto its seed exactly once; see
+     *  output-stream.ts's `OutputBatch.startOffset`. */
+    epoch?: string;
+    startOffset?: number;
+    /** The PTY's grid, restated per chunk so a viewer that joins mid-episode
+     *  learns the geometry WITH its first chunk rather than after it. */
+    cols?: number;
+    rows?: number;
+  },
 ): Promise<boolean> {
   const body = await postEvent(cfg, workspaceId, {
     attachmentId,
@@ -310,6 +354,9 @@ export async function postOutputChunk(
     seq: chunk.seq,
     data: chunk.data,
     droppedBytes: chunk.droppedBytes,
+    ...(chunk.epoch ? { epoch: chunk.epoch } : {}),
+    ...(typeof chunk.startOffset === 'number' ? { startOffset: chunk.startOffset } : {}),
+    ...(chunk.cols && chunk.rows ? { cols: chunk.cols, rows: chunk.rows } : {}),
   });
   return Boolean(body?.relayed);
 }

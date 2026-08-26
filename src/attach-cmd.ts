@@ -23,7 +23,17 @@ import { SseFrameParser } from './sse-frame-parser.js';
 import { actionForFrame } from './frame-actions.js';
 import { startHeartbeat, defaultTimers, type HeartbeatScheduler, type TimerImpl } from './heartbeat.js';
 import { nextBackoffMs, type BackoffOptions } from './reconnect.js';
-import { deliverPromptToLocalAgent, captureLocalAgentOutput, onLocalAgentData } from './local-agent.js';
+import {
+  deliverPromptToLocalAgent,
+  captureLocalAgentOutput,
+  onLocalAgentData,
+  takeRawSeed as takeRawSeedFromAgent,
+  primeRawStream as primeRawStreamFromAgent,
+  getLocalAgentGeometry,
+  type RawChunkMeta,
+  type RawSeed,
+  type RawStreamPrime,
+} from './local-agent.js';
 import {
   OutputStreamBuffer,
   DEFAULT_FLUSH_INTERVAL_MS,
@@ -147,7 +157,22 @@ export interface AttachDaemonDeps {
    *  terminal. */
   clearScreen?: () => void;
   deliverPrompt?: (prompt: string) => Promise<void>;
-  captureOutput?: () => Promise<{ output: string; busy: boolean }>;
+  captureOutput?: () => Promise<{ output: string; busy: boolean; cols?: number; rows?: number }>;
+  /**
+   * The raw-replay seed for a browser terminal (local-agent.ts's
+   * `takeRawSeed`). Injectable so the tests can drive seed/tap interleaving
+   * deterministically without a real PTY.
+   */
+  takeRawSeed?: () => RawSeed | undefined;
+  /**
+   * The recent raw tail a NEW streaming episode primes its queue with, so the
+   * stream covers the seam below wherever the viewer's seed happened to end
+   * (local-agent.ts's `primeRawStream`).
+   */
+  primeRawStream?: () => RawStreamPrime;
+  /** The PTY's fixed grid, restated on every relayed chunk so a viewer learns
+   *  it with (not after) its first byte. */
+  getAgentGeometry?: () => { cols: number; rows: number } | undefined;
   /**
    * Raw-PTY-output tap for the DEMAND-DRIVEN live stream
    * (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming"). Defaults to
@@ -159,7 +184,7 @@ export interface AttachDaemonDeps {
    * That is the whole cost property: an attached daemon with nobody looking at
    * its tile does no work here and sends nothing.
    */
-  subscribeAgentOutput?: (listener: (data: string) => void) => () => void;
+  subscribeAgentOutput?: (listener: (data: string, meta?: RawChunkMeta) => void) => () => void;
   /** Volume-control tuning for that stream (see output-stream.ts). Tests
    *  shrink the caps to make the drop path reachable in milliseconds. */
   outputStreamOptions?: OutputStreamBufferOptions;
@@ -260,6 +285,9 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const authBaseUrl = deps.authBaseUrl ?? process.env.YOLOBRIDGE_AUTH_URL ?? DEFAULT_AUTH_URL;
   const doRefresh = deps.refreshAccessToken ?? refreshAccessTokenApi;
   const subscribeAgentOutput = deps.subscribeAgentOutput ?? onLocalAgentData;
+  const takeRawSeed = deps.takeRawSeed ?? takeRawSeedFromAgent;
+  const primeRawStream = deps.primeRawStream ?? primeRawStreamFromAgent;
+  const getGeometry = deps.getAgentGeometry ?? getLocalAgentGeometry;
   const flushIntervalMs = deps.outputFlushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
 
   /**
@@ -823,6 +851,9 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     flushHandle: unknown;
     /** Wall-clock the grant expires at, refreshed by each `output-stream-start`. */
     leaseUntilMs: number;
+    /** The PTY session these bytes belong to. Changes only if the local agent
+     *  is respawned mid-episode, which invalidates every queued byte. */
+    epoch: string;
     /** Single-flight guard: two POSTs in flight can land out of order, and on
      *  a terminal an out-of-order chunk is corruption, not lateness. */
     posting: boolean;
@@ -854,11 +885,16 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     const bytes = Buffer.byteLength(batch.data, 'utf-8');
     session.posting = true;
     try {
+      const geometry = getGeometry();
       await apiClient.postOutputChunk(scopedCfg(), workspaceId, attachmentId, {
         streamId: session.streamId,
         seq: session.seq,
         data: batch.data,
         droppedBytes: batch.droppedBytes,
+        epoch: session.epoch,
+        startOffset: batch.startOffset,
+        cols: geometry?.cols,
+        rows: geometry?.rows,
       });
       if (outputStream === session) session.seq += 1;
     } catch (err) {
@@ -900,7 +936,15 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     }
     stopOutputStream();
 
+    // Prime from the raw ring, atomically with taking the tap below. The seed
+    // the viewer fetches is a SEPARATE round trip that can land either side of
+    // this moment, so the stream deliberately starts BEHIND it: overlapping
+    // bytes are trimmed by the viewer using their absolute offsets, whereas a
+    // hole would cost a re-seed. Overlap is free; a gap is not.
+    const prime = primeRawStream();
     const buffer = new OutputStreamBuffer(deps.outputStreamOptions);
+    buffer.setBaseOffset(prime.startOffset);
+    if (prime.data) buffer.push(prime.data);
     const session: OutputStreamSession = {
       streamId,
       seq: 0,
@@ -909,12 +953,21 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       flushHandle: undefined,
       leaseUntilMs: now() + leaseMs,
       posting: false,
+      epoch: prime.epoch,
     };
     outputStream = session;
     // Subscribe AFTER the session exists so a synchronous first chunk can't
     // land on a half-built one.
-    session.unsubscribe = subscribeAgentOutput((data) => {
+    session.unsubscribe = subscribeAgentOutput((data, meta) => {
       if (outputStream !== session) return;
+      if (meta && meta.epoch !== session.epoch) {
+        // The local agent was respawned under us. Everything queued describes a
+        // screen that no longer exists; rebase onto the new session's offsets
+        // and let the viewer notice the epoch change and re-seed.
+        buffer.reset();
+        buffer.setBaseOffset(meta.startOffset);
+        session.epoch = meta.epoch;
+      }
       buffer.push(data);
     });
     session.flushHandle = timers.setInterval(() => {
@@ -1071,8 +1124,36 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                   break;
                 case 'read-output': {
                   const captured = await captureOutput();
+                  // Taken AFTER the (async) capture and synchronously, so
+                  // `endOffset` names the exact byte position this reply leaves
+                  // the viewer at. Anything the PTY produces from here on
+                  // carries a higher offset and is spliced on by the viewer;
+                  // anything already inside `raw.data` is trimmed by the same
+                  // arithmetic. That is what makes seed and tap non-atomic in
+                  // WALL CLOCK yet exactly-once in effect.
+                  const raw = action.mode === 'raw' ? takeRawSeed() : undefined;
                   await apiClient
-                    .postReadOutputReply(scopedCfg(), workspaceId, attachmentId, action.requestId, captured.output, captured.busy)
+                    .postReadOutputReply(
+                      scopedCfg(),
+                      workspaceId,
+                      attachmentId,
+                      action.requestId,
+                      captured.output,
+                      captured.busy,
+                      {
+                        cols: raw?.cols ?? captured.cols,
+                        rows: raw?.rows ?? captured.rows,
+                        raw: raw
+                          ? {
+                              epoch: raw.epoch,
+                              baseOffset: raw.baseOffset,
+                              endOffset: raw.endOffset,
+                              data: raw.data,
+                              truncated: raw.truncated,
+                            }
+                          : undefined,
+                      },
+                    )
                     .catch((err) =>
                       noteConnection('degraded', {
                         detail: `read-output reply failed: ${err instanceof Error ? err.message : String(err)}`,
