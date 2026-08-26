@@ -2766,3 +2766,490 @@ describe('runAttachDaemon — account refresh token is not persisted past the at
     });
   });
 });
+
+/**
+ * A fake raw-PTY tap. Stands in for `local-agent.ts`'s `onLocalAgentData`, so
+ * these tests can drive a deliberately noisy producer with no real subprocess
+ * — and, critically, can observe whether the daemon SUBSCRIBED at all.
+ * `listenerCount` is the strongest available statement of the invariant: with
+ * no viewer, the daemon does not even attach itself to the PTY.
+ */
+function fakeAgentOutput(): {
+  subscribe: (listener: (data: string) => void) => () => void;
+  emit: (data: string) => void;
+  readonly listenerCount: number;
+} {
+  const listeners = new Set<(data: string) => void>();
+  return {
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    emit: (data) => {
+      for (const listener of [...listeners]) listener(data);
+    },
+    get listenerCount() {
+      return listeners.size;
+    },
+  };
+}
+
+interface ChunkPost {
+  streamId: string;
+  seq: number;
+  data: string;
+  droppedBytes: number;
+}
+
+/** Shared fetch fake for the streaming tests: attach, the controllable SSE,
+ *  and an events endpoint that records every `output-chunk` body. */
+function streamingFetch(stream: { response: Response }): {
+  fetchImpl: any;
+  chunks: ChunkPost[];
+  eventTypes: string[];
+} {
+  const chunks: ChunkPost[] = [];
+  const eventTypes: string[] = [];
+  const fetchImpl = (async (url: any, init?: any) => {
+    const u = String(url);
+    if (u.endsWith('/yolobridge/attach')) {
+      return jsonResponse(201, {
+        tileId: 'tile-1',
+        attachmentId: 'a1',
+        scopedToken: 'scoped-tok-1',
+        scopedTokenExpiresAt: 9_999_999_999_999,
+      });
+    }
+    if (u.includes('/yolobridge/stream')) return stream.response;
+    if (u.endsWith('/yolobridge/events')) {
+      let body: any = {};
+      try { body = JSON.parse(String(init?.body ?? '{}')); } catch { /* not JSON */ }
+      eventTypes.push(String(body.type));
+      if (body.type === 'output-chunk') {
+        chunks.push({
+          streamId: String(body.streamId),
+          seq: Number(body.seq),
+          data: String(body.data),
+          droppedBytes: Number(body.droppedBytes ?? 0),
+        });
+        return jsonResponse(200, { relayed: true });
+      }
+      return jsonResponse(200, { recorded: true });
+    }
+    throw new Error(`unexpected request: ${u}`);
+  }) as any;
+  return { fetchImpl, chunks, eventTypes };
+}
+
+const CONNECTED_FRAME = 'event: connected\ndata: {"attachmentId":"a1","workspaceId":"w1","timestamp":"t"}\n\n';
+
+/** `controllableSseResponse` plus the ability to END the stream — which is
+ *  what a real dropped connection looks like to the daemon's `for await`. */
+function closableSseResponse(initial = ''): {
+  response: Response;
+  push(text: string): void;
+  close(): void;
+} {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+      if (initial) c.enqueue(encoder.encode(initial));
+    },
+  });
+  return {
+    response: new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    push: (text: string) => { try { controller.enqueue(encoder.encode(text)); } catch { /* closed */ } },
+    close: () => { try { controller.close(); } catch { /* already closed */ } },
+  };
+}
+
+function startFrame(streamId: string, leaseMs: number): string {
+  return `event: output-stream-start\ndata: {"attachmentId":"a1","streamId":"${streamId}","leaseMs":${leaseMs}}\n\n`;
+}
+
+const STOP_FRAME = 'event: output-stream-stop\ndata: {"attachmentId":"a1"}\n\n';
+
+describe('runAttachDaemon — demand-driven live output stream', () => {
+  it('sends ZERO output POSTs, and does not even TAP the PTY, while nobody is watching', async () => {
+    // THE LOAD-BEARING TEST. Every attached daemon runs for hours on the
+    // operator's own machine and uplink. If it streamed unconditionally, that
+    // would be a permanent, unbounded cost for tiles nobody has open — so the
+    // assertion here is a hard ZERO, not "low". Note the daemon is otherwise
+    // fully healthy: attached, stream connected, heartbeating, and the local
+    // agent is producing a torrent of output the whole time.
+    const stream = controllableSseResponse(CONNECTED_FRAME);
+    const { fetchImpl, chunks, eventTypes } = streamingFetch(stream);
+    const agent = fakeAgentOutput();
+    const timers = fakeTimers();
+    let stopFlag = false;
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      timers,
+      subscribeAgentOutput: agent.subscribe,
+      shouldStop: () => stopFlag,
+    });
+
+    // Wait until the daemon is genuinely connected (heartbeat interval armed).
+    await tickUntil(timers, () => eventTypes.includes('heartbeat'));
+
+    // A very noisy local agent, for a long time, with nobody watching.
+    for (let i = 0; i < 200; i++) agent.emit('x'.repeat(4096));
+    await drainTicks(timers, 30);
+    for (let i = 0; i < 200; i++) agent.emit('y'.repeat(4096));
+    await drainTicks(timers, 30);
+
+    assert.equal(
+      chunks.length,
+      0,
+      `a daemon with no viewer must send ZERO output POSTs, saw ${chunks.length}`,
+    );
+    assert.equal(
+      agent.listenerCount,
+      0,
+      'with no viewer the daemon must not even be subscribed to the PTY',
+    );
+    assert.ok(eventTypes.includes('heartbeat'), 'sanity: the daemon really was alive and connected');
+    assert.ok(
+      eventTypes.every((t) => t !== 'output-chunk'),
+      'no output-chunk event may be sent without a grant',
+    );
+
+    stopFlag = true;
+    await drainTicks(timers, 10);
+    await withTimeout(resultPromise, 3000, 'no-viewer daemon');
+  });
+
+  it('starts streaming on output-stream-start and stops dead on output-stream-stop', async () => {
+    const stream = controllableSseResponse(CONNECTED_FRAME);
+    const { fetchImpl, chunks } = streamingFetch(stream);
+    const agent = fakeAgentOutput();
+    const timers = fakeTimers();
+    let stopFlag = false;
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      timers,
+      subscribeAgentOutput: agent.subscribe,
+      shouldStop: () => stopFlag,
+    });
+
+    stream.push(startFrame('s1', 60_000));
+    await waitUntil(() => agent.listenerCount === 1);
+
+    agent.emit('\x1b[32mhello\x1b[0m');
+    await tickUntil(timers, () => chunks.length >= 1);
+    assert.equal(chunks[0].streamId, 's1');
+    assert.equal(chunks[0].seq, 0);
+    assert.equal(chunks[0].data, '\x1b[32mhello\x1b[0m', 'raw bytes must survive verbatim, escapes included');
+    assert.equal(chunks[0].droppedBytes, 0);
+
+    agent.emit('more');
+    await tickUntil(timers, () => chunks.length >= 2);
+    assert.equal(chunks[1].seq, 1, 'sequence advances so a viewer can spot a lost relay');
+
+    // Nobody is watching any more.
+    stream.push(STOP_FRAME);
+    await waitUntil(() => agent.listenerCount === 0);
+    const countAtStop = chunks.length;
+    for (let i = 0; i < 50; i++) agent.emit('z'.repeat(1024));
+    await drainTicks(timers, 20);
+    assert.equal(chunks.length, countAtStop, 'a stopped stream must send nothing further');
+
+    stopFlag = true;
+    await drainTicks(timers, 10);
+    await withTimeout(resultPromise, 3000, 'start/stop daemon');
+  });
+
+  it('stops on its own when the lease lapses, with no stop frame at all', async () => {
+    // FAIL-SAFE. The `output-stream-stop` frame is the fast path, not the
+    // mechanism: a server replica that dies, a half-open SSE, or a lost frame
+    // must all end with the daemon quiet. Here the server simply goes silent
+    // after granting a short lease.
+    const stream = controllableSseResponse(CONNECTED_FRAME);
+    const { fetchImpl, chunks } = streamingFetch(stream);
+    const agent = fakeAgentOutput();
+    const timers = fakeTimers();
+    let clock = 1_000_000;
+    let stopFlag = false;
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      timers,
+      now: () => clock,
+      subscribeAgentOutput: agent.subscribe,
+      outputStreamOptions: { now: () => clock },
+      shouldStop: () => stopFlag,
+    });
+
+    stream.push(startFrame('s1', 5_000));
+    await waitUntil(() => agent.listenerCount === 1);
+    agent.emit('before');
+    await tickUntil(timers, () => chunks.length >= 1);
+
+    clock += 6_000; // the grant has lapsed; the server never said so
+    await drainTicks(timers, 5);
+    assert.equal(agent.listenerCount, 0, 'a lapsed lease must tear the PTY tap down');
+
+    const countAtLapse = chunks.length;
+    for (let i = 0; i < 50; i++) agent.emit('after'.repeat(200));
+    await drainTicks(timers, 20);
+    assert.equal(chunks.length, countAtLapse, 'nothing may be sent after the lease lapses');
+
+    stopFlag = true;
+    await drainTicks(timers, 10);
+    await withTimeout(resultPromise, 3000, 'lease-lapse daemon');
+  });
+
+  it('caps a NOISY producer and marks the gap, instead of relaying everything', async () => {
+    // A build log / `yes` / `cat bigfile`. The assertion is on the OBSERVED
+    // byte and POST counts, not on "it worked": the whole point of the caps is
+    // that a producer this far over them cannot buy more bandwidth by
+    // producing more.
+    const stream = controllableSseResponse(CONNECTED_FRAME);
+    const { fetchImpl, chunks } = streamingFetch(stream);
+    const agent = fakeAgentOutput();
+    const timers = fakeTimers();
+    let clock = 1_000_000;
+    let stopFlag = false;
+
+    const PER_SECOND = 2_000;
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      timers,
+      now: () => clock,
+      subscribeAgentOutput: agent.subscribe,
+      outputStreamOptions: {
+        now: () => clock,
+        maxBytesPerSecond: PER_SECOND,
+        maxBatchBytes: 512,
+        maxQueueBytes: 2_048,
+      },
+      shouldStop: () => stopFlag,
+    });
+
+    stream.push(startFrame('s1', 600_000));
+    await waitUntil(() => agent.listenerCount === 1);
+
+    // 2 simulated seconds of a producer running ~100× over the cap.
+    const PUSHED = 25 * 8 * 1024;
+    for (let pass = 0; pass < 25; pass++) {
+      for (let i = 0; i < 8; i++) agent.emit('n'.repeat(1024));
+      clock += 80;
+      timers.tick(1);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await drainTicks(timers, 5);
+
+    const relayed = chunks.reduce((n, c) => n + Buffer.byteLength(c.data, 'utf-8'), 0);
+    const dropped = chunks.reduce((n, c) => n + c.droppedBytes, 0);
+
+    assert.ok(relayed > 0, 'the cap must throttle, not silence, the stream');
+    // Bucket starts full (1s of burst) and refills over the ~2s simulated
+    // window — so 3 seconds' worth is the hard ceiling.
+    assert.ok(
+      relayed <= PER_SECOND * 3,
+      `relayed ${relayed} bytes, over the ${PER_SECOND * 3} ceiling — the rate cap did NOT hold`,
+    );
+    assert.ok(
+      relayed < PUSHED / 10,
+      `relayed ${relayed} of ${PUSHED} pushed — the cap is not actually binding`,
+    );
+    assert.ok(dropped > 0, 'an over-cap producer must produce an explicitly MARKED gap');
+    assert.ok(
+      chunks.length <= 30,
+      `${chunks.length} POSTs for 25 flush ticks — one POST per tick is the bound`,
+    );
+    // Every byte is accounted for: relayed, marked as dropped, or still queued.
+    assert.ok(relayed + dropped <= PUSHED, 'accounting must not invent bytes');
+
+    stopFlag = true;
+    await drainTicks(timers, 10);
+    await withTimeout(resultPromise, 3000, 'noisy daemon');
+  });
+
+  it('stops streaming when the SSE connection drops, and resumes only under a NEW grant', async () => {
+    // A reconnect must never silently continue the old episode: its first
+    // chunk begins mid-screen, and splicing it onto what the viewer is already
+    // showing produces a confidently wrong terminal.
+    const first = closableSseResponse(CONNECTED_FRAME);
+    const second = controllableSseResponse(CONNECTED_FRAME);
+    const chunks: ChunkPost[] = [];
+    let streamOpens = 0;
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1', attachmentId: 'a1',
+          scopedToken: 'scoped-tok-1', scopedTokenExpiresAt: 9_999_999_999_999,
+        });
+      }
+      if (u.includes('/yolobridge/stream')) {
+        streamOpens += 1;
+        return streamOpens === 1 ? first.response : second.response;
+      }
+      if (u.endsWith('/yolobridge/events')) {
+        let body: any = {};
+        try { body = JSON.parse(String(init?.body ?? '{}')); } catch { /* not JSON */ }
+        if (body.type === 'output-chunk') {
+          chunks.push({
+            streamId: String(body.streamId),
+            seq: Number(body.seq),
+            data: String(body.data),
+            droppedBytes: Number(body.droppedBytes ?? 0),
+          });
+          return jsonResponse(200, { relayed: true });
+        }
+        return jsonResponse(200, { recorded: true });
+      }
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const agent = fakeAgentOutput();
+    const timers = fakeTimers();
+    let stopFlag = false;
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: () => {},
+      clearScreen: () => {},
+      timers,
+      subscribeAgentOutput: agent.subscribe,
+      backoffOpts: { baseMs: 1, maxMs: 2, jitter: 0 },
+      shouldStop: () => stopFlag,
+    });
+
+    first.push(startFrame('s1', 600_000));
+    await waitUntil(() => agent.listenerCount === 1);
+    agent.emit('episode one');
+    await tickUntil(timers, () => chunks.length >= 1);
+    assert.equal(chunks[0].streamId, 's1');
+
+    // The connection dies mid-episode.
+    first.close();
+    await waitUntil(() => agent.listenerCount === 0, 4000);
+
+    const countAtDrop = chunks.length;
+    for (let i = 0; i < 20; i++) agent.emit('lost bytes');
+    await drainTicks(timers, 15);
+    assert.equal(chunks.length, countAtDrop, 'a dropped connection must silence the stream');
+
+    // The reconnected daemon streams again only once the server re-grants —
+    // and under a DIFFERENT streamId, which is what tells the viewer to
+    // re-seed rather than splice.
+    await waitUntil(() => streamOpens >= 2, 4000);
+    second.push(startFrame('s2', 600_000));
+    await waitUntil(() => agent.listenerCount === 1, 4000);
+    agent.emit('episode two');
+    await tickUntil(timers, () => chunks.length > countAtDrop);
+    const resumed = chunks[chunks.length - 1];
+    assert.equal(resumed.streamId, 's2', 'a reconnect must begin a NEW episode');
+    assert.equal(resumed.seq, 0, 'sequence restarts with the episode');
+    assert.equal(resumed.data, 'episode two', 'bytes buffered under the dead grant must NOT be replayed');
+
+    stopFlag = true;
+    await drainTicks(timers, 10);
+    await withTimeout(resultPromise, 4000, 'reconnect daemon');
+  });
+
+  it('never narrates the stream onto stdout mid-session (the TUI-corruption regression)', async () => {
+    // `log` is the local agent's own screen after `onAttached` spawns it. A
+    // relay failure must reach `onConnectionEvent`, never that stream.
+    const stream = controllableSseResponse(CONNECTED_FRAME);
+    const agent = fakeAgentOutput();
+    const timers = fakeTimers();
+    const logs: string[] = [];
+    const events: ConnectionEvent[] = [];
+    let stopFlag = false;
+
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/yolobridge/attach')) {
+        return jsonResponse(201, {
+          tileId: 'tile-1', attachmentId: 'a1',
+          scopedToken: 'scoped-tok-1', scopedTokenExpiresAt: 9_999_999_999_999,
+        });
+      }
+      if (u.includes('/yolobridge/stream')) return stream.response;
+      if (u.endsWith('/yolobridge/events')) {
+        let body: any = {};
+        try { body = JSON.parse(String(init?.body ?? '{}')); } catch { /* not JSON */ }
+        // Every relay attempt fails — the path that used to write to stdout.
+        if (body.type === 'output-chunk') return jsonResponse(500, { error: 'relay exploded' });
+        return jsonResponse(200, { recorded: true });
+      }
+      throw new Error(`unexpected request: ${u}`);
+    }) as any;
+
+    const resultPromise = runAttachDaemon({
+      workspaceId: 'w1',
+      commonApiBaseUrl: 'https://api.example.com',
+      auth: AUTH,
+      env: ENV,
+      io: fakeIO(),
+      fetchImpl,
+      log: (line) => logs.push(line),
+      clearScreen: () => {},
+      timers,
+      subscribeAgentOutput: agent.subscribe,
+      onConnectionEvent: (e) => events.push(e),
+      shouldStop: () => stopFlag,
+    });
+
+    stream.push(startFrame('s1', 600_000));
+    await waitUntil(() => agent.listenerCount === 1);
+    agent.emit('secret-looking output');
+    await tickUntil(timers, () => events.some((e) => e.detail?.includes('output chunk relay failed')));
+
+    assert.ok(
+      !logs.some((l) => /output chunk|relay/i.test(l)),
+      `stream narration reached stdout: ${logs.join(' | ')}`,
+    );
+    // And the failure detail must carry the TRANSPORT error only — never the
+    // PTY bytes it was carrying.
+    const detail = events.find((e) => e.detail?.includes('output chunk relay failed'))!.detail!;
+    assert.ok(
+      !detail.includes('secret-looking output'),
+      `the PTY bytes leaked into a connection-state detail: ${detail}`,
+    );
+
+    stopFlag = true;
+    await drainTicks(timers, 10);
+    await withTimeout(resultPromise, 3000, 'relay-failure daemon');
+  });
+});

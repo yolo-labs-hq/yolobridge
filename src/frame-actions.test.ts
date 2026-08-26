@@ -1,7 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { actionForFrame } from './frame-actions.js';
+import {
+  actionForFrame,
+  FALLBACK_OUTPUT_STREAM_LEASE_MS,
+  MAX_OUTPUT_STREAM_LEASE_MS,
+} from './frame-actions.js';
 import type { SseFrame } from './sse-frame-parser.js';
 
 function frame(event: string, data: unknown): SseFrame {
@@ -31,6 +35,40 @@ describe('actionForFrame', () => {
   it('maps detached', () => {
     const action = actionForFrame(frame('detached', { attachmentId: 'a1' }));
     assert.deepEqual(action, { kind: 'detached', attachmentId: 'a1' });
+  });
+
+  it('maps output-stream-start, carrying the streamId and the lease', () => {
+    const action = actionForFrame(
+      frame('output-stream-start', { attachmentId: 'a1', streamId: 's1', leaseMs: 30_000 }),
+    );
+    assert.deepEqual(action, { kind: 'output-stream-start', attachmentId: 'a1', streamId: 's1', leaseMs: 30_000 });
+  });
+
+  it('falls back to a SHORT lease when the server names none — an unknown grant is a reason to be conservative', () => {
+    for (const bad of [undefined, 0, -1, 'soon', Number.NaN]) {
+      const action = actionForFrame(frame('output-stream-start', { attachmentId: 'a1', streamId: 's1', leaseMs: bad }));
+      assert.deepEqual(
+        action,
+        { kind: 'output-stream-start', attachmentId: 'a1', streamId: 's1', leaseMs: FALLBACK_OUTPUT_STREAM_LEASE_MS },
+        `leaseMs=${String(bad)}`,
+      );
+    }
+  });
+
+  it('CLAMPS an absurd lease — no single frame can buy an hour of streaming', () => {
+    const action = actionForFrame(
+      frame('output-stream-start', { attachmentId: 'a1', streamId: 's1', leaseMs: 24 * 60 * 60_000 }),
+    );
+    assert.equal(
+      (action as { leaseMs: number }).leaseMs,
+      MAX_OUTPUT_STREAM_LEASE_MS,
+      'a buggy or hostile server must not be able to extend the grant without bound',
+    );
+  });
+
+  it('maps output-stream-stop', () => {
+    const action = actionForFrame(frame('output-stream-stop', { attachmentId: 'a1' }));
+    assert.deepEqual(action, { kind: 'output-stream-stop', attachmentId: 'a1' });
   });
 
   it('maps an unrecognized event to unknown without throwing', () => {

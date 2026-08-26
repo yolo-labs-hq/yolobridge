@@ -23,7 +23,12 @@ import { SseFrameParser } from './sse-frame-parser.js';
 import { actionForFrame } from './frame-actions.js';
 import { startHeartbeat, defaultTimers, type HeartbeatScheduler, type TimerImpl } from './heartbeat.js';
 import { nextBackoffMs, type BackoffOptions } from './reconnect.js';
-import { deliverPromptToLocalAgent, captureLocalAgentOutput } from './local-agent.js';
+import { deliverPromptToLocalAgent, captureLocalAgentOutput, onLocalAgentData } from './local-agent.js';
+import {
+  OutputStreamBuffer,
+  DEFAULT_FLUSH_INTERVAL_MS,
+  type OutputStreamBufferOptions,
+} from './output-stream.js';
 import * as apiClient from './api-client.js';
 import { refreshAccessToken as refreshAccessTokenApi, type RefreshTokenResult } from './device-auth.js';
 import {
@@ -143,6 +148,23 @@ export interface AttachDaemonDeps {
   clearScreen?: () => void;
   deliverPrompt?: (prompt: string) => Promise<void>;
   captureOutput?: () => Promise<{ output: string; busy: boolean }>;
+  /**
+   * Raw-PTY-output tap for the DEMAND-DRIVEN live stream
+   * (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming"). Defaults to
+   * local-agent.ts's `onLocalAgentData`; injectable so the tests below can
+   * drive a deliberately noisy producer without a real PTY.
+   *
+   * Subscribed ONLY for as long as the server holds an unexpired
+   * `output-stream-start` lease open — never at attach, never "just in case".
+   * That is the whole cost property: an attached daemon with nobody looking at
+   * its tile does no work here and sends nothing.
+   */
+  subscribeAgentOutput?: (listener: (data: string) => void) => () => void;
+  /** Volume-control tuning for that stream (see output-stream.ts). Tests
+   *  shrink the caps to make the drop path reachable in milliseconds. */
+  outputStreamOptions?: OutputStreamBufferOptions;
+  /** Flush cadence for that stream. Defaults to `DEFAULT_FLUSH_INTERVAL_MS`. */
+  outputFlushIntervalMs?: number;
   /** auth-service base URL for token refresh. Defaults to
    * `YOLOBRIDGE_AUTH_URL` (same env var cli.ts's `authUrl()` reads) or the
    * production auth-service host. */
@@ -237,6 +259,8 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const refreshBufferMs = deps.refreshBufferMs ?? DEFAULT_REFRESH_BUFFER_MS;
   const authBaseUrl = deps.authBaseUrl ?? process.env.YOLOBRIDGE_AUTH_URL ?? DEFAULT_AUTH_URL;
   const doRefresh = deps.refreshAccessToken ?? refreshAccessTokenApi;
+  const subscribeAgentOutput = deps.subscribeAgentOutput ?? onLocalAgentData;
+  const flushIntervalMs = deps.outputFlushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
 
   /**
    * THE ACCOUNT identity. Full-account bearer from `yolo-bridge login`, and the
@@ -773,6 +797,131 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     return { ok: true, reason: 'stopped' };
   }
 
+  // ── Demand-driven live output stream (docs/YOLOBRIDGE_PLAN.md) ──────────
+  //
+  // THE INVARIANT THIS BLOCK EXISTS TO HOLD: **a daemon with no viewer sends
+  // nothing.** Not "a little", not "a heartbeat's worth" — zero POSTs, zero
+  // PTY taps, zero timers. Every attached daemon runs for hours on someone's
+  // own laptop and uplink; streaming unconditionally would burn that
+  // bandwidth, and flood the workspace event bus, for tiles nobody has open.
+  //
+  // Streaming is therefore something the SERVER grants, never something this
+  // daemon decides. It runs only while an `output-stream-start` LEASE is
+  // outstanding, and the lease is short: if the server dies, the SSE goes
+  // half-open, a `stop` frame is lost, or the connection drops, the lease
+  // simply lapses and the tap is torn down. The failure mode of
+  // over-streaming is unbounded; the failure mode of under-streaming is the
+  // poll that already works.
+  interface OutputStreamSession {
+    streamId: string;
+    /** Per-`streamId` chunk counter. A viewer that sees a gap here knows a
+     *  relay POST was lost and re-seeds rather than splicing. Advanced only on
+     *  a SUCCESSFUL post, so the sequence a viewer sees is contiguous. */
+    seq: number;
+    buffer: OutputStreamBuffer;
+    unsubscribe: () => void;
+    flushHandle: unknown;
+    /** Wall-clock the grant expires at, refreshed by each `output-stream-start`. */
+    leaseUntilMs: number;
+    /** Single-flight guard: two POSTs in flight can land out of order, and on
+     *  a terminal an out-of-order chunk is corruption, not lateness. */
+    posting: boolean;
+  }
+  let outputStream: OutputStreamSession | undefined;
+
+  function stopOutputStream(): void {
+    const session = outputStream;
+    if (!session) return;
+    outputStream = undefined;
+    try { session.unsubscribe(); } catch { /* best effort */ }
+    timers.clearInterval(session.flushHandle);
+    // Anything still queued belongs to a streamId that no longer exists.
+    session.buffer.reset();
+  }
+
+  async function flushOutputStream(session: OutputStreamSession): Promise<void> {
+    if (outputStream !== session) return;
+    // Lease check FIRST, before any work: this tick is the only thing that
+    // ever notices a lapsed grant, and it must notice it even when the buffer
+    // is empty.
+    if (now() >= session.leaseUntilMs) {
+      stopOutputStream();
+      return;
+    }
+    if (session.posting) return;
+    const batch = session.buffer.drain();
+    if (!batch) return;
+    const bytes = Buffer.byteLength(batch.data, 'utf-8');
+    session.posting = true;
+    try {
+      await apiClient.postOutputChunk(scopedCfg(), workspaceId, attachmentId, {
+        streamId: session.streamId,
+        seq: session.seq,
+        data: batch.data,
+        droppedBytes: batch.droppedBytes,
+      });
+      if (outputStream === session) session.seq += 1;
+    } catch (err) {
+      // These bytes are GONE — re-queueing them would reorder the stream
+      // behind whatever the PTY produced while the POST was in flight, and an
+      // out-of-order terminal frame is worse than an acknowledged hole. Fold
+      // them (plus any gap this batch was already carrying) into the next
+      // batch's `droppedBytes` so the viewer re-seeds instead of trusting a
+      // screen that silently lost a frame.
+      if (outputStream === session) session.buffer.noteDropped(bytes + batch.droppedBytes);
+      // Out-of-band, never `log`: this fires mid-session while the local
+      // agent's TUI owns stdout (connection-state.ts's module header). The
+      // detail carries the transport error only — NEVER the PTY bytes.
+      noteConnection('degraded', {
+        detail: `output chunk relay failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    } finally {
+      if (outputStream === session) session.posting = false;
+    }
+  }
+
+  /**
+   * Honour an `output-stream-start` frame.
+   *
+   * Same `streamId` → this is a LEASE RENEWAL (the server re-sends while
+   * demand persists); keep the tap, the buffer and the sequence exactly as
+   * they are, so a renewal is invisible to the viewer.
+   *
+   * Different `streamId` → a NEW episode (the previous one was stopped, or
+   * this daemon reconnected and the server re-granted). Tear the old one down
+   * first: its queued bytes describe a screen the viewer is no longer showing.
+   */
+  function startOrRenewOutputStream(streamId: string, leaseMs: number): void {
+    if (!streamId) return;
+    const existing = outputStream;
+    if (existing && existing.streamId === streamId) {
+      existing.leaseUntilMs = now() + leaseMs;
+      return;
+    }
+    stopOutputStream();
+
+    const buffer = new OutputStreamBuffer(deps.outputStreamOptions);
+    const session: OutputStreamSession = {
+      streamId,
+      seq: 0,
+      buffer,
+      unsubscribe: () => {},
+      flushHandle: undefined,
+      leaseUntilMs: now() + leaseMs,
+      posting: false,
+    };
+    outputStream = session;
+    // Subscribe AFTER the session exists so a synchronous first chunk can't
+    // land on a half-built one.
+    session.unsubscribe = subscribeAgentOutput((data) => {
+      if (outputStream !== session) return;
+      buffer.push(data);
+    });
+    session.flushHandle = timers.setInterval(() => {
+      void flushOutputStream(session);
+    }, flushIntervalMs);
+  }
+
   let heartbeat: HeartbeatScheduler | undefined;
   let attempt = 0;
   /** Set when a proactive refresh (see ensureFreshToken) fails while a
@@ -931,6 +1080,12 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                     );
                   break;
                 }
+                case 'output-stream-start':
+                  startOrRenewOutputStream(action.streamId, action.leaseMs);
+                  break;
+                case 'output-stream-stop':
+                  stopOutputStream();
+                  break;
                 case 'detached':
                   noteConnection('detached');
                   sawDetached = true;
@@ -955,6 +1110,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
       heartbeat?.stop();
       heartbeat = undefined;
+      // The grant died with the connection that carried it. A reconnect gets a
+      // FRESH `output-stream-start` (new streamId) if demand still exists —
+      // never a silent resumption of the old one, which is what keeps a
+      // reconnect from splicing two episodes' bytes into one screen.
+      stopOutputStream();
 
       if (sawDetached || sawGone) {
         clearAttachment(env, io);
@@ -970,6 +1130,11 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     }
   } finally {
     heartbeat?.stop();
+    // Belt and braces for every path out of the loop (a break, a throw, a
+    // stop signal): no code path may leave a live PTY tap or flush timer
+    // behind, or the daemon would keep streaming with nobody watching — the
+    // exact failure this whole mechanism exists to prevent.
+    stopOutputStream();
   }
 
   if (scopedRefreshFailed) {

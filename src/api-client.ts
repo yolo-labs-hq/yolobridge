@@ -276,6 +276,44 @@ export async function postReadOutputReply(
   return Boolean(body?.resolved);
 }
 
+/**
+ * `POST .../yolobridge/events {type:'output-chunk'}` — one batch of live PTY
+ * output (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming").
+ *
+ * Sent ONLY while the server has an unexpired `output-stream-start` lease
+ * outstanding, i.e. only while a browser is actually watching the tile. A
+ * daemon with no viewer sends none of these at all — see attach-cmd.ts's
+ * stream controller.
+ *
+ * Authenticated with the WORKSPACE-SCOPED credential like every other
+ * post-attach call (Boundary B refuses an account token here), and the bytes
+ * are relayed in memory by the server onto the workspace's own event stream —
+ * never logged, never written to Mongo, never appended to the resumable event
+ * buffer. This is the operator's live screen; it can contain anything they
+ * typed.
+ *
+ * `droppedBytes` is how many bytes were SKIPPED immediately before `data`
+ * (see output-stream.ts). Non-zero means the viewer must treat its screen as
+ * unreliable and re-seed — it is not a diagnostic counter, it is part of the
+ * protocol.
+ */
+export async function postOutputChunk(
+  cfg: ApiClientConfig,
+  workspaceId: string,
+  attachmentId: string,
+  chunk: { streamId: string; seq: number; data: string; droppedBytes: number },
+): Promise<boolean> {
+  const body = await postEvent(cfg, workspaceId, {
+    attachmentId,
+    type: 'output-chunk',
+    streamId: chunk.streamId,
+    seq: chunk.seq,
+    data: chunk.data,
+    droppedBytes: chunk.droppedBytes,
+  });
+  return Boolean(body?.relayed);
+}
+
 async function postEvent(cfg: ApiClientConfig, workspaceId: string, payload: Record<string, unknown>): Promise<any> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const res = await fetchImpl(`${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/events`, {

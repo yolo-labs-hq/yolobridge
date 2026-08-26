@@ -14,6 +14,7 @@ import {
   deliverPromptToLocalAgent,
   captureLocalAgentOutput,
   serializeTerminalBuffer,
+  onLocalAgentData,
   type PtySpawnImpl,
 } from './local-agent.js';
 
@@ -492,5 +493,69 @@ describe('startLocalAgent (real node-pty spawn)', () => {
 
     const { output } = await captureLocalAgentOutput();
     assert.match(output, /42/);
+  });
+});
+
+describe('onLocalAgentData — the raw PTY tap the live stream reads from', () => {
+  it('delivers the PTY bytes VERBATIM, escapes and all', async () => {
+    // The whole reason streaming beats the poll: xterm needs the real byte
+    // stream (cursor moves, erase-line, alt-screen), not a serialized screen.
+    const fake = fakePty();
+    const seen: string[] = [];
+    const unsubscribe = onLocalAgentData((d) => seen.push(d));
+    try {
+      startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl });
+      fake.emitData('\x1b[2K\r\x1b[32m⠋ working\x1b[0m');
+      await waitFor(() => seen.length > 0);
+      assert.deepEqual(seen, ['\x1b[2K\r\x1b[32m⠋ working\x1b[0m']);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('still receives output after the PTY is replaced (the tap outlives one session)', async () => {
+    // `startLocalAgent` stops and replaces any prior session (Decision Q3). A
+    // tap registered by the long-lived attach daemon must survive that, or the
+    // tile would go permanently blank after any respawn with no error anywhere.
+    const seen: string[] = [];
+    const unsubscribe = onLocalAgentData((d) => seen.push(d));
+    try {
+      const first = fakePty();
+      startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: undefined, spawnImpl: first.spawnImpl });
+      first.emitData('one');
+      await waitFor(() => seen.length === 1);
+
+      const second = fakePty();
+      startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: () => true }, stdin: undefined, spawnImpl: second.spawnImpl });
+      second.emitData('two');
+      await waitFor(() => seen.length === 2);
+      assert.deepEqual(seen, ['one', 'two']);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('stops delivering once unsubscribed, and a throwing tap never breaks the local session', async () => {
+    const fake = fakePty();
+    const stdout: string[] = [];
+    const good: string[] = [];
+    const unsubscribeBad = onLocalAgentData(() => { throw new Error('tap exploded'); });
+    const unsubscribeGood = onLocalAgentData((d) => good.push(d));
+    try {
+      startLocalAgent({ agentBin: 'fake', cols: 40, rows: 10, stdout: { write: (d: string) => { stdout.push(d); return true; } }, stdin: undefined, spawnImpl: fake.spawnImpl });
+      fake.emitData('hello');
+      await waitFor(() => good.length === 1);
+      // The human's own view of the session is unaffected by a broken tap.
+      assert.deepEqual(stdout, ['hello']);
+
+      unsubscribeGood();
+      fake.emitData('after');
+      await new Promise((r) => setTimeout(r, 20));
+      assert.deepEqual(good, ['hello'], 'an unsubscribed tap must receive nothing further');
+      assert.deepEqual(stdout, ['hello', 'after'], 'the local session keeps running regardless');
+    } finally {
+      unsubscribeBad();
+      unsubscribeGood();
+    }
   });
 });

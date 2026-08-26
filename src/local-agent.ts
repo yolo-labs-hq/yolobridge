@@ -191,6 +191,52 @@ interface LocalAgentState {
 
 let current: LocalAgentState | undefined;
 
+/**
+ * Raw-PTY-output taps (docs/YOLOBRIDGE_PLAN.md, "Live terminal streaming").
+ *
+ * MODULE-LEVEL, not per-`LocalAgentState`, on purpose: a tap is owned by the
+ * attach daemon's stream controller, which outlives any individual PTY —
+ * `startLocalAgent` stops and replaces the previous session (Decision Q3), and
+ * a tap registered before that swap must keep working after it rather than
+ * silently going deaf. The listener set is therefore keyed to the PROCESS, the
+ * same scope `deliverPromptToLocalAgent`/`captureLocalAgentOutput` already use.
+ *
+ * These see the same bytes the human at the keyboard sees — the unmodified PTY
+ * stream, before any serialization. Nothing here writes them anywhere: a tap
+ * is a callback, and the one caller (attach-cmd.ts's output-stream controller)
+ * relays them in memory only. In particular they must NEVER be routed to
+ * `log`/stdout — that stream belongs to the attached agent's TUI (see
+ * `AttachDaemonDeps.log`), and echoing its own output back into it would both
+ * corrupt the frame and loop.
+ */
+type RawDataListener = (data: string) => void;
+const rawDataListeners = new Set<RawDataListener>();
+
+/**
+ * Register a raw-output tap. Returns an unsubscribe that is safe to call more
+ * than once.
+ */
+export function onLocalAgentData(listener: RawDataListener): () => void {
+  rawDataListeners.add(listener);
+  return () => {
+    rawDataListeners.delete(listener);
+  };
+}
+
+/** Fan a PTY chunk out to every tap. A throwing tap must never break the
+ *  human's own view of the session, which is the very next thing that would
+ *  happen if this propagated out of the `onData` handler. */
+function fanOutRawData(data: string): void {
+  if (rawDataListeners.size === 0) return;
+  for (const listener of rawDataListeners) {
+    try {
+      listener(data);
+    } catch {
+      // A broken tap degrades the remote view, never the local session.
+    }
+  }
+}
+
 function sanitizeEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
   const out: { [key: string]: string } = {};
   for (const [k, v] of Object.entries(env)) {
@@ -473,6 +519,7 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
     state.writeChain = state.writeChain.then(
       () => new Promise<void>((resolve) => term.write(data, () => resolve())),
     );
+    fanOutRawData(data);
   });
 
   if (inStream && typeof inStream.on === 'function') {
