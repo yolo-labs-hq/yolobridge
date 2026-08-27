@@ -760,3 +760,78 @@ describe('local terminal resize (SIGWINCH)', () => {
     assert.equal(src.listenerCount, 0, 'listener leaked past stop');
   });
 });
+
+describe('the detach sequence is actually MOUNTED on stdin', () => {
+  /**
+   * The filter itself is unit-tested in `detach-sequence.test.ts`. These prove
+   * it is wired into the real stdin path — a correct filter mounted nowhere
+   * protects nothing, and the wiring is the half a unit test cannot see.
+   */
+  function fakeStdin() {
+    const listeners: Array<(d: Buffer | string) => void> = [];
+    return {
+      isTTY: true,
+      setRawMode: () => {},
+      resume: () => {},
+      pause: () => {},
+      setEncoding: () => {},
+      on: (_event: 'data', fn: (d: Buffer | string) => void) => { listeners.push(fn); },
+      removeListener: () => {},
+      type: (text: string) => { for (const l of [...listeners]) l(text); },
+    };
+  }
+
+  it('Ctrl-P Ctrl-Q typed on stdin detaches, and neither byte reaches the PTY', () => {
+    const fake = fakePty();
+    const stdin = fakeStdin();
+    let detached = 0;
+    startLocalAgent({
+      agentBin: 'fake', cols: 40, rows: 10,
+      stdout: { write: () => true },
+      stdin: stdin as any,
+      onDetachRequested: () => { detached++; },
+      spawnImpl: fake.spawnImpl,
+    });
+
+    stdin.type('\x10');
+    stdin.type('\x11');
+
+    assert.equal(detached, 1);
+    assert.deepEqual(fake.writes, [], 'the sequence must not reach the agent');
+  });
+
+  it('⚠️ Ctrl+C typed on stdin still reaches the AGENT and does not detach', () => {
+    // Interrupting a runaway agent is worth more than quitting the daemon, so
+    // "fixing" the unreachable SIGINT by claiming Ctrl+C would be a regression.
+    const fake = fakePty();
+    const stdin = fakeStdin();
+    let detached = 0;
+    startLocalAgent({
+      agentBin: 'fake', cols: 40, rows: 10,
+      stdout: { write: () => true },
+      stdin: stdin as any,
+      onDetachRequested: () => { detached++; },
+      spawnImpl: fake.spawnImpl,
+    });
+
+    stdin.type('\x03');
+
+    assert.deepEqual(fake.writes, ['\x03']);
+    assert.equal(detached, 0);
+  });
+
+  it('ordinary typing is forwarded unchanged', () => {
+    const fake = fakePty();
+    const stdin = fakeStdin();
+    startLocalAgent({
+      agentBin: 'fake', cols: 40, rows: 10,
+      stdout: { write: () => true },
+      stdin: stdin as any,
+      spawnImpl: fake.spawnImpl,
+    });
+
+    stdin.type('ls -la\r');
+
+    assert.deepEqual(fake.writes, ['ls -la\r']);
+  });
+});

@@ -480,6 +480,10 @@ async function cmdAttach(args: string[]): Promise<number> {
         // real `onExit` handler below: stop + detach immediately rather than
         // let the daemon loop ride out the full heartbeat-staleness window.
         try {
+          // Say where Ctrl+C goes BEFORE the agent takes over the screen.
+          // Without this the operator presses it expecting to quit, nothing
+          // happens, and there is no way to discover why.
+          process.stdout.write('yolo-bridge: Ctrl+C goes to the agent · Ctrl-P Ctrl-Q to detach\n');
           startLocalAgent({
             agentBin,
             // Empty unless the MCP block above successfully resolved argv
@@ -488,6 +492,15 @@ async function cmdAttach(args: string[]): Promise<number> {
             // never a launch carrying a flag the binary would reject.
             agentArgs: agentMcpArgs,
             cwd: spawnCwd,
+            // The daemon's only reachable stop key. `process.on('SIGINT')`
+            // above cannot fire from the keyboard: stdin is in raw mode so the
+            // tty never turns Ctrl+C into a signal, and Ctrl+C is deliberately
+            // forwarded to the AGENT instead (interrupting a runaway agent is
+            // worth more than quitting the daemon). Same teardown either way.
+            onDetachRequested: () => {
+              process.stdout.write('\nyolo-bridge: detaching...\n');
+              onSignal();
+            },
             onExit: ({ exitCode, signal }) => {
               localAgentExited = true;
               stopRequested = true;

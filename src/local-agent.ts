@@ -34,6 +34,7 @@
 
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
+import { createDetachSequenceFilter, type DetachSequenceFilter } from './detach-sequence.js';
 import * as pty from 'node-pty';
 import type { IPty } from 'node-pty';
 import type { Terminal as TerminalType } from '@xterm/headless';
@@ -192,6 +193,16 @@ export interface StartLocalAgentOptions {
    *  interactive `attach`). Pass explicitly to drive resizes in a test; pass
    *  `undefined` WITH a `stdout` sink to disable resize handling entirely. */
   resizeSource?: TerminalResizeSource;
+  /**
+   * The operator typed the detach sequence (`Ctrl-P Ctrl-Q`).
+   *
+   * This exists because the daemon's SIGINT handler is UNREACHABLE from the
+   * keyboard: stdin is in raw mode so the tty never turns `\x03` into a signal,
+   * and Ctrl+C is forwarded to the agent (which is the behaviour worth
+   * keeping). Without a key of its own, the foreground process the operator
+   * started cannot be quit from the terminal they started it in.
+   */
+  onDetachRequested?: () => void;
   /** Test injection point — swap the real `node-pty` spawn for a fake IPty. */
   spawnImpl?: PtySpawnImpl;
 }
@@ -214,6 +225,7 @@ export interface LocalAgentHandle {
 interface LocalAgentState {
   resizeSource?: TerminalResizeSource;
   resizeListener?: () => void;
+  detachFilter?: DetachSequenceFilter;
   ptyProcess: IPty;
   term: TerminalType;
   cols: number;
@@ -1034,8 +1046,16 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
   });
 
   if (inStream && typeof inStream.on === 'function') {
+    // Every byte passes through the detach filter on its way to the PTY. It
+    // forwards everything except the `Ctrl-P Ctrl-Q` sequence — including a
+    // lone `Ctrl-P`, which agents use for history and which must not be eaten.
+    const detachFilter = createDetachSequenceFilter({
+      emit: (chunk) => { ptyProcess.write(chunk); },
+      onDetach: () => { opts.onDetachRequested?.(); },
+    });
+    state.detachFilter = detachFilter;
     const stdinListener = (data: Buffer | string) => {
-      ptyProcess.write(typeof data === 'string' ? data : data.toString('utf-8'));
+      detachFilter.push(typeof data === 'string' ? data : data.toString('utf-8'));
     };
     if (inStream.isTTY && typeof inStream.setRawMode === 'function') {
       inStream.setRawMode(true);
@@ -1117,6 +1137,7 @@ function handleLocalResize(state: LocalAgentState): void {
 }
 
 function teardownStdio(state: LocalAgentState): void {
+  state.detachFilter?.dispose();
   if (state.resizeSource && state.resizeListener && typeof state.resizeSource.removeListener === 'function') {
     state.resizeSource.removeListener('resize', state.resizeListener);
   }
