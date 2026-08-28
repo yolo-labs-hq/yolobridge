@@ -25,6 +25,7 @@ import { hostname } from 'node:os';
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runShare, runDeliver } from './share-cmd.js';
+import { runConsole } from './console-cmd.js';
 import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
@@ -117,6 +118,10 @@ function printHelp(): void {
       '  allow <path>           Let the ATTACHED AGENT send files from this path. You type',
       '                         this; nothing in the cloud can. Also --list and --remove <path>.',
       '                         The daemon\'s own working directory is always allowed.',
+      '  console [workspaceId]  Attach a REAL TERMINAL to a bridged session on another',
+      '    [--attachment <id>]  machine. Ctrl+C goes to the agent; Ctrl-P Ctrl-Q leaves,',
+      '                         and the agent keeps running. Defaults to this machine\'s',
+      '                         own attachment when run with no arguments.',
       '  share <path>           Share a local file with the attached workspace, so a cloud',
       '                         agent can see it. Push only — nothing reads your disk remotely.',
       '    [--to <tileId>]      Also write it into that tile\'s session, so its agent can open it.',
@@ -627,6 +632,29 @@ function cmdStatus(): number {
   return 0;
 }
 
+async function cmdConsole(args: string[]): Promise<number> {
+  const attIdx = args.indexOf('--attachment');
+  const attachmentId = attIdx >= 0 ? args[attIdx + 1] : undefined;
+  if (attIdx >= 0 && (!attachmentId || attachmentId.startsWith('-'))) {
+    process.stderr.write('yolo-bridge console: `--attachment` needs an id.\n');
+    return 64;
+  }
+  const workspaceId = args.find((a, i) => !a.startsWith('-') && i !== attIdx + 1);
+
+  const result = await runConsole({ commonApiBaseUrl: apiUrl(), workspaceId, attachmentId });
+  if (!result.ok) {
+    process.stderr.write(`yolo-bridge console: ${result.message}\n`);
+    return 1;
+  }
+  if (result.reason === 'stream-ended') {
+    // Distinguished from a deliberate detach: the operator did not ask to
+    // leave, so say why the session ended rather than exiting silently.
+    process.stderr.write('yolo-bridge console: the connection ended.\n');
+    return 1;
+  }
+  return 0;
+}
+
 async function cmdDeliver(args: string[]): Promise<number> {
   const assetId = args.find((a) => !a.startsWith('-') && a !== args[args.indexOf('--to') + 1]);
   const toIdx = args.indexOf('--to');
@@ -732,6 +760,8 @@ async function main(): Promise<number> {
       return cmdDetach();
     case 'allow':
       return cmdAllow(rest);
+    case 'console':
+      return cmdConsole(rest);
     case 'deliver':
       return cmdDeliver(rest);
     case 'share':
