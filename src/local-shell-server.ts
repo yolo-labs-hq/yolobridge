@@ -38,16 +38,30 @@
  * why the client must treat "no answer" as a timeout and fall back, never wait
  * forever.
  *
- * ⚠️ KNOWN GAP — RECONNECT FIDELITY FOR TUIs. The backlog is a byte TAIL, cut
- * at a parser-safe boundary. That is enough to resume a shell transcript, and
- * NOT enough to reconstruct a full-screen TUI that painted its layout once and
- * then emitted more than `BACKLOG_CHARS` of cursor-addressed updates: a viewer
- * reconnecting mid-session gets the updates without the screen they address,
- * and sticky modes set before the window are lost. The cloud path already
- * solved this properly — `local-agent.ts` keeps an `@xterm/headless` mirror and
- * serves a serialized screen plus a mode `prologue` — and `@xterm/headless` is
- * already a dependency here. Doing the same for these shells is the next slice;
- * it is called out rather than left to be discovered. (codex P2.)
+ * ⚠️ THE BACKLOG DOES NOT RECONSTRUCT A TUI SCREEN — AND NOTHING CURRENTLY
+ * NEEDS IT TO. Worth stating precisely, because the obvious next step here is
+ * speculative work.
+ *
+ * The backlog is a byte TAIL cut at a parser-safe boundary. It cannot rebuild a
+ * full-screen TUI that painted its layout once and then emitted more than
+ * `BACKLOG_CHARS` of cursor-addressed updates: a viewer joining mid-session
+ * would get the updates without the screen they address. The cloud path solved
+ * that properly — `local-agent.ts` keeps an `@xterm/headless` mirror and serves
+ * a serialized screen plus a mode `prologue` — and that dependency is already
+ * here, so doing the same looks like the natural next slice.
+ *
+ * IT IS NOT, because no client reconnects. `openLocalTerminal` establishes the
+ * stream exactly once; a stream that ends marks the session DEAD rather than
+ * retrying, and the tile never reuses a session id — every mount opens a fresh
+ * shell. So the replay only ever covers output produced between `/open` and
+ * `/stream`, a window of milliseconds inside a single connection, where a byte
+ * tail is exactly right.
+ *
+ * ⚠️ WHAT WOULD MAKE IT MATTER: adding session RESUMPTION — a tile that
+ * reattaches to its shell across a remount, a dropped stream, or a page
+ * refresh. That is a real feature and a reasonable one to want. The headless
+ * mirror is a prerequisite FOR IT, not an improvement on its own; building the
+ * mirror first would be solving the second half of a problem nobody has yet.
  *
  * SECURITY, deliberately narrow because this hands out shells:
  *   · bound to 127.0.0.1 ONLY — never 0.0.0.0, so it is off the local network
