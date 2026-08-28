@@ -15,6 +15,17 @@ export type DaemonAction =
   | { kind: 'ping' }
   | { kind: 'prompt'; attachmentId: string; prompt: string }
   /**
+   * Raw keystrokes from a `yolo-bridge console` client, written to the PTY
+   * VERBATIM.
+   *
+   * ⚠️ NOT a prompt. `prompt` is one coherent instruction: it waits for a
+   * readiness gate, types the text, pauses, then sends Enter. Input is bytes —
+   * a lone `\x03`, half of an arrow-key escape sequence, a character mid-word.
+   * Routing it through the prompt path would append an Enter nobody typed and
+   * block on a readiness check that never applies.
+   */
+  | { kind: 'input'; attachmentId: string; data: string }
+  /**
    * A screen read. `mode` picks WHICH primitive answers it, and they are not
    * interchangeable:
    *
@@ -74,6 +85,10 @@ export function actionForFrame(frame: SseFrame): DaemonAction {
       return { kind: 'ping' };
     case 'prompt':
       return { kind: 'prompt', attachmentId: String(data.attachmentId ?? ''), prompt: String(data.prompt ?? '') };
+    case 'input':
+      // No coercion beyond String(): these are the operator's own keystrokes
+      // and anything clever here would corrupt a control sequence.
+      return { kind: 'input', attachmentId: String(data.attachmentId ?? ''), data: String(data.data ?? '') };
     case 'read-output':
       return {
         kind: 'read-output',

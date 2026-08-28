@@ -38,11 +38,13 @@ import {
   type RawChunkMeta,
   type RawSeed,
   type RawStreamPrime,
+  writeInputToLocalAgent,
 } from './local-agent.js';
 import {
   OutputStreamBuffer,
   DEFAULT_FLUSH_INTERVAL_MS,
   type OutputStreamBufferOptions,
+  INTERACTIVE_ECHO_FLUSH_MS,
 } from './output-stream.js';
 import * as apiClient from './api-client.js';
 import { refreshAccessToken as refreshAccessTokenApi, type RefreshTokenResult } from './device-auth.js';
@@ -162,6 +164,8 @@ export interface AttachDaemonDeps {
    *  terminal. */
   clearScreen?: () => void;
   deliverPrompt?: (prompt: string) => Promise<void>;
+  /** Raw keystroke write, for console input. Injectable like `deliverPrompt`. */
+  writeInput?: (data: string) => boolean;
   captureOutput?: () => Promise<{ output: string; busy: boolean; cols?: number; rows?: number; usedRows?: number }>;
   /**
    * The raw-replay seed for a browser terminal (local-agent.ts's
@@ -292,6 +296,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
   const clearScreen = deps.clearScreen ?? (() => process.stdout.write('\x1b[2J\x1b[3J\x1b[H'));
   const deliverPrompt = deps.deliverPrompt ?? deliverPromptToLocalAgent;
+  const writeInput = deps.writeInput ?? writeInputToLocalAgent;
   const captureOutput = deps.captureOutput ?? captureLocalAgentOutput;
   const timers = deps.timers ?? defaultTimers;
   const now = deps.now ?? Date.now;
@@ -1195,6 +1200,27 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                 case 'prompt':
                   await deliverPrompt(action.prompt);
                   break;
+                case 'input': {
+                  // Raw keystrokes from a console client. Written verbatim —
+                  // no Enter appended, no readiness gate — see
+                  // `writeInputToLocalAgent`. Nothing logs the bytes.
+                  writeInput(action.data);
+                  // The PTY echoes within ~1ms. Without this the echo waits out
+                  // the 80ms batch window, which buys nothing for a payload
+                  // this small and spends ~40% of the latency budget that is
+                  // ours rather than the network's. `flushOutputStream` re-checks
+                  // that this session is still current, so a stale timer no-ops.
+                  const echoSession = outputStream;
+                  if (echoSession) {
+                    // A plain timer, not `timers`: that seam exists so tests can
+                    // drive the heartbeat/flush CADENCE, and widening it for a
+                    // 5ms nudge would touch every existing double. `unref` so a
+                    // pending echo can never hold the process open at exit.
+                    const t = setTimeout(() => { void flushOutputStream(echoSession); }, INTERACTIVE_ECHO_FLUSH_MS);
+                    (t as { unref?: () => void }).unref?.();
+                  }
+                  break;
+                }
                 case 'read-output': {
                   const captured = await captureOutput();
                   // Taken AFTER the (async) capture and synchronously, so

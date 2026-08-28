@@ -1,6 +1,6 @@
 {
   "name": "@yolo-labs/yolobridge",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "YoloBridge — local coding-agent daemon that attaches a user's own Claude Code/Codex session to a YOLO Studio workspace as a first-class tile (docs/YOLOBRIDGE_PLAN.md, build-order Phase 5).",
   "license": "MIT",
   "type": "module",

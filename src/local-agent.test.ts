@@ -19,6 +19,7 @@ import {
   serializeTerminalBuffer,
   onLocalAgentData,
   type PtySpawnImpl,
+  writeInputToLocalAgent,
 } from './local-agent.js';
 
 /**
@@ -833,5 +834,46 @@ describe('the detach sequence is actually MOUNTED on stdin', () => {
     stdin.type('ls -la\r');
 
     assert.deepEqual(fake.writes, ['ls -la\r']);
+  });
+});
+
+describe('writeInputToLocalAgent — raw keystrokes, not prompts', () => {
+  it('writes bytes VERBATIM, with no Enter appended', () => {
+    // `deliverPromptToLocalAgent` writes text then `\r`. That is right for one
+    // coherent instruction and wrong for a keystroke.
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake', cols: 40, rows: 10,
+      stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl,
+    });
+
+    assert.equal(writeInputToLocalAgent('y'), true);
+    assert.deepEqual(fake.writes, ['y'], 'no \\r may be appended');
+  });
+
+  it('passes control sequences through unchanged', () => {
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake', cols: 40, rows: 10,
+      stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl,
+    });
+
+    for (const raw of ['\x03', '\x1b[A', '\x1b[B', '\t']) writeInputToLocalAgent(raw);
+    assert.deepEqual(fake.writes, ['\x03', '\x1b[A', '\x1b[B', '\t']);
+  });
+
+  it('reports false when nothing is attached, rather than swallowing input', () => {
+    stopLocalAgent();
+    assert.equal(writeInputToLocalAgent('x'), false);
+  });
+
+  it('reports false for an empty write instead of poking the PTY', () => {
+    const fake = fakePty();
+    startLocalAgent({
+      agentBin: 'fake', cols: 40, rows: 10,
+      stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl,
+    });
+    assert.equal(writeInputToLocalAgent(''), false);
+    assert.deepEqual(fake.writes, []);
   });
 });

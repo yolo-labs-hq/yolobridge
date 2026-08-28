@@ -1179,6 +1179,37 @@ export function stopLocalAgent(): void {
 }
 
 /**
+ * Write raw bytes straight into the PTY, exactly as typed.
+ *
+ * ⚠️ DELIBERATELY NOT `deliverPromptToLocalAgent`. That function is for one
+ * coherent instruction: it waits on a readiness gate, writes the text, pauses,
+ * then writes `\r`. Every one of those is wrong for a keystroke —
+ * a lone `\x03` would get an Enter appended, an arrow-key escape sequence would
+ * be split by the pause, and the readiness gate would block on a prompt that a
+ * mid-session TUI never shows.
+ *
+ * So this does the minimum: if there is a live PTY, write the bytes. No
+ * interpretation, no framing, no Enter.
+ *
+ * ⚠️ NOTHING HERE LOGS `data`. These are the operator's keystrokes on their own
+ * machine — the same rule the output path already follows, and the reason a
+ * console session logs that it opened and closed and never what was typed.
+ *
+ * Returns false when there is no agent to write to, so a caller can say
+ * "nothing is attached" rather than silently swallowing input.
+ */
+export function writeInputToLocalAgent(data: string): boolean {
+  if (!current || !data) return false;
+  try {
+    current.ptyProcess.write(data);
+    return true;
+  } catch {
+    // The child is gone; onExit will clear `current`.
+    return false;
+  }
+}
+
+/**
  * Best-effort readiness check before `deliverPromptToLocalAgent` writes
  * into the PTY — docs/YOLOBRIDGE_PLAN.md's "[P1] Blind prompt delivery can
  * hit a permission dialog or partial input" Codex finding. Writing

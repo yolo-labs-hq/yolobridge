@@ -44,6 +44,22 @@
  *  rather than one per `onData`. */
 export const DEFAULT_FLUSH_INTERVAL_MS = 80;
 
+/**
+ * Flush delay after a console keystroke, rather than waiting out the batch
+ * window.
+ *
+ * The 80ms above is right for a passive VIEWER: it trades a little liveness for
+ * ~12 POSTs/second instead of one per `onData`. It is wrong for an interactive
+ * session, where a single echoed keystroke IS the entire payload and the batch
+ * saves nothing while costing up to 80ms of a round trip already near 200ms —
+ * measured 2026-08-28, and roughly 40% of the budget that is ours to spend
+ * rather than the network's.
+ *
+ * 5ms is long enough that a burst of keystrokes still coalesces into one POST,
+ * short enough to be invisible next to the ~160ms the network costs.
+ */
+export const INTERACTIVE_ECHO_FLUSH_MS = 5;
+
 /** ~192 KiB/s sustained. Comfortably above a fast agent's real output rate
  *  (a streaming LLM response is a few KiB/s), far below what `cat`ting a
  *  large file would produce. */

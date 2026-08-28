@@ -93,3 +93,32 @@ describe('actionForFrame', () => {
     assert.deepEqual(action, { kind: 'prompt', attachmentId: '', prompt: '' });
   });
 });
+
+describe('input frames — console keystrokes', () => {
+  it('maps an input frame to a raw-write action', () => {
+    const action = actionForFrame({ event: 'input', data: { attachmentId: 'att1', data: 'ls -la' } } as any);
+    assert.deepEqual(action, { kind: 'input', attachmentId: 'att1', data: 'ls -la' });
+  });
+
+  it('carries control bytes through untouched', () => {
+    // A lone Ctrl+C, an arrow-key escape sequence, a bare CR — anything clever
+    // here would corrupt a control sequence mid-flight.
+    for (const raw of ['\x03', '\x1b[A', '\r', '\x1b', '\t', '\x7f']) {
+      const action = actionForFrame({ event: 'input', data: { attachmentId: 'a', data: raw } } as any);
+      assert.equal((action as any).data, raw);
+    }
+  });
+
+  it('is a DIFFERENT action from prompt — an Enter must not be appended', () => {
+    const input = actionForFrame({ event: 'input', data: { attachmentId: 'a', data: 'y' } } as any);
+    const prompt = actionForFrame({ event: 'prompt', data: { attachmentId: 'a', prompt: 'y' } } as any);
+    assert.equal(input.kind, 'input');
+    assert.equal(prompt.kind, 'prompt');
+    assert.notEqual(input.kind, prompt.kind);
+  });
+
+  it('degrades to an empty string rather than "undefined" when data is absent', () => {
+    const action = actionForFrame({ event: 'input', data: { attachmentId: 'a' } } as any);
+    assert.equal((action as any).data, '');
+  });
+});
