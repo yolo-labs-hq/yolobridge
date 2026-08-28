@@ -10,8 +10,7 @@
  *   yolo-bridge attach [workspaceId]  — attach + hold the SSE stream (attach-cmd.ts)
  *                                        (omit the id for an interactive picker)
  *   yolo-bridge detach                — DELETE the current attachment (detach-cmd.ts)
- *   yolo-bridge console [workspaceId] — join a bridged session from a real
- *                                        terminal on another machine (console-cmd.ts)
+ *   yolo-bridge console               — REMOVED in 0.26.0; prints where to go instead
  *   yolo-bridge allow <path>          — approve a path the attached agent may
  *                                        send files from (approved-paths.ts)
  *   yolo-bridge share <path>          — push a local file to the workspace,
@@ -35,7 +34,6 @@ import { hostname } from 'node:os';
 import { runLogin } from './login-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runShare, runDeliver } from './share-cmd.js';
-import { runConsole } from './console-cmd.js';
 import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
@@ -128,10 +126,8 @@ function printHelp(): void {
       '  allow <path>           Let the ATTACHED AGENT send files from this path. You type',
       '                         this; nothing in the cloud can. Also --list and --remove <path>.',
       '                         The daemon\'s own working directory is always allowed.',
-      '  console [workspaceId]  Attach a REAL TERMINAL to a bridged session on another',
-      '    [--attachment <id>]  machine. Ctrl+C goes to the agent; Ctrl-P Ctrl-Q leaves,',
-      '                         and the agent keeps running. Defaults to this machine\'s',
-      '                         own attachment when run with no arguments.',
+      '  console                REMOVED in 0.26.0. Use the YoloBridge tile\'s "open terminal"',
+      '                         control, which spawns a terminal tile wired to the session.',
       '  share <path>           Share a local file with the attached workspace, so a cloud',
       '                         agent can see it. Push only — nothing reads your disk remotely.',
       '    [--to <tileId>]      Also write it into that tile\'s session, so its agent can open it.',
@@ -651,27 +647,31 @@ function cmdStatus(): number {
   return 0;
 }
 
-async function cmdConsole(args: string[]): Promise<number> {
-  const attIdx = args.indexOf('--attachment');
-  const attachmentId = attIdx >= 0 ? args[attIdx + 1] : undefined;
-  if (attIdx >= 0 && (!attachmentId || attachmentId.startsWith('-'))) {
-    process.stderr.write('yolo-bridge console: `--attachment` needs an id.\n');
-    return 64;
-  }
-  const workspaceId = args.find((a, i) => !a.startsWith('-') && i !== attIdx + 1);
-
-  const result = await runConsole({ commonApiBaseUrl: apiUrl(), workspaceId, attachmentId });
-  if (!result.ok) {
-    process.stderr.write(`yolo-bridge console: ${result.message}\n`);
-    return 1;
-  }
-  if (result.reason === 'stream-ended') {
-    // Distinguished from a deliberate detach: the operator did not ask to
-    // leave, so say why the session ended rather than exiting silently.
-    process.stderr.write('yolo-bridge console: the connection ended.\n');
-    return 1;
-  }
-  return 0;
+/**
+ * REMOVED in 0.26.0 — kept as an explicit notice rather than falling through to
+ * "unknown command".
+ *
+ * A command that vanishes without explanation is worse than one that says why:
+ * anyone with it in muscle memory or a shell script gets a dead end and no
+ * pointer. This costs a few lines and answers the question.
+ */
+function cmdConsoleRemoved(): number {
+  process.stderr.write(
+    [
+      'yolo-bridge console was removed in 0.26.0.',
+      '',
+      'Open a terminal from the workspace instead: the YoloBridge tile has an',
+      '"open terminal" control that spawns a terminal tile wired to this session.',
+      '',
+      'It was built for reaching a session from a DIFFERENT machine\'s terminal,',
+      'which turned out not to be a use case anyone had. Nothing replaced it',
+      'because the tile does the job from the machine you are already on.',
+      '',
+      'Need it back? `npm i -g @yolo-labs/yolobridge@0.25.0` still has it.',
+      '',
+    ].join('\n'),
+  );
+  return 64;
 }
 
 async function cmdDeliver(args: string[]): Promise<number> {
@@ -780,7 +780,7 @@ async function main(): Promise<number> {
     case 'allow':
       return cmdAllow(rest);
     case 'console':
-      return cmdConsole(rest);
+      return cmdConsoleRemoved();
     case 'deliver':
       return cmdDeliver(rest);
     case 'share':
