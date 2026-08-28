@@ -118,6 +118,15 @@ const SCOPED_REFRESH_AT_FRACTION = 0.75;
 const SCOPED_REFRESH_GRACE_MS = 15 * 60_000;
 
 export interface AttachDaemonDeps {
+  /**
+   * Where this machine's local terminal server is listening, when one is
+   * running. Reported to the server on every heartbeat so a tile can reach it
+   * directly instead of relaying keystrokes through the cloud.
+   *
+   * Absent when the shell server failed to start — the attach continues
+   * without it, and the tile falls back.
+   */
+  localEndpoint?: () => { url: string; secret: string } | undefined;
   workspaceId: string;
   commonApiBaseUrl: string;
   hostLabel?: string;
@@ -1172,6 +1181,22 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                         return;
                       }
                       await apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId);
+                      // ⚠️ RE-REPORTED ON EVERY BEAT, not once at startup. The
+                      // server holds this in memory with a TTL, so it is lost
+                      // on a restart or a failover — and the correct recovery
+                      // is the daemon simply saying it again a few seconds
+                      // later, not the server persisting a secret. Best-effort:
+                      // a failed report costs the tile its fast path, nothing
+                      // more.
+                      // Read LAZILY: the shell server starts inside
+                      // `onAttached`, after these deps were built, so a
+                      // snapshot taken at construction would always be empty.
+                      const local = deps.localEndpoint?.();
+                      if (local) {
+                        await apiClient.reportLocalEndpoint(
+                          scopedCfg(), workspaceId, attachmentId, local.url, local.secret,
+                        );
+                      }
                     },
                     (err) => {
                       // The heartbeat hits the SAME boundary as the stream open
@@ -1187,6 +1212,22 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                     undefined,
                     deps.timers,
                   );
+                  // ⚠️ REPORT THE LOCAL ENDPOINT IMMEDIATELY TOO, not only on
+                  // the interval. Waiting ~10s means a tile opened in that
+                  // window gets a 404 and silently downgrades to the ~200ms
+                  // relay, while a perfectly good local server is already
+                  // listening — and it would stay downgraded for that whole
+                  // session. Same reasoning as the immediate heartbeat below.
+                  // (codex P2.)
+                  {
+                    const local = deps.localEndpoint?.();
+                    if (local) {
+                      apiClient.reportLocalEndpoint(
+                        scopedCfg(), workspaceId, attachmentId, local.url, local.secret,
+                      ).catch(() => { /* best effort — the tile falls back */ });
+                    }
+                  }
+
                   // Send one immediately so status isn't stale for the first ~10s.
                   apiClient.postHeartbeat(scopedCfg(), workspaceId, attachmentId).catch((err) => {
                     if (noteCredentialRejection(err)) return;

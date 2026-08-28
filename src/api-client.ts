@@ -272,6 +272,41 @@ export async function openStream(
   return res;
 }
 
+/**
+ * Tell the server where this daemon's LOCAL terminal server is listening.
+ *
+ * ⚠️ Uses the daemon's SCOPED token, and the route requires one. It is the
+ * mirror of the input route's rule: only a USER may type, and only the machine
+ * actually running the server may say where it is. A user token here would let
+ * anyone point a tile at an arbitrary address.
+ *
+ * Best-effort by design — returns false rather than throwing. A daemon whose
+ * report fails is still a perfectly good daemon; the tile simply falls back to
+ * the cloud relay, which is slower and works.
+ */
+export async function reportLocalEndpoint(
+  cfg: ApiClientConfig,
+  workspaceId: string,
+  attachmentId: string,
+  url: string,
+  secret: string,
+): Promise<boolean> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  try {
+    const res = await fetchImpl(
+      `${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}/local-endpoint`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(cfg), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, secret }),
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function postHeartbeat(cfg: ApiClientConfig, workspaceId: string, attachmentId: string): Promise<boolean> {
   const body = await postEvent(cfg, workspaceId, { attachmentId, type: 'heartbeat' });
   return Boolean(body?.recorded);

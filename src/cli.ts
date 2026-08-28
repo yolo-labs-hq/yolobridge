@@ -395,6 +395,12 @@ async function cmdAttach(args: string[]): Promise<number> {
   let result: Awaited<ReturnType<typeof runAttachFromDisk>>;
   try {
     result = await runAttachFromDisk({
+      // Read lazily on each heartbeat — the shell server starts in
+      // `onAttached`, after this object is built, so a value here would
+      // always be undefined.
+      localEndpoint: () => (shellServerHandle
+        ? { url: shellServerHandle.url, secret: shellServerHandle.secret }
+        : undefined),
       workspaceId,
       commonApiBaseUrl: apiUrl(),
       hostLabel: attachHostInfo.hostLabel,
