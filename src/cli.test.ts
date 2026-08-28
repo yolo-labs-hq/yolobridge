@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { hostname } from 'node:os';
+import { readFileSync, existsSync } from 'node:fs';
 
 import { parseAttachArgs, resolveAttachHostInfo, resolveWorkspaceIdOrName, readOwnVersion } from './cli.js';
 
@@ -241,5 +242,63 @@ describe('readOwnVersion', () => {
     assert.notEqual(actual, 'unknown', 'resolver fell back to unknown — the package.json lookup is broken');
     assert.equal(actual, expected);
     assert.match(actual, /^\d+\.\d+\.\d+/);
+  });
+});
+
+/**
+ * The CLI describes itself in THREE places — the file header, `printHelp`, and
+ * the dispatch switch — and only the last one is executable. The other two fell
+ * five commands behind (`console`, `allow`, `share`, `deliver`, `version` were
+ * all added without either being updated), so the first thing a reader of the
+ * file saw was a CLI half its real size, and nothing anywhere went red.
+ *
+ * Documentation drift is invisible by construction, so it needs a test rather
+ * than good intentions. The switch is the source of truth here because it is
+ * the only one the runtime actually consults.
+ */
+describe('the CLI describes itself accurately', () => {
+  const source = (() => {
+    for (const rel of ['./cli.ts', '../src/cli.ts', '../../src/cli.ts']) {
+      const url = new URL(rel, import.meta.url);
+      if (existsSync(url)) return readFileSync(url, 'utf-8');
+    }
+    throw new Error('could not locate cli.ts from ' + import.meta.url);
+  })();
+
+  /** Command names the dispatch switch actually handles. */
+  const dispatched = [...source.matchAll(/^\s{4}case '([a-z-]+)':$/gm)]
+    .map((m) => m[1])
+    .filter((c) => !c.startsWith('-'));
+
+  it('dispatches the commands we think it does', () => {
+    // A canary on the extraction itself: if the switch is refactored into a
+    // shape this regex cannot see, every assertion below would pass vacuously.
+    assert.ok(dispatched.length >= 9, `only found ${dispatched.length} commands: ${dispatched.join(', ')}`);
+    for (const expected of ['login', 'workspaces', 'attach', 'detach', 'console', 'share', 'status']) {
+      assert.ok(dispatched.includes(expected), `expected the switch to handle '${expected}'`);
+    }
+  });
+
+  it('lists every dispatched command in `printHelp`', () => {
+    const help = source.slice(source.indexOf('function printHelp'), source.indexOf('function apiUrl') > 0
+      ? source.length
+      : source.length);
+    const helpBlock = help.slice(0, help.indexOf('\n}\n'));
+    for (const cmd of dispatched) {
+      assert.ok(
+        new RegExp(`'\\s*${cmd}[ \\[<']`).test(helpBlock) || helpBlock.includes(`'  ${cmd}`),
+        `\`${cmd}\` is dispatched but missing from printHelp — an operator running --help would never learn it exists`,
+      );
+    }
+  });
+
+  it('lists every dispatched command in the file header', () => {
+    const header = source.slice(0, source.indexOf(' */'));
+    for (const cmd of dispatched) {
+      assert.ok(
+        header.includes(`yolo-bridge ${cmd}`),
+        `\`${cmd}\` is dispatched but missing from the header comment — this is exactly the drift that let the list fall five commands behind`,
+      );
+    }
   });
 });

@@ -3,13 +3,23 @@
  * `yolo-bridge` — YoloBridge local daemon CLI (docs/YOLOBRIDGE_PLAN.md,
  * Implementation Plan → build-order step 5).
  *
- * Subcommands:
+ * Subcommands (keep in step with `printHelp` — this list is what a reader of
+ * the file sees first, and it silently fell five commands behind before):
  *   yolo-bridge login                 — device-authorization flow (login-cmd.ts)
  *   yolo-bridge workspaces            — list selectable workspaces (workspaces-cmd.ts)
  *   yolo-bridge attach [workspaceId]  — attach + hold the SSE stream (attach-cmd.ts)
  *                                        (omit the id for an interactive picker)
  *   yolo-bridge detach                — DELETE the current attachment (detach-cmd.ts)
+ *   yolo-bridge console [workspaceId] — join a bridged session from a real
+ *                                        terminal on another machine (console-cmd.ts)
+ *   yolo-bridge allow <path>          — approve a path the attached agent may
+ *                                        send files from (approved-paths.ts)
+ *   yolo-bridge share <path>          — push a local file to the workspace,
+ *                                        optionally into a tile (share-cmd.ts)
+ *   yolo-bridge deliver <assetId>     — write an ALREADY-shared file into a
+ *                                        tile's session (share-cmd.ts)
  *   yolo-bridge status                — print local login/attach state (status-cmd.ts)
+ *   yolo-bridge version               — print the installed version (also --version, -v)
  *
  * Base URLs default to this repo's real hostnames (CLAUDE.md → Project
  * Overview): common-api `https://api.yolo.studio`, auth-service
