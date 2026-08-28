@@ -302,3 +302,68 @@ describe('the CLI describes itself accurately', () => {
     }
   });
 });
+
+
+/**
+ * The local terminal server authorises reaching a SHELL on this machine, so
+ * the two things that gate it — which origin may call, and where the secret is
+ * allowed to appear — are pinned here rather than left to review.
+ */
+describe('the local terminal server is wired safely', () => {
+  const source = (() => {
+    for (const rel of ['./cli.ts', '../src/cli.ts', '../../src/cli.ts']) {
+      const url = new URL(rel, import.meta.url);
+      if (existsSync(url)) return readFileSync(url, 'utf-8');
+    }
+    throw new Error('could not locate cli.ts');
+  })();
+
+  it('allows exactly one origin, never a wildcard', () => {
+    // `*` here would let any page on the internet reach a shell on the
+    // operator's machine.
+    assert.ok(source.includes('allowedOrigin: webappOrigin()'));
+    assert.ok(!/allowedOrigin:\s*['"`]\*/.test(source), 'a wildcard origin must never appear');
+  });
+
+  it('NEVER prints the secret', () => {
+    // ⚠️ The daemon's stdout is the operator's scrollback — where things get
+    // copied into bug reports. The secret reaches the tile over the
+    // authenticated workspace channel instead, and appears in no log line.
+    const printed = [...source.matchAll(/process\.stdout\.write\(([^;]*)\);/g)].map((m) => m[1]);
+    for (const line of printed) {
+      assert.ok(
+        !/shellServerHandle\.secret|\.secret\b/.test(line),
+        `a stdout line references a secret: ${line.slice(0, 90)}`,
+      );
+    }
+  });
+
+  it('starts the server before the agent', () => {
+    // So the endpoint exists by the time a tile could ask for it.
+    assert.ok(source.indexOf('startLocalShellServer') < source.indexOf('startLocalAgent({'));
+  });
+
+  it('closes it in TEARDOWN, not during setup', () => {
+    // ⚠️ The first cut of this asserted only that `close()` appeared SOMEWHERE,
+    // and shipped broken: the call landed inside `onAttached`, so the server
+    // was shut down moments after starting and the URL it had just announced
+    // was already dead. Presence proves nothing; position is the property.
+    const close = source.indexOf('shellServerHandle.close()');
+    const stopAgent = source.indexOf('stopLocalAgent();');
+    const stopProxy = source.indexOf('mcpProxyHandle.stop()');
+    assert.ok(close > 0, 'close() is missing entirely');
+    assert.ok(close > stopAgent, 'close() runs before the agent is stopped — it is in setup, not teardown');
+    // And in the same teardown block as the MCP proxy, which has the identical
+    // "nothing left running detached" rule.
+    assert.ok(Math.abs(close - stopProxy) < 800, 'close() is not alongside the MCP proxy shutdown');
+  });
+
+  it('does not let a failed terminal server abort the attach', () => {
+    // The agent and its tile are the point; a local terminal is an extra.
+    const at = source.indexOf('shellServerHandle = await startLocalShellServer');
+    assert.ok(at > 0, 'call site not found');
+    const after = source.slice(at, at + 1400);
+    assert.match(after, /catch \(err\)/, 'the start call is not guarded');
+    assert.match(after, /the attach continues without them/, 'the failure is not explained to the operator');
+  });
+});
