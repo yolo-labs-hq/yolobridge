@@ -170,12 +170,43 @@ describe('resolveAttachHostInfo', () => {
     assert.equal(result.hostLabel, undefined);
   });
 
-  it('reports exactly the three machine facts the tile shows — cwd, platform, agent — and nothing else', () => {
+  it('reports exactly the facts the tile shows — and nothing else', () => {
     const result = resolveAttachHostInfo(BASE);
     assert.deepEqual(result.remoteHost, { cwd: '/home/dev/proj', platform: 'linux', agent: 'claude' });
     // Guards the privacy boundary directly: adding an env dump, a username,
     // or a file listing here would fail this assertion, not slip through.
+    // `cliVersion` is the one later addition, and it is the daemon's own
+    // version rather than a fact about the operator's machine — it appears
+    // only when supplied, which is why it is absent here.
     assert.deepEqual(Object.keys(result.remoteHost).sort(), ['agent', 'cwd', 'platform']);
+  });
+
+  it('reports its OWN version when given one, and still nothing else', () => {
+    // ⚠️ This is a CAPABILITY signal, not telemetry. The daemon binary freezes
+    // on the operator's machine while the server and webapp keep deploying, so
+    // without it a tile can offer a control this daemon has never heard of —
+    // and nothing notices, because an unrecognised frame produces no error and
+    // the route still answers 200.
+    const result = resolveAttachHostInfo({ ...BASE, cliVersion: '0.25.0' });
+    assert.equal(result.remoteHost.cliVersion, '0.25.0');
+    assert.deepEqual(Object.keys(result.remoteHost).sort(), ['agent', 'cliVersion', 'cwd', 'platform']);
+  });
+
+  it('OMITS the version rather than sending "unknown"', () => {
+    // `readOwnVersion()` returns the literal 'unknown' when it cannot find its
+    // own package.json. Forwarding that would be indistinguishable from a real
+    // version to anything doing a semver compare — and a reader must be able
+    // to tell "did not report" from "reported something unusable", because
+    // only the first is a reason to hedge.
+    assert.equal(resolveAttachHostInfo({ ...BASE, cliVersion: 'unknown' }).remoteHost.cliVersion, undefined);
+    assert.equal(resolveAttachHostInfo({ ...BASE, cliVersion: '   ' }).remoteHost.cliVersion, undefined);
+    assert.equal(resolveAttachHostInfo({ ...BASE }).remoteHost.cliVersion, undefined);
+  });
+
+  it('sends a version that MATCHES the installed package', () => {
+    // The whole signal is worthless if it drifts from the binary it describes.
+    const result = resolveAttachHostInfo({ ...BASE, cliVersion: readOwnVersion() });
+    assert.equal(result.remoteHost.cliVersion, readOwnVersion());
   });
 
   it('describes the REAL process when handed real values (no mocks — the actual call shape cli.ts uses)', () => {

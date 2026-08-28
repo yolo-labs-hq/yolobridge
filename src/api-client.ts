@@ -58,6 +58,25 @@ export interface RemoteHostInfo {
   cwd?: string;
   platform?: string;
   agent?: string;
+  /**
+   * This daemon's own `@yolo-labs/yolobridge` version.
+   *
+   * ⚠️ IT IS A CAPABILITY SIGNAL, not decoration. The daemon binary FREEZES on
+   * the operator's machine at install time while the server and the webapp
+   * deploy continuously — the same mixed-fleet seam the pod/server rule
+   * describes, with the same trap. A server that starts sending a frame an
+   * older daemon does not recognise gets no error back: the daemon logs a
+   * local `degraded` note and drops it, and the route still answers 200
+   * because the stream is genuinely held. Without a reported version there is
+   * NO server-visible fact that distinguishes "delivered and acted on" from
+   * "delivered and ignored".
+   *
+   * Absent from every daemon older than the release that added it, which is
+   * exactly why its absence must DEGRADE (warn, still offer) rather than
+   * brick — the reader cannot tell an old daemon from a new one that predates
+   * the field.
+   */
+  cliVersion?: string;
 }
 
 /**

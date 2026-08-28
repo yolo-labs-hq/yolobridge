@@ -235,7 +235,9 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
  *    is the obvious default and is already what `--label` is usually set to
  *    by hand. An explicit `--label` still wins.
  *  - **`remoteHost` is assembled**: the launch directory, the OS platform
- *    string, and which agent binary this attach drives.
+ *    string, which agent binary this attach drives, and the daemon's own
+ *    version — see `RemoteHostInfo.cliVersion` for why that last one is a
+ *    capability signal rather than a nicety.
  *
  * What is deliberately NOT collected, and should not be added without its
  * own consent story: environment variables, anything listing the contents
@@ -249,14 +251,20 @@ export function resolveAttachHostInfo(input: {
   cwd: string;
   platform: string;
   agent: string;
+  cliVersion?: string;
 }): { hostLabel: string | undefined; remoteHost: RemoteHostInfo } {
   const label = input.label?.trim();
+  const cliVersion = input.cliVersion?.trim();
   return {
     hostLabel: label || input.hostname.trim() || undefined,
     remoteHost: {
       cwd: input.cwd,
       platform: input.platform,
       agent: input.agent,
+      // Omitted rather than sent as 'unknown': a reader must be able to tell
+      // "this daemon does not report a version" from "it reports a version it
+      // could not determine", and only the first is a reason to hedge.
+      ...(cliVersion && cliVersion !== 'unknown' ? { cliVersion } : {}),
     },
   };
 }
@@ -346,6 +354,7 @@ async function cmdAttach(args: string[]): Promise<number> {
     cwd: spawnCwd,
     platform: process.platform,
     agent: resolvedAgentId,
+    cliVersion: readOwnVersion(),
   });
   let mcpProxyHandle: McpProxyHandle | undefined;
   // argv fragment pointing the spawned agent at the local MCP proxy, or
