@@ -41,23 +41,10 @@ import { getStatus, formatStatus } from './status-cmd.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 import { startMcpProxy, mcpUrl, SECRET_ENV_VAR, type McpProxyHandle } from './mcp-proxy.js';
-import { startLocalShellServer, type LocalShellServerHandle } from './local-shell-server.js';
 import { buildAgentMcpArgs } from './agent-mcp-args.js';
 
 const DEFAULT_API_URL = 'https://api.yolo.studio';
-const DEFAULT_WEBAPP_ORIGIN = 'https://yolo.studio';
 const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
-
-/**
- * The ONE browser origin allowed to reach the local terminal server.
- *
- * ⚠️ Never a wildcard: this authorises reaching a shell on the operator's
- * machine, so it is a single exact origin. Overridable only for local
- * development against a different webapp host.
- */
-function webappOrigin(): string {
-  return process.env.YOLOBRIDGE_WEBAPP_ORIGIN || DEFAULT_WEBAPP_ORIGIN;
-}
 
 function apiUrl(): string {
   return process.env.YOLOBRIDGE_API_URL || DEFAULT_API_URL;
@@ -383,7 +370,6 @@ async function cmdAttach(args: string[]): Promise<number> {
    * session; this owns any shells the operator opens from the workspace. They
    * share a lifetime — both die with the attach — and nothing else.
    */
-  let shellServerHandle: LocalShellServerHandle | undefined;
   // argv fragment pointing the spawned agent at the local MCP proxy, or
   // `[]` when MCP isn't wired in — see `agent-mcp-args.ts`. Nothing else is
   // tracked for cleanup any more: as of 2026-08-26 `attach` writes NOTHING
@@ -395,12 +381,6 @@ async function cmdAttach(args: string[]): Promise<number> {
   let result: Awaited<ReturnType<typeof runAttachFromDisk>>;
   try {
     result = await runAttachFromDisk({
-      // Read lazily on each heartbeat — the shell server starts in
-      // `onAttached`, after this object is built, so a value here would
-      // always be undefined.
-      localEndpoint: () => (shellServerHandle
-        ? { url: shellServerHandle.url, secret: shellServerHandle.secret }
-        : undefined),
       workspaceId,
       commonApiBaseUrl: apiUrl(),
       hostLabel: attachHostInfo.hostLabel,
@@ -427,22 +407,6 @@ async function cmdAttach(args: string[]): Promise<number> {
         // prompt. MCP access is an enhancement on a tile that already works
         // without it; the local agent spawning is not optional.
         try {
-          // The local terminal server. Started BEFORE the agent, like the MCP
-          // proxy, so the endpoint exists by the time the tile could ask for
-          // it. A failure here must not stop the attach: the agent and its
-          // tile are the point, a local terminal is an extra.
-          try {
-            shellServerHandle = await startLocalShellServer({ allowedOrigin: webappOrigin() });
-            // ⚠️ THE URL, NEVER THE SECRET. This line lands in the operator's
-            // scrollback, which is exactly where things get copied into bug
-            // reports and pasted into chats. The secret authorises spawning a
-            // shell on this machine; it reaches the tile over the authenticated
-            // workspace channel and is printed nowhere.
-            process.stdout.write(`yolo-bridge: local terminals ready at ${shellServerHandle.url} (127.0.0.1 only)\n`);
-          } catch (err) {
-            process.stdout.write(`yolo-bridge: local terminals unavailable (${err instanceof Error ? err.message : String(err)}) — the attach continues without them.\n`);
-          }
-
           mcpProxyHandle = await startMcpProxy({
             apiUrl: apiUrl(),
             getAccessToken,
@@ -621,17 +585,6 @@ async function cmdAttach(args: string[]): Promise<number> {
     // or a reboot, and every skipped run left a file that broke the
     // operator's own standalone `claude` in that directory. Nothing written
     // is nothing to clean up.
-    // Same "nothing left running detached" rule as the MCP proxy: a shell the
-    // operator opened from the workspace must not outlive the attach that
-    // served it. `close()` kills every session it owns.
-    if (shellServerHandle) {
-      try {
-        await shellServerHandle.close();
-      } catch (err) {
-        process.stdout.write(`yolo-bridge: local terminal shutdown failed (${err instanceof Error ? err.message : String(err)}).\n`);
-      }
-    }
-
     if (mcpProxyHandle) {
       try {
         await mcpProxyHandle.stop();

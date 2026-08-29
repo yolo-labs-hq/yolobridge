@@ -284,29 +284,6 @@ export async function openStream(
  * report fails is still a perfectly good daemon; the tile simply falls back to
  * the cloud relay, which is slower and works.
  */
-export async function reportLocalEndpoint(
-  cfg: ApiClientConfig,
-  workspaceId: string,
-  attachmentId: string,
-  url: string,
-  secret: string,
-): Promise<boolean> {
-  const fetchImpl = cfg.fetchImpl ?? fetch;
-  try {
-    const res = await fetchImpl(
-      `${base(cfg)}/v1/workspaces/${workspaceId}/yolobridge/attach/${attachmentId}/local-endpoint`,
-      {
-        method: 'POST',
-        headers: { ...authHeaders(cfg), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, secret }),
-      },
-    );
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 export async function postHeartbeat(cfg: ApiClientConfig, workspaceId: string, attachmentId: string): Promise<boolean> {
   const body = await postEvent(cfg, workspaceId, { attachmentId, type: 'heartbeat' });
   return Boolean(body?.recorded);
