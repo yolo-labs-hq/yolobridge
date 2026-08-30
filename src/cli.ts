@@ -38,6 +38,7 @@ import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
+import { resolveAgentBinary } from './resolve-agent-binary.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 import { startMcpProxy, mcpUrl, SECRET_ENV_VAR, type McpProxyHandle } from './mcp-proxy.js';
@@ -363,13 +364,6 @@ async function cmdAttach(args: string[]): Promise<number> {
     cliVersion: readOwnVersion(),
   });
   let mcpProxyHandle: McpProxyHandle | undefined;
-  /**
-   * Serves terminals on 127.0.0.1 for the tile's "open terminal".
-   *
-   * ⚠️ SEPARATE FROM THE AGENT PTY. `startLocalAgent` owns the one agent
-   * session; this owns any shells the operator opens from the workspace. They
-   * share a lifetime — both die with the attach — and nothing else.
-   */
   // argv fragment pointing the spawned agent at the local MCP proxy, or
   // `[]` when MCP isn't wired in — see `agent-mcp-args.ts`. Nothing else is
   // tracked for cleanup any more: as of 2026-08-26 `attach` writes NOTHING
@@ -510,6 +504,25 @@ async function cmdAttach(args: string[]): Promise<number> {
           // Say where Ctrl+C goes BEFORE the agent takes over the screen.
           // Without this the operator presses it expecting to quit, nothing
           // happens, and there is no way to discover why.
+          // ⚠️ RESOLVE THE BINARY BEFORE SPAWNING IT, so a failure can be
+          // EXPLAINED. node-pty reports an unspawnable binary as the bare
+          // string `posix_spawnp failed.` — no binary name, no PATH, no
+          // remedy — which on macOS reached an operator as "failed to start
+          // the local agent (posix_spawnp failed.)" and told them nothing
+          // they could act on. Worse, the one fact they could see (`claude`
+          // works when typed) argued that nothing was wrong, because a shell
+          // alias or function resolves interactively and cannot be spawned.
+          // This does not change WHETHER the attach fails — only whether the
+          // operator can tell why.
+          const resolvedBinary = resolveAgentBinary(agentBin ?? DEFAULT_AGENT_BIN, process.env);
+          if (!resolvedBinary.ok) {
+            process.stdout.write(`yolo-bridge: cannot start the agent — ${resolvedBinary.message}\n`);
+            process.stdout.write('yolo-bridge: detaching...\n');
+            stopRequested = true;
+            await runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+            return;
+          }
+
           process.stdout.write('yolo-bridge: Ctrl+C goes to the agent · Ctrl-P Ctrl-Q to detach\n');
           startLocalAgent({
             agentBin,
