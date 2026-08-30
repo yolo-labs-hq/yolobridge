@@ -39,6 +39,7 @@ import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
 import { resolveAgentBinary } from './resolve-agent-binary.js';
+import { checkPtyHelper } from './check-pty-helper.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 import { startMcpProxy, mcpUrl, SECRET_ENV_VAR, type McpProxyHandle } from './mcp-proxy.js';
@@ -504,6 +505,23 @@ async function cmdAttach(args: string[]): Promise<number> {
           // Say where Ctrl+C goes BEFORE the agent takes over the screen.
           // Without this the operator presses it expecting to quit, nothing
           // happens, and there is no way to discover why.
+          // ⚠️ THE HELPER FIRST, BEFORE THE AGENT. node-pty does not spawn
+          // your binary — on unix it spawns its own `spawn-helper` and passes
+          // the real command as an argument (`pty.cc`: argv[0] = helper_path).
+          // A broken helper therefore fails with the SAME
+          // `posix_spawnp failed.` as a missing agent, and checking the agent
+          // first would report it healthy and leave the operator debugging a
+          // binary that was never at fault — which is exactly what happened on
+          // macOS with two working `claude` installs on PATH.
+          const helper = checkPtyHelper();
+          if (!helper.ok) {
+            process.stdout.write(`yolo-bridge: cannot start the agent — ${helper.message}\n`);
+            process.stdout.write('yolo-bridge: detaching...\n');
+            stopRequested = true;
+            await runDetach({ commonApiBaseUrl: apiUrl() }).catch(() => undefined);
+            return;
+          }
+
           // ⚠️ RESOLVE THE BINARY BEFORE SPAWNING IT, so a failure can be
           // EXPLAINED. node-pty reports an unspawnable binary as the bare
           // string `posix_spawnp failed.` — no binary name, no PATH, no
