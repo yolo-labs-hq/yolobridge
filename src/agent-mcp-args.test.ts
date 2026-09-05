@@ -352,7 +352,7 @@ describe('SECURITY: the literal secret never reaches argv', () => {
         for (const arg of result.args) {
           assert.equal(arg.includes(secret), false, `argv element leaked the secret: ${arg}`);
         }
-        assert.equal(result.args.join(' ').includes(secret), false, 'no argv element may contain the secret');
+        assert.equal(result.args.join('\x00').includes(secret), false, 'no argv element may contain the secret');
       });
     });
   });
@@ -373,7 +373,7 @@ describe('SECURITY: the literal secret never reaches argv', () => {
         for (const arg of result.args) {
           assert.equal(arg.includes(secret), false, `argv element leaked the secret: ${arg}`);
         }
-        assert.equal(result.args.join(' ').includes(secret), false, 'no argv element may contain the secret');
+        assert.equal(result.args.join('\x00').includes(secret), false, 'no argv element may contain the secret');
       });
     });
   });
