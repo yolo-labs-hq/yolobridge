@@ -496,7 +496,7 @@ export async function finalizeShare(
 }
 
 export interface DeliveredAsset {
-  /** Where the pod wrote it, e.g. `.yolo-drops/<assetId prefix>-<filename>` — the path
+  /** Where the pod wrote it, e.g. `~/lanes/<lane>/.yolo-drops/<filename>` — the path
    *  the target agent should be told to open. */
   path: string;
   size?: number;
