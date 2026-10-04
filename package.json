@@ -1,8 +1,16 @@
 {
   "name": "@yolo-labs/yolobridge",
-  "version": "0.32.0",
-  "description": "YoloBridge \u2014 local coding-agent daemon that attaches a user's own Claude Code/Codex session to a YOLO Studio workspace as a first-class tile (docs/YOLOBRIDGE_PLAN.md, build-order Phase 5).",
+  "version": "0.32.1",
+  "description": "Attach your own local coding agent (Claude Code, Codex) to a YOLO Studio workspace as a first-class tile.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yolo-labs-hq/yolobridge.git"
+  },
+  "homepage": "https://github.com/yolo-labs-hq/yolobridge#readme",
+  "bugs": {
+    "url": "https://github.com/yolo-labs-hq/yolobridge/issues"
+  },
   "type": "module",
   "bin": {
     "yolo-bridge": "dist/cli.js"
