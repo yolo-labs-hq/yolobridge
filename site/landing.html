@@ -48,9 +48,11 @@
 
     /* The command is the page. It is set large, in the octopus green, behind a
        dimmed prompt and with a live cursor: what you copy here is exactly
-       what you type there. */
+       what you type there. Sized so the command plus cursor fits its box at
+       every width: at 3vw/26px it overflowed by ~10px and showed a scrollbar.
+       overflow-x stays as a safety net for unusually wide fonts. */
     .command-row { display: flex; align-items: center; gap: 16px; background: var(--deep); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px; margin: 36px 0 12px; }
-    .command { flex: 1; min-width: 0; overflow-x: auto; margin: 0; font-size: clamp(15px, 3vw, 26px); line-height: 1.5; color: var(--green); }
+    .command { flex: 1; min-width: 0; overflow-x: auto; margin: 0; font-size: clamp(15px, 2.6vw, 22px); line-height: 1.5; color: var(--green); }
     .command::before { content: "$ "; color: var(--line); filter: brightness(1.8); user-select: none; }
     .command code { color: inherit; user-select: all; }
     .hero .command code::after { content: ""; display: inline-block; width: .55em; height: 1.05em; margin-left: .35em; vertical-align: -.17em; background: var(--green); animation: blink 1.1s steps(1) infinite; }
@@ -88,7 +90,10 @@
       /* Stack the button under the command so the full command stays in view
          instead of scrolling behind it. */
       .command-row { flex-direction: column; align-items: stretch; padding: 14px; gap: 12px; }
-      .command { font-size: 13.5px; }
+      /* .alt .command too: its desktop 16px is more specific than .command.
+         Below ~390px no readable size fits a whole command on one line, so
+         wrap at spaces instead of scrolling. Copy still copies the exact text. */
+      .command, .alt .command { font-size: 13.5px; white-space: pre-wrap; }
       .dry-run { padding-left: 0; }
     }
   </style>
