@@ -63,10 +63,15 @@ version=${YOLOBRIDGE_VERSION:-latest}
 case "$version" in ''|.*|-*|*[!a-zA-Z0-9.-]*) fail 'Invalid YOLOBRIDGE_VERSION.' ;; esac
 
 # A global install writes to npm's prefix. When that is root-owned (a system
-# Node), say so instead of reaching for sudo.
+# Node), say so instead of reaching for sudo. npm creates missing folders, so
+# judge each target by its nearest existing ancestor (a fresh prefix has none).
 prefix=$(npm prefix -g 2>/dev/null) || fail 'Could not read npm'"'"'s global prefix.'
-if [ -d "$prefix/lib/node_modules" ]; then modules=$prefix/lib/node_modules; else modules=$prefix/lib; fi
-if [ ! -w "$modules" ] || { [ -d "$prefix/bin" ] && [ ! -w "$prefix/bin" ]; }; then
+writable() {
+    target=$1
+    while [ ! -e "$target" ]; do target=$(dirname "$target"); done
+    [ -w "$target" ]
+}
+if ! writable "$prefix/lib/node_modules" || ! writable "$prefix/bin"; then
     fail "npm installs global packages into $prefix, which needs sudo. This script won't use sudo.
   Use a Node version manager (nvm, fnm or volta), or point npm at a folder you own:
     npm config set prefix \"\$HOME/.npm-global\"

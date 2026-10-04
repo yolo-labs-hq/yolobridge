@@ -63,7 +63,9 @@
 
     h2 { font-size: 15px; font-weight: 700; color: var(--foam); margin: 0 0 14px; letter-spacing: -.01em; }
     .steps-wrap { margin-top: 52px; }
-    /* A real sequence (each step waits on the one before), so it is numbered. */
+    /* A real sequence (each step waits on the one before), so it is numbered.
+       Each item's text sits in one <span>: the li is a grid, so bare inline
+       <code> children would each become their own grid cell. */
     .steps { list-style: none; margin: 0; padding: 0; counter-reset: step; display: grid; gap: 10px; }
     .steps li { counter-increment: step; display: grid; grid-template-columns: 2.2em 1fr; color: var(--muted); font-size: 15px; line-height: 1.6; }
     .steps li::before { content: counter(step); color: var(--green); font-weight: 700; }
@@ -110,10 +112,10 @@
   <section class="steps-wrap" aria-labelledby="steps-heading">
     <h2 id="steps-heading">What happens when you run it</h2>
     <ol class="steps">
-      <li>The script installs <code>yolo-bridge</code> with npm.</li>
-      <li><code>yolo-bridge login</code> signs you in to YOLO Studio through a browser link.</li>
-      <li><code>yolo-bridge attach</code> lets you pick a workspace and starts your agent in this terminal.</li>
-      <li>Your agent appears in the workspace as a tile, with the same workspace tools a cloud agent gets.</li>
+      <li><span>The script installs <code>yolo-bridge</code> with npm.</span></li>
+      <li><span><code>yolo-bridge login</code> signs you in to YOLO Studio through a browser link.</span></li>
+      <li><span><code>yolo-bridge attach</code> lets you pick a workspace and starts your agent in this terminal.</span></li>
+      <li><span>Your agent appears in the workspace as a tile, with the same workspace tools a cloud agent gets.</span></li>
     </ol>
     <p class="dry-run">Nothing connects in to your machine: the bridge dials out and holds one stream. Files leave only when shared, by you or by your agent from paths you <code>allow</code>.</p>
   </section>
