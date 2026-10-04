@@ -12,10 +12,13 @@ yolo-bridge itself ships through npm as `@yolo-labs/yolobridge`.
 | `GET /` from a browser (`Sec-Fetch-Dest: document` or `Accept: text/html`) | `landing.html`, with the installer banner embedded |
 | `GET /` from anything else (curl, wget) | `install.sh`, byte for byte |
 | `GET /install.sh`, `GET /?raw` | `install.sh`, even in a browser |
-| `/favicon.ico`, `/apple-touch-icon.png` | icons |
+| `GET /` from a link-preview or search crawler (Slackbot, Twitterbot, ...) | `landing.html`, for its og:/twitter: tags |
+| `/favicon.ico`, `/apple-touch-icon.png`, `/og.png` | icons and the 1200×630 social card |
 
-No User-Agent sniffing. Every response is `Cache-Control: no-store` with
-`Vary: Accept, Sec-Fetch-Dest`.
+The only User-Agent rule is that crawler allow-list (`isPreviewBot`); curl and
+wget never match it. Every response is `Cache-Control: no-store` with
+`Vary: Accept, Sec-Fetch-Dest, User-Agent`. Regenerate the social card with
+`python3 scripts/site-og-cards.py` (monorepo root; needs Pillow).
 
 ## The installer
 
