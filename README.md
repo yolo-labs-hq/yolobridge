@@ -5,13 +5,13 @@ Attach the coding agent on your own machine — Claude Code, Codex, or another t
 `yolo-bridge` is a small local daemon. It runs your agent in a real terminal on your machine. You keep driving that session yourself, and prompts sent from the workspace land in the same session. The agent's screen streams back to the tile, and the agent gets the same workspace-wide YOLO Studio tools a cloud-hosted agent tile has.
 
 ```sh
-npm install -g @yolo-labs/yolobridge
+curl -fsSL https://yolobridge.sh | sh   # checks for Node 20+, installs with npm, never uses sudo
 
 yolo-bridge login          # one-time device-authorization sign-in
 yolo-bridge attach         # pick a workspace; spawns `claude` and attaches it
 ```
 
-Requires Node.js 20+.
+Requires Node.js 20+. Prefer npm directly? `npm install -g @yolo-labs/yolobridge` installs the same package. The installer and its site live in [`site/`](./site).
 
 ## How it works
 
