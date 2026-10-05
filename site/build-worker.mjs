@@ -4,12 +4,14 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 // build and the tests. Same shape as yolostart-sh/build-worker.mjs, minus the
 // release assets: yolo-bridge itself ships through npm, so this site serves only
 // the installer, the landing page and its icons.
-export async function buildWorker(outputDirectory) {
+// `analyticsHtml` fills the landing page's <!-- ANALYTICS --> slot (the GA tag,
+// from build.mjs); omitted, the page carries no analytics — what tests render.
+export async function buildWorker(outputDirectory, {analyticsHtml = ''} = {}) {
   const script = await readFile(new URL('./install.sh', import.meta.url), 'utf8');
   const banner = script.match(/cat <<'BANNER'\n([\s\S]*?)\nBANNER\n/)?.[1];
   if (!banner) throw Error('Installer banner missing');
   const template = await readFile(new URL('./landing.html', import.meta.url), 'utf8');
-  for (const slot of ['<!-- INSTALL_BANNER -->', '<!-- OCTOPUS_SVG -->', '<!-- ICON_SVG -->']) {
+  for (const slot of ['<!-- INSTALL_BANNER -->', '<!-- OCTOPUS_SVG -->', '<!-- ICON_SVG -->', '<!-- ANALYTICS -->']) {
     if (template.split(slot).length !== 2) throw Error(`Landing slot ${slot} missing or duplicated`);
   }
   const escapeHtml = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -19,7 +21,8 @@ export async function buildWorker(outputDirectory) {
   const octopus = svg.replace(/^<\?xml[^>]*>\s*/, '').replace('<svg ', '<svg class="mark" aria-hidden="true" focusable="false" ');
   const landing = template.replace('<!-- INSTALL_BANNER -->', () => escapeHtml(banner))
     .replace('<!-- OCTOPUS_SVG -->', () => octopus)
-    .replace('<!-- ICON_SVG -->', () => 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64'));
+    .replace('<!-- ICON_SVG -->', () => 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64'))
+    .replace('<!-- ANALYTICS -->', () => analyticsHtml);
   const icons = {};
   for (const [path, type] of [['favicon.ico', 'image/x-icon'], ['apple-touch-icon.png', 'image/png'], ['og.png', 'image/png']]) {
     icons['/' + path] = {type, bytes: (await readFile(new URL('./icons/' + path, import.meta.url))).toString('base64')};
