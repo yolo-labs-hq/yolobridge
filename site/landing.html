@@ -3,27 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="yolo-bridge attaches the coding agent on your own machine (Claude Code or Codex) to a YOLO Studio workspace as a first-class tile.">
+  <meta name="description" content="yolo-bridge brings the coding agent on your own machine (Claude Code or Codex) into a YOLO Studio workspace as a tile.">
   <meta name="theme-color" content="#04130d">
-  <title>yolobridge: your agent, in your workspace</title>
+  <title>yolo-bridge: your agent, in your workspace</title>
   <link rel="canonical" href="https://yolobridge.sh/">
   <!-- Link previews (Slack, X, LinkedIn, Discord, iMessage, ...). Crawlers get
        this page rather than the installer: see isPreviewBot in build-worker.mjs. -->
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="YOLO Studio">
   <meta property="og:url" content="https://yolobridge.sh/">
-  <meta property="og:title" content="yolobridge: your agent, in your workspace">
-  <meta property="og:description" content="yolo-bridge attaches the coding agent on your own machine (Claude Code or Codex) to a YOLO Studio workspace as a first-class tile.">
+  <meta property="og:title" content="yolo-bridge: your agent, in your workspace">
+  <meta property="og:description" content="yolo-bridge brings the coding agent on your own machine (Claude Code or Codex) into a YOLO Studio workspace as a tile.">
   <meta property="og:image" content="https://yolobridge.sh/og.png">
   <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="yolobridge: your own agent in your cloud workspace, with curl -fsSL https://yolobridge.sh | sh">
+  <meta property="og:image:alt" content="yolo-bridge: your own agent in your cloud workspace, with curl -fsSL https://yolobridge.sh | sh">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="yolobridge: your agent, in your workspace">
-  <meta name="twitter:description" content="yolo-bridge attaches the coding agent on your own machine (Claude Code or Codex) to a YOLO Studio workspace as a first-class tile.">
+  <meta name="twitter:title" content="yolo-bridge: your agent, in your workspace">
+  <meta name="twitter:description" content="yolo-bridge brings the coding agent on your own machine (Claude Code or Codex) into a YOLO Studio workspace as a tile.">
   <meta name="twitter:image" content="https://yolobridge.sh/og.png">
-  <meta name="twitter:image:alt" content="yolobridge: your own agent in your cloud workspace, with curl -fsSL https://yolobridge.sh | sh">
+  <meta name="twitter:image:alt" content="yolo-bridge: your own agent in your cloud workspace, with curl -fsSL https://yolobridge.sh | sh">
   <link rel="icon" href="/favicon.ico" sizes="32x32">
   <link rel="icon" type="image/svg+xml" href="<!-- ICON_SVG -->">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
@@ -119,10 +119,10 @@
 </head>
 <body>
 <main>
-  <a class="brand" href="https://yolo.studio"><!-- OCTOPUS_SVG --><span class="wordmark">yolobridge <span class="by">by YOLO Studio</span></span></a>
+  <a class="brand" href="https://yolo.studio"><!-- OCTOPUS_SVG --><span class="wordmark">yolo-bridge <span class="by">by YOLO Studio</span></span></a>
 
   <h1>Your own agent,<br>in your cloud workspace.</h1>
-  <p class="lede">yolo-bridge runs Claude Code or Codex on your machine and attaches it to a YOLO Studio workspace as a first-class tile. Prompts from the workspace land in the same session you keep driving locally.</p>
+  <p class="lede">yolo-bridge runs Claude Code or Codex on your machine and shows it in your YOLO Studio workspace as a tile, like any cloud agent. Prompts from the workspace land in the same session you keep driving locally.</p>
 
   <div class="hero">
     <div class="command-row">
@@ -141,7 +141,7 @@
       <li><span><code>yolo-bridge attach</code> lets you pick a workspace and starts your agent in this terminal.</span></li>
       <li><span>Your agent appears in the workspace as a tile, with the same workspace tools a cloud agent gets.</span></li>
     </ol>
-    <p class="dry-run">Nothing connects in to your machine: the bridge dials out and holds one stream. Files leave only when shared, by you or by your agent from paths you <code>allow</code>.</p>
+    <p class="dry-run">Nothing connects in to your machine: the bridge makes one outbound connection. It sends files only when you share them, or when your agent does from paths you <code>allow</code>. Your agent still runs as you, with your shell.</p>
   </section>
 
   <section class="alt">
@@ -155,7 +155,7 @@
 
   <details>
     <summary>The octopus you'll meet in your terminal</summary>
-    <pre class="banner" tabindex="0" aria-label="YOLO octopus and yolobridge terminal banner"><!-- INSTALL_BANNER --></pre>
+    <pre class="banner" tabindex="0" aria-label="YOLO octopus and yolo-bridge terminal banner"><!-- INSTALL_BANNER --></pre>
   </details>
   <footer>
     <a href="https://yolo.studio">YOLO Studio</a>
