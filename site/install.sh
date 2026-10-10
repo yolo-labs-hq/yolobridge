@@ -16,7 +16,7 @@ cat <<'BANNER'
 |    #     ## ####    #    YOUR AGENT JOINS THE WORKSPACE.                     |
 |    ###   ##   ##  ###                                                        |
 |      ##  #   ##  ##      Claude Code or Codex, running right here,           |
-|         ## ###           as a first-class tile in YOLO Studio.               |
+|         ## ###           as a tile in your YOLO Studio workspace.            |
 |         ##                                                                   |
 |          ###                                                                 |
 |                                                                              |
@@ -32,8 +32,8 @@ cat <<'BANNER'
 |                                                                              |
 | YOUR MACHINE, YOUR CALL                                                      |
 |   Nothing connects in. The daemon dials out and holds one stream.            |
-|   Files leave only when shared: by you, or by your agent from paths          |
-|   you allow. You keep driving the same session remote prompts land in.       |
+|   The bridge sends files only when you share them, or when your agent        |
+|   does from paths you allow. Your agent still runs as you.                   |
 |                                                                              |
 | PREFER NPM?  /  SAME PACKAGE                                                 |
 |   npm install -g @yolo-labs/yolobridge                                       |
@@ -44,7 +44,7 @@ BANNER
 if [ -t 1 ] && [ "${NO_COLOR+x}" != x ]; then printf '\033[0m'; fi
 printf '\n'
 
-fail() { printf 'yolobridge: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'yolo-bridge: %s\n' "$*" >&2; exit 1; }
 case "$(uname -s)" in
     Linux|Darwin) ;;
     *) fail 'Supported platforms: macOS and Linux (on Windows, run it inside WSL).' ;;
