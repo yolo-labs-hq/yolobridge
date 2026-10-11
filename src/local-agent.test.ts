@@ -317,6 +317,16 @@ describe('startLocalAgent / deliverPromptToLocalAgent / captureLocalAgentOutput 
     assert.deepEqual(sunk, ['hello from the agent\r\n'], 'the real terminal should see the same bytes');
   });
 
+  it('seeds the same Unicode 11 screen digest as the browser after emoji wrapping', async () => {
+    const fake = fakePty();
+    startLocalAgent({ agentBin: 'fake', cols: 12, rows: 4, stdout: { write: () => true }, stdin: undefined, spawnImpl: fake.spawnImpl });
+    // Same fixture as both screen-digest test files; exercise the daemon's
+    // actual terminal initialization, not just an independently built terminal.
+    fake.emitData('ab😀日本cd😀Z');
+    await captureLocalAgentOutput();
+    assert.equal(takeRawSeed()!.screenDigest, '022ffe44');
+  });
+
   it('reports busy: false once the busy window has elapsed with no new output', async () => {
     const fake = fakePty();
     startLocalAgent({
