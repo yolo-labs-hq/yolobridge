@@ -61,6 +61,7 @@ export type { DigestTerminal } from './screen-digest.js';
 // runtime, which does have `Terminal` on it.
 const require = createRequire(import.meta.url);
 const { Terminal } = require('@xterm/headless') as typeof import('@xterm/headless');
+const { Unicode11Addon } = require('@xterm/addon-unicode11') as typeof import('@xterm/addon-unicode11');
 
 /** Default agent binary: overridable via `--agent` (cli.ts) or this env var. */
 export const DEFAULT_AGENT_BIN = process.env.YOLOBRIDGE_AGENT_BIN || 'claude';
@@ -1001,6 +1002,9 @@ export function startLocalAgent(opts: StartLocalAgentOptions = {}): LocalAgentHa
   });
 
   const term = new Terminal({ cols, rows, allowProposedApi: true });
+  // Match YoloBridgeTerminalView so emoji widths and screen digests agree.
+  term.loadAddon(new Unicode11Addon());
+  term.unicode.activeVersion = '11';
 
   // A NEW PTY is a new byte stream: everything retained belongs to a screen
   // that no longer exists, and offsets restart. The fresh `epoch` is what a

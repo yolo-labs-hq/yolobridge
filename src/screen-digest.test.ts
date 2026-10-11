@@ -24,6 +24,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { Terminal } = require('@xterm/headless') as typeof import('@xterm/headless');
+const { Unicode11Addon } = require('@xterm/addon-unicode11') as typeof import('@xterm/addon-unicode11');
 import type { Terminal as TerminalType } from '@xterm/headless';
 
 import { screenDigest, type DigestTerminal } from './screen-digest.js';
@@ -34,6 +35,8 @@ function write(term: TerminalType, data: string): Promise<void> {
 
 async function terminal(data: string, cols = 12, rows = 4): Promise<TerminalType> {
   const term = new Terminal({ cols, rows, allowProposedApi: true });
+  term.loadAddon(new Unicode11Addon());
+  term.unicode.activeVersion = '11';
   await write(term, data);
   return term;
 }
@@ -49,8 +52,22 @@ const digest = (t: TerminalType) => screenDigest(t as unknown as DigestTerminal)
  */
 export const DIGEST_FIXTURE_BYTES = 'hi \x1b[1;38;5;196mred\x1b[0m\r\nplain 日本\r\n';
 export const DIGEST_FIXTURE_VALUE = '3c06d971';
+export const UNICODE_FIXTURE_BYTES = 'ab😀日本cd😀Z';
+export const UNICODE_FIXTURE_VALUE = '022ffe44';
 
 describe('screenDigest', () => {
+  it('matches the browser Unicode 11 emoji widths and wrapping', async () => {
+    const term = await terminal(UNICODE_FIXTURE_BYTES);
+    try {
+      assert.equal(term.buffer.active.getLine(0)!.getCell(2)!.getWidth(), 2);
+      assert.equal(term.buffer.active.cursorY, 1);
+      assert.equal(term.buffer.active.cursorX, 1);
+      assert.equal(digest(term), UNICODE_FIXTURE_VALUE);
+    } finally {
+      term.dispose();
+    }
+  });
+
   it('matches the value the webapp mirror must produce for the same bytes', async () => {
     assert.equal(digest(await terminal(DIGEST_FIXTURE_BYTES)), DIGEST_FIXTURE_VALUE);
   });
