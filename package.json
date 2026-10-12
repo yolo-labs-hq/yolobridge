@@ -1,6 +1,6 @@
 {
   "name": "@yolo-labs/yolobridge",
-  "version": "0.32.1",
+  "version": "0.32.2",
   "description": "Attach your own local coding agent (Claude Code, Codex) to a YOLO Studio workspace as a first-class tile.",
   "license": "MIT",
   "repository": {
