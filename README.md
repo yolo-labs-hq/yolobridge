@@ -52,6 +52,19 @@ Requires Node.js 20+. Prefer npm directly? `npm install -g @yolo-labs/yolobridge
 | `YOLOBRIDGE_AUTH_URL` | `https://auth.yololabs.ai` |
 | `YOLOBRIDGE_MCP_URL` | `https://services.yolo.studio` |
 
+Agent options go after a literal `--`; Bridge options go before it (requires 0.33.0):
+
+```sh
+yolo-bridge attach <workspace> --agent claude -- --model sonnet
+yolo-bridge attach <workspace> --agent claude -- --resume "session name"
+yolo-bridge attach <workspace> --agent claude -- --continue
+yolo-bridge attach <workspace> --agent codex -- resume --last
+```
+
+Supported options are Claude `--model`, `--resume`/`-r`, `--continue`/`-c`, and Codex `--model`/`-m`, `resume [SESSION|--last]`. Omit the session to open the agent's interactive picker. Quote values with spaces as usual. Custom binary paths need the matching `--agent-id claude` or `--agent-id codex`. Arguments pass directly to the installed executable, without a shell, alongside Bridge's existing MCP configuration. They apply when this invocation launches its agent; transport reconnects do not restart or reconfigure it. Installed agent versions must support the requested options; login and session selection use the normal agent UI.
+
+This initial compatibility surface rejects other options, including permission-mode overrides, configuration/MCP replacement flags and positional prompts, before attaching. It does not change existing agent permissions or provide OS isolation. No arguments preserves existing behavior for other agent binaries.
+
 Credentials, the current attachment and approved paths are stored under `~/.config/yolobridge/`.
 
 ## Troubleshooting
