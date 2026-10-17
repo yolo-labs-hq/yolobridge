@@ -38,7 +38,7 @@ import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
-import { validateAgentCliOptions, composeAgentArgv } from './agent-cli-options.js';
+import { composeAgentArgv } from './agent-cli-options.js';
 import { resolveAgentBinary } from './resolve-agent-binary.js';
 import { checkPtyHelper } from './check-pty-helper.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
@@ -125,7 +125,7 @@ function printHelp(): void {
       '                         finds a still-live attachment for this workspace on this machine',
       '                         RESUMES it (same tile) instead of adding a duplicate; --fresh skips',
       '                         that check entirely.',
-      '    [-- <agent-options>] Ordinary interactive options: model and resume (claude/codex).',
+      '    [-- <agent-args...>] Forward remaining arguments verbatim to the local agent.',
       '                         Examples: -- --model sonnet; -- resume --last (codex).',
       '  detach                 Detach the current workspace attachment.',
       '  allow <path>           Let the ATTACHED AGENT send files from this path. You type',
@@ -167,7 +167,7 @@ export interface AttachArgs {
   /** `--fresh` — never resume a stored attachment; always create a new one.
    *  A bare boolean flag, so unlike the three above it consumes no value. */
   fresh?: boolean;
-  /** Tokens after --, validated before any attach/network side effects. */
+  /** Tokens after --, forwarded verbatim as distinct argv entries. */
   agentArgs?: string[];
 }
 
@@ -309,11 +309,6 @@ async function cmdAttach(args: string[]): Promise<number> {
   // far (claude, codex).
   const resolvedAgentId = parsed.agentId ?? agentBin ?? DEFAULT_AGENT_BIN;
   const agentArgs = parsed.agentArgs ?? [];
-  const optionError = validateAgentCliOptions(resolvedAgentId, agentArgs);
-  if (optionError) {
-    process.stderr.write(`yolo-bridge attach: ${optionError}\n`);
-    return 64;
-  }
   // The string actually spawned — and therefore the one whose `--help` is
   // authoritative about which flags it accepts (`buildAgentMcpArgs`).
   // `startLocalAgent` applies the same default, so probing anything else
@@ -558,8 +553,8 @@ async function cmdAttach(args: string[]): Promise<number> {
             agentBin,
             // Empty unless the MCP block above successfully resolved argv
             // for THIS agent binary — a probe that came back without the
-            // flags leaves the MCP portion empty. Explicit supported user
-            // options follow it as separate argv entries, never shell text.
+            // flags leaves the MCP portion empty. User arguments follow it
+            // as separate argv entries, never shell text.
             agentArgs: composeAgentArgv(agentMcpArgs, agentArgs),
             cwd: spawnCwd,
             // The daemon's only reachable stop key. `process.on('SIGINT')`
