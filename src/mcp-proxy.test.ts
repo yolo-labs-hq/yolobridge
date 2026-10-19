@@ -176,6 +176,22 @@ describe('startMcpProxy', () => {
     assert.deepEqual(mintAuths, ['Bearer account-tok-1', 'Bearer account-tok-2']);
   });
 
+  it('the startup timeout also bounds a HUNG account-token renewal, so the attach still proceeds without MCP', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const started = Date.now();
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com',
+      getAccessToken: () => new Promise<string>(() => {}), // auth-service went quiet
+      workspaceId: 'w1',
+      agentId: 'claude',
+      fetchImpl: makeFetch({}),
+      log: () => {},
+      mintTimeoutMs: 50,
+    });
+    assert.equal(handle, undefined, 'MCP is skipped rather than blocking the agent from starting');
+    assert.ok(Date.now() - started < 2000, 'returned on the startup timeout, not on the hung renewal');
+  });
+
   it('does not inject a token into a non-tools/call request (e.g. initialize)', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     let forwardedBody: any;

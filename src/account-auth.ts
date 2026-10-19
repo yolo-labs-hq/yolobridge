@@ -127,7 +127,13 @@ export async function rotateAccountAuth(current: StoredAuth, deps: AccountAuthDe
     onDisk &&
     (onDisk.refreshToken === current.refreshToken || (sameAccount(onDisk, auth) && onDisk.expiresAtMs < auth.expiresAtMs))
   ) {
-    saveAuth(auth, deps.env, deps.io);
+    try {
+      saveAuth(auth, deps.env, deps.io);
+    } catch {
+      // The presented refresh token is already spent; throwing here would
+      // discard its only successor. Hand the pair back for in-memory use and
+      // let the next rotation try the write again.
+    }
   }
   return { ok: true, auth };
 }

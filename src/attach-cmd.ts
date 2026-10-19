@@ -259,8 +259,8 @@ export interface AttachDaemonDeps {
      *  first mint. */
     accessToken: string;
     /** Live getter for the account access token, reflecting this daemon's
-     *  own in-progress `ensureFreshToken` refreshes (Bug 2) — NOT a snapshot
-     *  like `accessToken` above. A long-running MCP proxy started here must
+     *  own rotations — NOT a snapshot like `accessToken` above. (The MCP
+     *  proxy uses `getFreshAccessToken` below, which also renews on demand.) A long-running MCP proxy started here must
      *  call this on every mint, not close over the initial `accessToken`:
      *  the daemon rotates its token roughly every 24h and a proxy holding a
      *  stale one would 401 on every mint forever once that happens (Codex
@@ -458,8 +458,9 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   /**
-   * Proactive refresh (Bug 2 fix): checked before opening/reopening the
-   * stream and on every heartbeat tick while connected, so the daemon
+   * Proactive refresh (Bug 2 fix): run before the attach itself, and — via the
+   * best-effort `ensureFreshAccountTokenOnce` wrapper below — before each
+   * (re)connect, on heartbeat ticks and on demand for MCP mints, so the daemon
    * rotates its access token well before the 24h production expiry
    * instead of degrading into a silent zombie that just starts 401ing.
    * Updates the in-memory `accountCfg`/`currentAuth` used by `attach` AND the

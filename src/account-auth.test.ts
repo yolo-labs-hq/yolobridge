@@ -112,6 +112,22 @@ describe('ensureFreshAccountAuth', () => {
     assert.equal(loadAuth(ENV, io)?.refreshToken, 'rt-2');
   });
 
+  it('still returns the new pair when persisting it fails — the old refresh token is already spent', async () => {
+    const io = fakeIO();
+    saveAuth(stored(), ENV, io);
+    io.writeFile = () => { throw new Error('ENOSPC'); };
+    const result = await ensureFreshAccountAuth({
+      env: ENV,
+      io,
+      now: () => T0 + 2 * 3600_000,
+      refreshAccessToken: async () => ({
+        status: 'ok',
+        tokens: { accessToken: 'at-2', refreshToken: 'rt-2', expiresInSec: 1, expiresAtMs: T0 + 86_400_000 },
+      }),
+    });
+    assert.equal(result.ok && result.auth.refreshToken, 'rt-2');
+  });
+
   it('keeps the stored login on a RETRYABLE failure', async () => {
     const io = fakeIO();
     saveAuth(stored(), ENV, io);

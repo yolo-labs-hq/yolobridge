@@ -236,6 +236,16 @@ async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl, tracker: Req
   });
 }
 
+/** Settles with `promise`, or rejects as soon as `signal` aborts. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 /** One cached, self-refreshing, workspace-wide token — scoped to whatever
  *  `agentId`'s registry entry actually allows out of the full scope
  *  universe (see this file's header comment). */
@@ -252,8 +262,11 @@ function makeTokenCache(
 
   async function mint(): Promise<MintResult> {
     const scopes = await fetchAllScopes(apiUrl, fetchImpl, tracker);
-    const accessToken = await getAccessToken();
     return tracker.run(async (signal) => {
+      // Inside the tracked call, and abortable: the getter may be renewing the
+      // account token, and the startup timeout's `abortAll()` must be able to
+      // cut that wait short like any other request.
+      const accessToken = await untilAborted(Promise.resolve(getAccessToken()), signal);
       const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
