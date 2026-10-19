@@ -63,7 +63,7 @@ export type RefreshTokenResult =
   /** `retryable`: the call never got a verdict (network error, 5xx, 429), so
    *  the refresh token may still be good and a later attempt can succeed.
    *  Absent/false means auth-service refused it. */
-  | { status: 'failed'; message: string; retryable?: boolean };
+  | { status: 'failed'; message: string; retryable?: boolean; refused?: boolean };
 
 export type FetchImpl = typeof fetch;
 
@@ -194,6 +194,10 @@ export async function refreshAccessToken(
       status: 'failed',
       message: extractErrorMessage(body) || `refresh failed: ${res.status}`,
       retryable: res.status >= 500 || res.status === 429,
+      // auth-service's own verdict on the token (revoked, expired, invalid) —
+      // as opposed to a 404/400 from a proxy or a wrong base URL, which says
+      // nothing about whether the login is still live.
+      ...(res.status === 401 || res.status === 403 ? { refused: true } : {}),
     };
   }
   const tokens = body?.tokens;
@@ -217,10 +221,13 @@ export async function refreshAccessToken(
 
 export type LogoutResult =
   | { status: 'revoked' }
-  /** 401: auth-service no longer accepts this access token (already signed
-   *  out, or expired). Nothing is left for it to revoke. */
+  /** 401: auth-service did not accept this ACCESS token. That alone does NOT
+   *  mean the sign-in is gone — `authenticateForLogout` 401s on clock skew, a
+   *  lost Redis session key or a transient DB error too, while the refresh
+   *  lineage may still be live. Callers must confirm via a renewal. */
   | { status: 'unauthorized'; message: string }
-  | { status: 'failed'; message: string };
+  /** `retryable`: no verdict was reached (network, 5xx, 429). */
+  | { status: 'failed'; message: string; retryable: boolean };
 
 /**
  * `POST /api/v1/auth/logout` — ends the sign-in this access token belongs to
@@ -247,12 +254,12 @@ export async function logoutSession(
     });
     body = await safeJson(res);
   } catch (err) {
-    return { status: 'failed', message: err instanceof Error ? err.message : String(err) };
+    return { status: 'failed', message: err instanceof Error ? err.message : String(err), retryable: true };
   }
   if (res.ok) return { status: 'revoked' };
   const message = extractErrorMessage(body) || `logout failed: ${res.status}`;
   if (res.status === 401) return { status: 'unauthorized', message };
-  return { status: 'failed', message };
+  return { status: 'failed', message, retryable: res.status >= 500 || res.status === 429 };
 }
 
 async function safeJson(res: Response): Promise<any> {

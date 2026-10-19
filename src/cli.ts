@@ -172,8 +172,10 @@ async function cmdLogout(): Promise<number> {
     return 0;
   }
   process.stderr.write(
-    `yolo-bridge logout: could not revoke the login (${result.message}). `
-      + 'Local credentials were kept so you can retry; check your connection and run `yolo-bridge logout` again.\n',
+    `yolo-bridge logout: could not revoke the login (${result.message}). Local credentials were kept. `
+      + (result.retryable
+        ? 'Check your connection and run `yolo-bridge logout` again.\n'
+        : 'Retrying will not help; check YOLOBRIDGE_AUTH_URL, or use "Sign out everywhere" in the web app.\n'),
   );
   return 1;
 }

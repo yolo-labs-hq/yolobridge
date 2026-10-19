@@ -55,7 +55,7 @@ export type RotateAccountAuthResult =
   /** `retryable`: auth-service was unreachable or erroring, so the stored
    *  login may still be good — distinct from a refusal, which needs a new
    *  `yolo-bridge login`. */
-  | { ok: false; message: string; retryable: boolean };
+  | { ok: false; message: string; retryable: boolean; refused?: boolean };
 
 export function needsRefresh(auth: StoredAuth, now: number, refreshBufferMs = DEFAULT_REFRESH_BUFFER_MS): boolean {
   return now >= auth.expiresAtMs - refreshBufferMs;
@@ -114,7 +114,7 @@ export async function rotateAccountAuth(current: StoredAuth, deps: AccountAuthDe
   const doRefresh = deps.refreshAccessToken ?? refreshAccessTokenApi;
   const result = await doRefresh(deps.authBaseUrl ?? defaultAuthBaseUrl(deps.env), current.refreshToken, deps.fetchImpl);
   if (result.status !== 'ok') {
-    return { ok: false, message: result.message, retryable: result.retryable === true };
+    return { ok: false, message: result.message, retryable: result.retryable === true, ...(result.refused ? { refused: true } : {}) };
   }
   const auth: StoredAuth = {
     accessToken: result.tokens.accessToken,
@@ -141,7 +141,7 @@ export async function rotateAccountAuth(current: StoredAuth, deps: AccountAuthDe
 export type FreshAccountAuthResult =
   | { ok: true; auth: StoredAuth }
   | { ok: false; reason: 'not-logged-in' }
-  | { ok: false; reason: 'refresh-failed'; message: string; retryable: boolean };
+  | { ok: false; reason: 'refresh-failed'; message: string; retryable: boolean; refused?: boolean };
 
 /**
  * Load `auth.json` and return a usable account credential, renewing it first
@@ -154,7 +154,15 @@ export async function ensureFreshAccountAuth(deps: AccountAuthDeps = {}): Promis
   const now = deps.now ?? Date.now;
   if (!needsRefresh(auth, now(), deps.refreshBufferMs)) return { ok: true, auth };
   const rotated = await rotateAccountAuth(auth, deps);
-  if (!rotated.ok) return { ok: false, reason: 'refresh-failed', message: rotated.message, retryable: rotated.retryable };
+  if (!rotated.ok) {
+    return {
+      ok: false,
+      reason: 'refresh-failed',
+      message: rotated.message,
+      retryable: rotated.retryable,
+      ...(rotated.refused ? { refused: true } : {}),
+    };
+  }
   return rotated;
 }
 

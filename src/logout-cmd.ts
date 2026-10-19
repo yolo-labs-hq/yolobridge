@@ -17,7 +17,7 @@
  * needs that record to authenticate.
  */
 
-import { ensureFreshAccountAuth, defaultAuthBaseUrl, type RefreshTokenFn } from './account-auth.js';
+import { ensureFreshAccountAuth, defaultAuthBaseUrl, rotateAccountAuth, type RefreshTokenFn } from './account-auth.js';
 import { logoutSession, type FetchImpl, type LogoutResult } from './device-auth.js';
 import { clearAuth, loadAttachment, loadAuth, type ConfigStoreIO } from './config-store.js';
 
@@ -37,43 +37,66 @@ export type LogoutCmdResult =
       ok: true;
       /**
        * - `revoked`          — auth-service ended the sign-in; file deleted.
-       * - `already-revoked`  — auth-service had already refused it; file deleted.
-       * - `local-only`       — nothing usable to present (expired access token,
-       *                        no refresh token); file deleted, nothing revoked.
+       * - `already-revoked`  — auth-service REFUSED the refresh token (401/403
+       *                        from `/refresh`), i.e. its own verdict that the
+       *                        login is dead; file deleted.
+       * - `local-only`       — the file had no refresh token and an expired
+       *                        access token, so nothing on THIS machine could
+       *                        present the sign-in; file deleted, nothing revoked.
        * - `not-logged-in`    — there was no `auth.json`.
        */
       outcome: 'revoked' | 'already-revoked' | 'local-only' | 'not-logged-in';
       /** Set when this machine is still attached — logout does not detach. */
       attachedWorkspaceId?: string;
     }
-  | { ok: false; reason: 'revoke-failed'; message: string };
+  /** `auth.json` is KEPT. `retryable` is false when retrying cannot help. */
+  | { ok: false; reason: 'revoke-failed'; message: string; retryable: boolean };
+
+type Outcome = Extract<LogoutCmdResult, { ok: true }>['outcome'];
 
 export async function runLogout(deps: LogoutDeps = {}): Promise<LogoutCmdResult> {
   const authBaseUrl = deps.authBaseUrl ?? defaultAuthBaseUrl(deps.env);
   const attachedWorkspaceId = loadAttachment(deps.env, deps.io)?.workspaceId;
-  const withAttachment = attachedWorkspaceId ? { attachedWorkspaceId } : {};
+  const done = (outcome: Outcome): LogoutCmdResult => {
+    if (outcome !== 'not-logged-in') clearAuth(deps.env, deps.io);
+    return { ok: true, outcome, ...(attachedWorkspaceId ? { attachedWorkspaceId } : {}) };
+  };
+  const keep = (message: string, retryable: boolean): LogoutCmdResult => ({ ok: false, reason: 'revoke-failed', message, retryable });
+  const accountDeps = { ...deps, authBaseUrl };
+  const revoke = deps.logoutSession ?? logoutSession;
 
   const stored = loadAuth(deps.env, deps.io);
-  if (!stored) return { ok: true, outcome: 'not-logged-in', ...withAttachment };
+  if (!stored) return done('not-logged-in');
 
   // `/logout` authenticates with the ACCESS token, so an expired one is renewed
   // first. The renewal continues the same lineage, which the logout then ends.
-  const fresh = await ensureFreshAccountAuth({ ...deps, authBaseUrl });
+  const fresh = await ensureFreshAccountAuth(accountDeps);
   if (!fresh.ok) {
-    if (fresh.reason === 'not-logged-in') return { ok: true, outcome: 'not-logged-in', ...withAttachment };
-    if (fresh.retryable) {
-      return { ok: false, reason: 'revoke-failed', message: fresh.message };
-    }
-    // Refused outright, or there was never a refresh token to renew with.
-    clearAuth(deps.env, deps.io);
-    return { ok: true, outcome: stored.refreshToken ? 'already-revoked' : 'local-only', ...withAttachment };
+    if (fresh.reason === 'not-logged-in') return done('not-logged-in');
+    if (!stored.refreshToken) return done('local-only');
+    // Only auth-service refusing the refresh token proves the login is dead.
+    // A 404 from a proxy or a garbled response proves nothing, so keep the
+    // file rather than claim a logout that did not happen.
+    return fresh.refused ? done('already-revoked') : keep(fresh.message, fresh.retryable);
   }
 
-  const revoke = deps.logoutSession ?? logoutSession;
-  const result = await revoke(authBaseUrl, fresh.auth.accessToken, deps.fetchImpl);
-  if (result.status === 'failed') return { ok: false, reason: 'revoke-failed', message: result.message };
-  clearAuth(deps.env, deps.io);
-  return { ok: true, outcome: result.status === 'revoked' ? 'revoked' : 'already-revoked', ...withAttachment };
+  let result = await revoke(authBaseUrl, fresh.auth.accessToken, deps.fetchImpl);
+  if (result.status === 'unauthorized') {
+    // The ACCESS token was rejected, but the sign-in may well be alive — this
+    // 401 also covers clock skew, a lost session key and transient DB errors.
+    // The refresh token is the durable credential, so ask it: a renewal that
+    // succeeds gets a token to retry the logout with; one auth-service refuses
+    // is the proof that nothing is left to revoke.
+    if (!fresh.auth.refreshToken) return done('local-only');
+    const renewed = await rotateAccountAuth(fresh.auth, accountDeps);
+    if (!renewed.ok) return renewed.refused ? done('already-revoked') : keep(renewed.message, renewed.retryable);
+    result = await revoke(authBaseUrl, renewed.auth.accessToken, deps.fetchImpl);
+    if (result.status === 'unauthorized') {
+      return keep(`auth-service rejected a freshly renewed token (${result.message})`, false);
+    }
+  }
+  if (result.status === 'failed') return keep(result.message, result.retryable);
+  return done('revoked');
 }
 
 export function formatLogout(result: Extract<LogoutCmdResult, { ok: true }>): string {
@@ -86,7 +109,10 @@ export function formatLogout(result: Extract<LogoutCmdResult, { ok: true }>): st
       lines.push('Logged out. The sign-in was already revoked; local credentials removed.');
       break;
     case 'local-only':
-      lines.push('Removed local credentials. The stored login had expired, so there was nothing left to revoke.');
+      lines.push(
+        'Removed local credentials. They had expired and held no refresh token, so nothing could be '
+          + 'revoked from this machine. To end every copy of an older login, use "Sign out everywhere" in the web app.',
+      );
       break;
     case 'not-logged-in':
       lines.push('Not logged in.');

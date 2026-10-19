@@ -139,7 +139,9 @@ describe('refreshAccessToken', () => {
     const down = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(503, { error: { message: 'unavailable' } })));
     assert.deepEqual(down, { status: 'failed', message: 'unavailable', retryable: true });
     const refused = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(401, { error: { message: 'Refresh token revoked' } })));
-    assert.deepEqual(refused, { status: 'failed', message: 'Refresh token revoked', retryable: false });
+    assert.deepEqual(refused, { status: 'failed', message: 'Refresh token revoked', retryable: false, refused: true });
+    const proxy404 = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(404, {})));
+    assert.deepEqual(proxy404, { status: 'failed', message: 'refresh failed: 404', retryable: false });
   });
 
   it('parses the rotated pair', async () => {
@@ -172,8 +174,10 @@ describe('logoutSession', () => {
     const unauthorized = await logoutSession('https://a', 'at', fetchStub(() => jsonResponse(401, { error: { message: 'Token revoked' } })));
     assert.deepEqual(unauthorized, { status: 'unauthorized', message: 'Token revoked' });
     const down = await logoutSession('https://a', 'at', fetchStub(() => jsonResponse(503, {})));
-    assert.deepEqual(down, { status: 'failed', message: 'logout failed: 503' });
+    assert.deepEqual(down, { status: 'failed', message: 'logout failed: 503', retryable: true });
     const offline = await logoutSession('https://a', 'at', (async () => { throw new TypeError('fetch failed'); }) as unknown as FetchImpl);
-    assert.deepEqual(offline, { status: 'failed', message: 'fetch failed' });
+    assert.deepEqual(offline, { status: 'failed', message: 'fetch failed', retryable: true });
+    const permanent = await logoutSession('https://a', 'at', fetchStub(() => jsonResponse(400, { error: { message: 'logout-needs-session' } })));
+    assert.deepEqual(permanent, { status: 'failed', message: 'logout-needs-session', retryable: false });
   });
 });

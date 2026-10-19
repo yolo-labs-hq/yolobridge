@@ -70,9 +70,9 @@ describe('runLogout', () => {
     const io = fakeIO();
     saveAuth(stored(), ENV, io);
     const result = await runLogout(deps(io, {
-      logoutSession: async (): Promise<LogoutResult> => ({ status: 'failed', message: 'fetch failed' }),
+      logoutSession: async (): Promise<LogoutResult> => ({ status: 'failed', message: 'fetch failed', retryable: true }),
     }));
-    assert.deepEqual(result, { ok: false, reason: 'revoke-failed', message: 'fetch failed' });
+    assert.deepEqual(result, { ok: false, reason: 'revoke-failed', message: 'fetch failed', retryable: true });
     assert.deepEqual(loadAuth(ENV, io), stored());
   });
 
@@ -87,34 +87,103 @@ describe('runLogout', () => {
     assert.ok(loadAuth(ENV, io));
   });
 
-  it('treats a 401 from /logout as already revoked and still removes the file', async () => {
+  it('a 401 from /logout is NOT proof of revocation: it renews and retries the logout once', async () => {
+    // e.g. clock skew — the access token looked fresh locally but the server
+    // rejected it — while the refresh lineage is still perfectly live.
+    const io = fakeIO();
+    saveAuth(stored(), ENV, io);
+    const presented: string[] = [];
+    const result = await runLogout(deps(io, {
+      refreshAccessToken: async () => ({
+        status: 'ok',
+        tokens: { accessToken: 'at-2', refreshToken: 'rt-2', expiresInSec: 86_400, expiresAtMs: T0 + 86_400_000 },
+      }),
+      logoutSession: async (_url, token) => {
+        presented.push(token);
+        return token === 'at-1' ? { status: 'unauthorized', message: 'Invalid token' } : { status: 'revoked' };
+      },
+    }));
+    assert.deepEqual(result, { ok: true, outcome: 'revoked' });
+    assert.deepEqual(presented, ['at-1', 'at-2']);
+    assert.equal(loadAuth(ENV, io), undefined);
+  });
+
+  it('after a 401, only auth-service REFUSING the refresh token counts as already revoked', async () => {
     const io = fakeIO();
     saveAuth(stored(), ENV, io);
     const result = await runLogout(deps(io, {
-      logoutSession: async () => ({ status: 'unauthorized', message: 'Token revoked' }),
+      refreshAccessToken: async () => ({ status: 'failed', message: 'Refresh token revoked', refused: true }),
+      logoutSession: async () => ({ status: 'unauthorized', message: 'Invalid token' }),
     }));
     assert.deepEqual(result, { ok: true, outcome: 'already-revoked' });
     assert.equal(loadAuth(ENV, io), undefined);
   });
 
-  it('treats a REFUSED renewal as already revoked', async () => {
+  it('after a 401, a renewal that reaches no verdict KEEPS the file', async () => {
+    const io = fakeIO();
+    saveAuth(stored(), ENV, io);
+    const result = await runLogout(deps(io, {
+      refreshAccessToken: async () => ({ status: 'failed', message: 'fetch failed', retryable: true }),
+      logoutSession: async () => ({ status: 'unauthorized', message: 'Invalid token' }),
+    }));
+    assert.deepEqual(result, { ok: false, reason: 'revoke-failed', message: 'fetch failed', retryable: true });
+    assert.ok(loadAuth(ENV, io));
+  });
+
+  it('a renewed token that is STILL rejected keeps the file and says retrying will not help', async () => {
+    const io = fakeIO();
+    saveAuth(stored(), ENV, io);
+    const result = await runLogout(deps(io, {
+      refreshAccessToken: async () => ({
+        status: 'ok',
+        tokens: { accessToken: 'at-2', refreshToken: 'rt-2', expiresInSec: 86_400, expiresAtMs: T0 + 86_400_000 },
+      }),
+      logoutSession: async () => ({ status: 'unauthorized', message: 'Invalid token' }),
+    }));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.retryable, false);
+    assert.ok(loadAuth(ENV, io));
+  });
+
+  it('an expired token whose renewal is REFUSED counts as already revoked', async () => {
     const io = fakeIO();
     saveAuth(stored({ expiresAtMs: T0 - 1 }), ENV, io);
     const result = await runLogout(deps(io, {
-      refreshAccessToken: async () => ({ status: 'failed', message: 'Refresh token revoked' }),
+      refreshAccessToken: async () => ({ status: 'failed', message: 'Refresh token revoked', refused: true }),
       logoutSession: async () => { throw new Error('must not be called'); },
     }));
     assert.deepEqual(result, { ok: true, outcome: 'already-revoked' });
     assert.equal(loadAuth(ENV, io), undefined);
   });
 
-  it('with an expired token and no refresh token, removes the file locally and says nothing was revoked', async () => {
+  it('a non-refusal renewal failure (proxy 404, garbled 200) keeps the file instead of claiming a logout', async () => {
+    const io = fakeIO();
+    saveAuth(stored({ expiresAtMs: T0 - 1 }), ENV, io);
+    const result = await runLogout(deps(io, {
+      refreshAccessToken: async () => ({ status: 'failed', message: 'refresh failed: 404' }),
+      logoutSession: async () => { throw new Error('must not be called'); },
+    }));
+    assert.equal(result.ok, false);
+    assert.ok(loadAuth(ENV, io));
+  });
+
+  it('a permanent /logout failure (4xx) is reported as not worth retrying', async () => {
+    const io = fakeIO();
+    saveAuth(stored(), ENV, io);
+    const result = await runLogout(deps(io, {
+      logoutSession: async () => ({ status: 'failed', message: 'logout-needs-session', retryable: false }),
+    }));
+    assert.deepEqual(result, { ok: false, reason: 'revoke-failed', message: 'logout-needs-session', retryable: false });
+    assert.ok(loadAuth(ENV, io));
+  });
+
+  it('with an expired token and no refresh token, removes the file locally and points at Sign out everywhere', async () => {
     const io = fakeIO();
     saveAuth(stored({ expiresAtMs: T0 - 1, refreshToken: undefined }), ENV, io);
     const result = await runLogout(deps(io, { logoutSession: async () => { throw new Error('must not be called'); } }));
     assert.deepEqual(result, { ok: true, outcome: 'local-only' });
     assert.equal(loadAuth(ENV, io), undefined);
-    assert.match(formatLogout(result as Extract<typeof result, { ok: true }>), /nothing left to revoke/);
+    assert.match(formatLogout(result as Extract<typeof result, { ok: true }>), /Sign out everywhere/);
   });
 
   it('is a no-op success when not logged in', async () => {
