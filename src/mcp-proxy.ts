@@ -368,6 +368,9 @@ function makeTokenCache(
     async getToken(): Promise<string> {
       if (cached && Date.now() < cached.expiresAtMs - REFRESH_BUFFER_MS) return cached.token;
       if (failure && Date.now() < failure.until) {
+        // An early refresh failed, but the token it was replacing may still
+        // be valid for the rest of its life — use it rather than 503.
+        if (cached && Date.now() < cached.expiresAtMs) return cached.token;
         throw new TokenUnavailableError(failure.message, false, failure.until - Date.now());
       }
       try {
@@ -377,6 +380,7 @@ function makeTokenCache(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         failure = { until: Date.now() + mintFailureBackoffMs, message };
+        if (cached && Date.now() < cached.expiresAtMs) return cached.token;
         if (err instanceof TokenUnavailableError && err.permanent) throw err;
         throw new TokenUnavailableError(message, false, mintFailureBackoffMs);
       }
@@ -884,7 +888,12 @@ async function handleRequest(
   // retry would send the operator's local file path to the cloud — breaking the
   // local-only invariant on the one path that skips the interception. (codex
   // P1, gpt-5.6-sol.)
-  if (method === 'POST' && forwardedAfterLocal && (result.status === 401 || isUnauthorizedToolResult(result.text))) {
+  // Only a body that CARRIED the token can have been refused for it; re-minting
+  // for anything else changes nothing in the retried request.
+  if (
+    method === 'POST' && forwardedAfterLocal && needsToken(forwardedAfterLocal)
+    && (result.status === 401 || isUnauthorizedToolResult(result.text))
+  ) {
     log(`yolo-bridge: MCP upstream reported an invalid/expired token (status ${result.status}), force-refreshing`);
     try {
       const refreshed = await forceRefresh();

@@ -678,6 +678,42 @@ describe('startMcpProxy', () => {
     assert.equal(mints, 1, 'only the startup mint — every call since was answered from the backoff');
   });
 
+  it('during the backoff, keeps using a cached token that is near-expiry but still valid', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mints = 0;
+    const forwarded: any[] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) {
+        mints += 1;
+        // First mint: valid for 10s — inside the 15s early-refresh buffer, so
+        // the next call tries to refresh. That refresh fails.
+        return mints === 1 ? mintResponse('tok-still-valid', 10) : new Response('{}', { status: 503 });
+      }
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwarded.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      mintFailureBackoffMs: 60_000,
+    });
+    const call = () => fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    // The early refresh fails on this first call, so it can only succeed by
+    // falling back to the still-valid token.
+    assert.equal((await call()).status, 200);
+    assert.equal((await call()).status, 200, 'and again during the backoff');
+    assert.equal(mints, 2, 'one failed early refresh, then the backoff holds');
+    assert.ok(forwarded.every((m) => m.params.arguments._delegatedToken === 'tok-still-valid'));
+  });
+
   for (const status of [404, 412]) {
     it(`treats a ${status} mint (workspace gone / terminated) as PERMANENT`, async () => {
       const fetchImpl = (async (url: any) => {
