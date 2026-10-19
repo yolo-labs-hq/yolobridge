@@ -366,11 +366,12 @@ after(async () => {
 function runAttach(
   projectDir: string,
   agent: { bin: string; id: string } = { bin: 'fake-claude', id: 'claude' },
+  agentArgs: string[] = [],
 ): Promise<{ code: number | null; stdout: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [cliPath, 'attach', WORKSPACE_ID, '--agent', join(h.root, 'bin', agent.bin), '--agent-id', agent.id],
+      [cliPath, 'attach', WORKSPACE_ID, '--agent', join(h.root, 'bin', agent.bin), '--agent-id', agent.id, '--', ...agentArgs],
       {
         cwd: projectDir,
         env: {
@@ -400,7 +401,10 @@ describe('a full `yolo-bridge attach`', () => {
 
   it('runs to completion with the agent driving the whole lifecycle', async () => {
     before_ = snapshot(h.projectDir);
-    const result = await runAttach(h.projectDir);
+    const result = await runAttach(h.projectDir, { bin: 'fake-claude', id: 'claude' }, [
+      '--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions',
+      '--config', 'approval_policy="never"', 'literal; $(no-shell)',
+    ]);
     after_ = snapshot(h.projectDir);
     cliStdout = result.stdout;
     assert.equal(result.code, 0, `cli should exit cleanly; output was:\n${result.stdout}`);
@@ -436,6 +440,13 @@ describe('a full `yolo-bridge attach`', () => {
     assert.equal(cfg.mcpServers['yolo-studio'].headers['x-yolobridge-proxy-secret'], '${YOLOBRIDGE_MCP_PROXY_SECRET}');
     assert.equal(recorded.argv.includes('--allowedTools'), true);
     assert.equal(recorded.argv.includes('mcp__yolo-studio__*'), true);
+  });
+
+  it('forwards arbitrary arguments after -- unchanged to the real PTY child', () => {
+    assert.deepEqual(recorded.argv.slice(-6), [
+      '--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions',
+      '--config', 'approval_policy="never"', 'literal; $(no-shell)',
+    ]);
   });
 
   it('SECURITY: the real per-attach secret reached the agent via the ENVIRONMENT and never via argv', () => {
