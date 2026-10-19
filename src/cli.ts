@@ -6,6 +6,8 @@
  * Subcommands (keep in step with `printHelp` — this list is what a reader of
  * the file sees first, and it silently fell five commands behind before):
  *   yolo-bridge login                 — device-authorization flow (login-cmd.ts)
+ *   yolo-bridge logout                — revoke the login at auth-service and
+ *                                        delete it locally (logout-cmd.ts)
  *   yolo-bridge workspaces            — list selectable workspaces (workspaces-cmd.ts)
  *   yolo-bridge attach [workspaceId]  — attach + hold the SSE stream (attach-cmd.ts)
  *                                        (omit the id for an interactive picker)
@@ -32,6 +34,7 @@ import { realpathSync, existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 
 import { runLogin } from './login-cmd.js';
+import { runLogout, formatLogout } from './logout-cmd.js';
 import { runAttachFromDisk, pickWorkspaceFromDisk } from './attach-cmd.js';
 import { runShare, runDeliver } from './share-cmd.js';
 import { runAllow } from './approved-paths.js';
@@ -111,6 +114,8 @@ function printHelp(): void {
       '',
       'Commands:',
       '  login                  Device-authorization login against auth-service.',
+      '  logout                 Revoke this machine\'s login at auth-service and remove it locally.',
+      '                         Does not detach a running attachment (use `detach`).',
       '  workspaces             List your own workspaces (id, name, status) that can be attached to.',
       '  attach [workspace]     Attach this machine to a workspace and hold the daemon loop open.',
       '                         Accepts either a raw workspace id or its NAME (case-insensitive',
@@ -157,6 +162,21 @@ async function cmdLogin(): Promise<number> {
   const result = await runLogin({ authBaseUrl: authUrl() });
   if (result.ok) return 0;
   process.stderr.write(`yolo-bridge login: ${result.message}\n`);
+  return 1;
+}
+
+async function cmdLogout(): Promise<number> {
+  const result = await runLogout({ authBaseUrl: authUrl() });
+  if (result.ok) {
+    process.stdout.write(`${formatLogout(result)}\n`);
+    return 0;
+  }
+  process.stderr.write(
+    `yolo-bridge logout: could not revoke the login (${result.message}). Local credentials were kept. `
+      + (result.retryable
+        ? 'Check your connection and run `yolo-bridge logout` again.\n'
+        : 'Retrying will not help; check YOLOBRIDGE_AUTH_URL, or use "Sign out everywhere" in the web app.\n'),
+  );
   return 1;
 }
 
@@ -816,6 +836,8 @@ async function main(): Promise<number> {
   switch (cmd) {
     case 'login':
       return cmdLogin();
+    case 'logout':
+      return cmdLogout();
     case 'workspaces':
       return cmdWorkspaces();
     case 'attach':

@@ -25,6 +25,7 @@ Requires Node.js 20+. Prefer npm directly? `npm install -g @yolo-labs/yolobridge
 | Command | What it does |
 |---|---|
 | `login` | Sign in with the device-authorization flow. |
+| `logout` | Revoke this machine's login and remove it locally. |
 | `workspaces` | List the workspaces you can attach to. |
 | `attach [workspace]` | Attach this machine to a workspace (by id or name; omit it to pick interactively) and run the daemon loop. |
 | `detach` | End the current attachment. |

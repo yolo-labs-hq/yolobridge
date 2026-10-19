@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { requestDeviceCode, pollDeviceToken, refreshAccessToken, DeviceAuthError, type FetchImpl } from './device-auth.js';
+import { requestDeviceCode, pollDeviceToken, refreshAccessToken, logoutSession, DeviceAuthError, type FetchImpl } from './device-auth.js';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -138,8 +138,14 @@ describe('refreshAccessToken', () => {
   it('treats a 5xx as retryable and a 401 as a refusal', async () => {
     const down = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(503, { error: { message: 'unavailable' } })));
     assert.deepEqual(down, { status: 'failed', message: 'unavailable', retryable: true });
-    const refused = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(401, { error: { message: 'Refresh token revoked' } })));
-    assert.deepEqual(refused, { status: 'failed', message: 'Refresh token revoked', retryable: false });
+    const refused = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(401, { error: { message: 'Refresh token revoked', statusCode: 401, code: 'REFRESH_REVOKED' } })));
+    assert.deepEqual(refused, { status: 'failed', message: 'Refresh token revoked', retryable: false, refused: true });
+    // A bare 401/403 without auth-service's code (a WAF, a proxy, another
+    // environment) is NOT a verdict on this login.
+    const waf = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(403, { error: 'Forbidden' })));
+    assert.deepEqual(waf, { status: 'failed', message: 'Forbidden', retryable: false });
+    const proxy404 = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(404, {})));
+    assert.deepEqual(proxy404, { status: 'failed', message: 'refresh failed: 404', retryable: false });
   });
 
   it('parses the rotated pair', async () => {
@@ -154,5 +160,28 @@ describe('refreshAccessToken', () => {
       assert.equal(result.tokens.refreshToken, 'rt-2');
       assert.equal(result.tokens.expiresInSec, 86_400);
     }
+  });
+});
+
+describe('logoutSession', () => {
+  it('POSTs /logout with the access token as Bearer', async () => {
+    const fetchImpl = fetchStub((url, init) => {
+      assert.equal(url, 'https://auth.example.com/api/v1/auth/logout');
+      assert.equal(init?.method, 'POST');
+      assert.equal((init?.headers as Record<string, string>).Authorization, 'Bearer at-1');
+      return jsonResponse(200, { message: 'Logged out successfully' });
+    });
+    assert.deepEqual(await logoutSession('https://auth.example.com/', 'at-1', fetchImpl), { status: 'revoked' });
+  });
+
+  it('separates a 401 (nothing left to revoke) from a failure worth retrying', async () => {
+    const unauthorized = await logoutSession('https://a', 'at', fetchStub(() => jsonResponse(401, { error: { message: 'Token revoked' } })));
+    assert.deepEqual(unauthorized, { status: 'unauthorized', message: 'Token revoked' });
+    const down = await logoutSession('https://a', 'at', fetchStub(() => jsonResponse(503, {})));
+    assert.deepEqual(down, { status: 'failed', message: 'logout failed: 503', retryable: true });
+    const offline = await logoutSession('https://a', 'at', (async () => { throw new TypeError('fetch failed'); }) as unknown as FetchImpl);
+    assert.deepEqual(offline, { status: 'failed', message: 'fetch failed', retryable: true });
+    const permanent = await logoutSession('https://a', 'at', fetchStub(() => jsonResponse(400, { error: { message: 'logout-needs-session' } })));
+    assert.deepEqual(permanent, { status: 'failed', message: 'logout-needs-session', retryable: false });
   });
 });

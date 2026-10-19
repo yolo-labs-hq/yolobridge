@@ -63,13 +63,16 @@ export type RefreshTokenResult =
   /** `retryable`: the call never got a verdict (network error, 5xx, 429), so
    *  the refresh token may still be good and a later attempt can succeed.
    *  Absent/false means auth-service refused it. */
-  | { status: 'failed'; message: string; retryable?: boolean };
+  | { status: 'failed'; message: string; retryable?: boolean; refused?: boolean };
 
 export type FetchImpl = typeof fetch;
 
 export class DeviceAuthError extends Error {}
 
 const REFRESH_TIMEOUT_MS = 15_000;
+
+/** auth-service's `REFRESH_REVOKED_CODE` / `REFRESH_INVALID_CODE`. */
+const REFRESH_REFUSED_CODES = new Set(['REFRESH_REVOKED', 'REFRESH_INVALID']);
 
 function normalizeBase(authBaseUrl: string): string {
   return authBaseUrl.replace(/\/+$/, '');
@@ -194,6 +197,12 @@ export async function refreshAccessToken(
       status: 'failed',
       message: extractErrorMessage(body) || `refresh failed: ${res.status}`,
       retryable: res.status >= 500 || res.status === 429,
+      // auth-service's own verdict that the token is dead, keyed on the error
+      // CODE it attaches (`AuthController.refreshTokenRejection`) rather than
+      // the bare status: a 401/403 from a proxy, a WAF or a different
+      // environment's auth-service says nothing about whether THIS login is
+      // still live.
+      ...(REFRESH_REFUSED_CODES.has(body?.error?.code) ? { refused: true } : {}),
     };
   }
   const tokens = body?.tokens;
@@ -213,6 +222,49 @@ export async function refreshAccessToken(
       expiresAtMs: Date.now() + tokens.expiresIn * 1000,
     },
   };
+}
+
+export type LogoutResult =
+  | { status: 'revoked' }
+  /** 401: auth-service did not accept this ACCESS token. That alone does NOT
+   *  mean the sign-in is gone — `authenticateForLogout` 401s on clock skew, a
+   *  lost Redis session key or a transient DB error too, while the refresh
+   *  lineage may still be live. Callers must confirm via a renewal. */
+  | { status: 'unauthorized'; message: string }
+  /** `retryable`: no verdict was reached (network, 5xx, 429). */
+  | { status: 'failed'; message: string; retryable: boolean };
+
+/**
+ * `POST /api/v1/auth/logout` — ends the sign-in this access token belongs to
+ * (`AuthController.logout`). auth-service revokes the session's whole LINEAGE,
+ * so every refresh token rotated from the original device login dies with it,
+ * including one a running daemon holds in memory. Only that one sign-in: the
+ * browser and workspace pods keep theirs (`/logout-all` is the account-wide
+ * route, deliberately not used here).
+ */
+export async function logoutSession(
+  authBaseUrl: string,
+  accessToken: string,
+  fetchImpl: FetchImpl = fetch,
+  timeoutMs: number = REFRESH_TIMEOUT_MS,
+): Promise<LogoutResult> {
+  let res: Response;
+  let body: any;
+  try {
+    res = await fetchImpl(`${normalizeBase(authBaseUrl)}/api/v1/auth/logout`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: '{}',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    body = await safeJson(res);
+  } catch (err) {
+    return { status: 'failed', message: err instanceof Error ? err.message : String(err), retryable: true };
+  }
+  if (res.ok) return { status: 'revoked' };
+  const message = extractErrorMessage(body) || `logout failed: ${res.status}`;
+  if (res.status === 401) return { status: 'unauthorized', message };
+  return { status: 'failed', message, retryable: res.status >= 500 || res.status === 429 };
 }
 
 async function safeJson(res: Response): Promise<any> {
