@@ -87,7 +87,9 @@ export async function runLogout(deps: LogoutDeps = {}): Promise<LogoutCmdResult>
     // The refresh token is the durable credential, so ask it: a renewal that
     // succeeds gets a token to retry the logout with; one auth-service refuses
     // is the proof that nothing is left to revoke.
-    if (!fresh.auth.refreshToken) return done('local-only');
+    // With no refresh token there is nothing to confirm with, and this file
+    // may be the only credential left that could revoke the sign-in — keep it.
+    if (!fresh.auth.refreshToken) return keep(result.message, true);
     const renewed = await rotateAccountAuth(fresh.auth, accountDeps);
     if (!renewed.ok) return renewed.refused ? done('already-revoked') : keep(renewed.message, renewed.retryable);
     result = await revoke(authBaseUrl, renewed.auth.accessToken, deps.fetchImpl);

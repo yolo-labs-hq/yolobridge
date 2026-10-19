@@ -71,6 +71,9 @@ export class DeviceAuthError extends Error {}
 
 const REFRESH_TIMEOUT_MS = 15_000;
 
+/** auth-service's `REFRESH_REVOKED_CODE` / `REFRESH_INVALID_CODE`. */
+const REFRESH_REFUSED_CODES = new Set(['REFRESH_REVOKED', 'REFRESH_INVALID']);
+
 function normalizeBase(authBaseUrl: string): string {
   return authBaseUrl.replace(/\/+$/, '');
 }
@@ -194,10 +197,12 @@ export async function refreshAccessToken(
       status: 'failed',
       message: extractErrorMessage(body) || `refresh failed: ${res.status}`,
       retryable: res.status >= 500 || res.status === 429,
-      // auth-service's own verdict on the token (revoked, expired, invalid) —
-      // as opposed to a 404/400 from a proxy or a wrong base URL, which says
-      // nothing about whether the login is still live.
-      ...(res.status === 401 || res.status === 403 ? { refused: true } : {}),
+      // auth-service's own verdict that the token is dead, keyed on the error
+      // CODE it attaches (`AuthController.refreshTokenRejection`) rather than
+      // the bare status: a 401/403 from a proxy, a WAF or a different
+      // environment's auth-service says nothing about whether THIS login is
+      // still live.
+      ...(REFRESH_REFUSED_CODES.has(body?.error?.code) ? { refused: true } : {}),
     };
   }
   const tokens = body?.tokens;

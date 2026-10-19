@@ -145,6 +145,16 @@ describe('runLogout', () => {
     assert.ok(loadAuth(ENV, io));
   });
 
+  it('a 401 with NO refresh token to confirm with keeps the file', async () => {
+    const io = fakeIO();
+    saveAuth(stored({ refreshToken: undefined }), ENV, io);
+    const result = await runLogout(deps(io, {
+      logoutSession: async () => ({ status: 'unauthorized', message: 'Invalid token' }),
+    }));
+    assert.deepEqual(result, { ok: false, reason: 'revoke-failed', message: 'Invalid token', retryable: true });
+    assert.ok(loadAuth(ENV, io));
+  });
+
   it('an expired token whose renewal is REFUSED counts as already revoked', async () => {
     const io = fakeIO();
     saveAuth(stored({ expiresAtMs: T0 - 1 }), ENV, io);
