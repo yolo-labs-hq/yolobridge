@@ -38,6 +38,7 @@ import { runAllow } from './approved-paths.js';
 import { runDetach } from './detach-cmd.js';
 import type { RemoteHostInfo } from './api-client.js';
 import { getStatus, formatStatus } from './status-cmd.js';
+import { composeAgentArgv } from './agent-cli-options.js';
 import { resolveAgentBinary } from './resolve-agent-binary.js';
 import { checkPtyHelper } from './check-pty-helper.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
@@ -125,6 +126,8 @@ function printHelp(): void {
       '                         finds a still-live attachment for this workspace on this machine',
       '                         RESUMES it (same tile) instead of adding a duplicate; --fresh skips',
       '                         that check entirely.',
+      '    [-- <agent-args...>] Forward remaining arguments verbatim to the local agent.',
+      '                         Examples: -- --model sonnet; -- resume --last (codex).',
       '  detach                 Detach the current workspace attachment.',
       '  allow <path>           Let the ATTACHED AGENT send files from this path. You type',
       '                         this; nothing in the cloud can. Also --list and --remove <path>.',
@@ -165,6 +168,8 @@ export interface AttachArgs {
   /** `--fresh` — never resume a stored attachment; always create a new one.
    *  A bare boolean flag, so unlike the three above it consumes no value. */
   fresh?: boolean;
+  /** Tokens after --, forwarded verbatim as distinct argv entries. */
+  agentArgs?: string[];
 }
 
 export interface AttachArgsError {
@@ -201,6 +206,7 @@ export function parseAttachArgs(args: string[]): AttachArgs | AttachArgsError {
   let fresh = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    if (a === '--') return { workspaceId, hostLabel, agentBin, agentId, fresh, agentArgs: args.slice(i + 1) };
     // Boolean — handled before the value-taking flags so it never swallows
     // the following argument (`attach --fresh w1` must still see `w1` as the
     // positional workspace id).
@@ -291,7 +297,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   const parsed = parseAttachArgs(args);
   if ('error' in parsed) {
     process.stderr.write(`yolo-bridge attach: ${parsed.error}\n`);
-    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>] [--fresh]\n');
+    process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>] [--fresh] [-- <agent-options>]\n');
     return 64;
   }
   let workspaceId = parsed.workspaceId;
@@ -303,6 +309,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   // match, which is every built-in agent this daemon has been used with so
   // far (claude, codex).
   const resolvedAgentId = parsed.agentId ?? agentBin ?? DEFAULT_AGENT_BIN;
+  const agentArgs = parsed.agentArgs ?? [];
   // The string actually spawned — and therefore the one whose `--help` is
   // authoritative about which flags it accepts (`buildAgentMcpArgs`).
   // `startLocalAgent` applies the same default, so probing anything else
@@ -342,7 +349,7 @@ async function cmdAttach(args: string[]): Promise<number> {
           process.stderr.write(`yolo-bridge attach: ${pick.message}\n`);
           break;
       }
-      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>] [--fresh]\n');
+      process.stderr.write('Usage: yolo-bridge attach [workspaceId] [--label <name>] [--agent <binary>] [--agent-id <registryId>] [--fresh] [-- <agent-options>]\n');
       return 64;
     }
     workspaceId = pick.workspaceId;
@@ -552,9 +559,9 @@ async function cmdAttach(args: string[]): Promise<number> {
             agentBin,
             // Empty unless the MCP block above successfully resolved argv
             // for THIS agent binary — a probe that came back without the
-            // flags leaves this `[]`, i.e. a normal launch with no MCP,
-            // never a launch carrying a flag the binary would reject.
-            agentArgs: agentMcpArgs,
+            // flags leaves the MCP portion empty. User arguments follow it
+            // as separate argv entries, never shell text.
+            agentArgs: composeAgentArgv(agentMcpArgs, agentArgs),
             cwd: spawnCwd,
             // The daemon's only reachable stop key. `process.on('SIGINT')`
             // above cannot fire from the keyboard: stdin is in raw mode so the

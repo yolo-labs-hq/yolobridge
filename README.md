@@ -52,6 +52,19 @@ Requires Node.js 20+. Prefer npm directly? `npm install -g @yolo-labs/yolobridge
 | `YOLOBRIDGE_AUTH_URL` | `https://auth.yololabs.ai` |
 | `YOLOBRIDGE_MCP_URL` | `https://services.yolo.studio` |
 
+Agent arguments go after a literal `--`; Bridge options go before it (requires 0.34.0):
+
+```sh
+yolo-bridge attach <workspace> --agent claude -- --model sonnet
+yolo-bridge attach <workspace> --agent claude -- --resume "session name"
+yolo-bridge attach <workspace> --agent claude -- --dangerously-skip-permissions
+yolo-bridge attach <workspace> --agent codex -- resume --last
+```
+
+Everything after `--` is forwarded verbatim to the selected local executable as distinct argv entries. Bridge does not parse, filter, expand, log, or run those values through a shell. This supports the agent's current flags, including model, resume, permission, configuration, MCP, prompt, and custom-agent flags. Quote values with spaces as usual. Custom binary paths need the matching `--agent-id` for Bridge's own MCP wiring. Bridge's existing MCP arguments are prepended; repeated or conflicting arguments follow the selected agent's own CLI semantics. These arguments apply when this invocation launches its agent; transport reconnects do not restart or reconfigure it. Installed agent versions must support the requested options.
+
+The separator makes the boundary explicit: Bridge flags must appear before `--`, and agent arguments must appear after it. It does not change the selected agent's permissions or provide OS isolation; it simply preserves the operator's argv. No arguments preserves existing behavior for other agent binaries.
+
 Credentials, the current attachment and approved paths are stored under `~/.config/yolobridge/`.
 
 ## Troubleshooting
