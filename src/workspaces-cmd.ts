@@ -8,13 +8,18 @@
  */
 
 import { listSelectableWorkspaces, type SelectableWorkspace, type FetchImpl } from './api-client.js';
-import { loadAuth, type ConfigStoreIO } from './config-store.js';
+import { type ConfigStoreIO } from './config-store.js';
+import { ensureFreshAccountAuth, refreshFailureAdvice, type RefreshTokenFn } from './account-auth.js';
 
 export interface ListWorkspacesDeps {
   commonApiBaseUrl: string;
   env?: Record<string, string | undefined>;
   io?: ConfigStoreIO;
   fetchImpl?: FetchImpl;
+  /** Account-token renewal seams (account-auth.ts). */
+  authBaseUrl?: string;
+  now?: () => number;
+  refreshAccessToken?: RefreshTokenFn;
 }
 
 export type ListWorkspacesResult =
@@ -22,8 +27,14 @@ export type ListWorkspacesResult =
   | { ok: false; reason: 'not-logged-in' | 'error'; message: string };
 
 export async function runListWorkspaces(deps: ListWorkspacesDeps): Promise<ListWorkspacesResult> {
-  const auth = loadAuth(deps.env, deps.io);
-  if (!auth) return { ok: false, reason: 'not-logged-in', message: 'Not logged in — run `yolo-bridge login` first.' };
+  const fresh = await ensureFreshAccountAuth(deps);
+  if (!fresh.ok) {
+    if (fresh.reason === 'not-logged-in') {
+      return { ok: false, reason: 'not-logged-in', message: 'Not logged in — run `yolo-bridge login` first.' };
+    }
+    return { ok: false, reason: fresh.retryable ? 'error' : 'not-logged-in', message: refreshFailureAdvice(fresh) };
+  }
+  const { auth } = fresh;
 
   try {
     const workspaces = await listSelectableWorkspaces({

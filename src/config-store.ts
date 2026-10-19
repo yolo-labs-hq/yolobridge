@@ -22,20 +22,14 @@ import * as path from 'node:path';
 export interface StoredAuth {
   accessToken: string;
   /**
-   * OPTIONAL since 0.6.0, and absent from disk on the scoped path
-   * (docs/YOLOBRIDGE_SCOPED_CREDENTIAL_PLAN.md, card 08).
+   * The durable half of the login: auth-service's 30-day, rotate-on-use
+   * refresh token. Persisted (0600) and rewritten on every rotation so the
+   * ~24h access token renews itself (account-auth.ts) — see
+   * docs/YOLOBRIDGE_SCOPED_CREDENTIAL_PLAN.md D8.
    *
-   * The access token expires; THIS is the durable key to the whole account, so
-   * a leaked `auth.json` carrying one is account compromise rather than the
-   * one-workspace exposure the scoping work exists to reduce it to. Once
-   * `attach` has exchanged it for a workspace-scoped credential, `saveAuth`
-   * writes the field out ABSENT (see below) and the daemon keeps its only copy
-   * in memory for the life of that process.
-   *
-   * Optional on the READ path too, in both directions: an `auth.json` written
-   * by an older daemon still carries one and must still load (this is a
-   * forward-compatible read, not a format break), and one written by a newer
-   * daemon on the scoped path carries none and must not read as corrupt.
+   * Optional on the read path: 0.6.0–0.32.x daemons wrote `auth.json` WITHOUT
+   * it after attaching (D5, since reversed), and such a file must still load —
+   * it just cannot renew, so the operator logs in once more.
    */
   refreshToken?: string;
   tokenType: string;
@@ -52,9 +46,7 @@ export interface StoredAttachment {
    * The workspace-scoped daemon credential minted at attach (card 07's
    * renewal target), persisted so a daemon that restarts while it is still
    * renewable RESUMES this attachment instead of needing a full re-`attach` —
-   * which matters precisely because the account refresh token above is gone:
-   * after the account access token expires there is otherwise nothing left on
-   * this machine to authenticate a fresh attach with.
+   * so the operator gets the same tile back rather than a duplicate.
    *
    * Both fields or neither (mirrors `api-client.ts`'s `attach`): a token whose
    * expiry is unknown cannot be scheduled around, and an expiry with no token

@@ -41,6 +41,7 @@ import { getStatus, formatStatus } from './status-cmd.js';
 import { resolveAgentBinary } from './resolve-agent-binary.js';
 import { checkPtyHelper } from './check-pty-helper.js';
 import { startLocalAgent, stopLocalAgent, DEFAULT_AGENT_BIN } from './local-agent.js';
+import { refreshFailureAdvice } from './account-auth.js';
 import { runListWorkspaces, formatWorkspacesTable, type ListWorkspacesResult } from './workspaces-cmd.js';
 import { startMcpProxy, mcpUrl, SECRET_ENV_VAR, type McpProxyHandle } from './mcp-proxy.js';
 import { buildAgentMcpArgs } from './agent-mcp-args.js';
@@ -321,6 +322,11 @@ async function cmdAttach(args: string[]): Promise<number> {
     // caller's own `GET .../workspaces/selectable` list instead of just
     // failing (nobody has a raw workspace ObjectId memorized).
     const pick = await pickWorkspaceFromDisk({ commonApiBaseUrl: apiUrl() });
+    if (!pick.ok && pick.reason === 'refresh-failed') {
+      // Not a usage error — the command line was fine.
+      process.stderr.write(`yolo-bridge attach: ${refreshFailureAdvice(pick)}\n`);
+      return 1;
+    }
     if (!pick.ok) {
       switch (pick.reason) {
         case 'not-logged-in':
@@ -389,7 +395,7 @@ async function cmdAttach(args: string[]): Promise<number> {
       // logged and skipped, not fatal — MCP access is an enhancement on a
       // tile that already works without it (send_to_tile/read_tile_output
       // are unaffected either way).
-      onAttached: async ({ tileId, getAccessToken, clearScreen }) => {
+      onAttached: async ({ tileId, getFreshAccessToken, clearScreen }) => {
         // Isolated from `startLocalAgent` below on purpose (Codex review,
         // 2026-08-24): `startMcpProxy` itself never throws, but
         // `buildAgentMcpArgs` spawns a real `<bin> --help` probe, and a
@@ -404,7 +410,7 @@ async function cmdAttach(args: string[]): Promise<number> {
         try {
           mcpProxyHandle = await startMcpProxy({
             apiUrl: apiUrl(),
-            getAccessToken,
+            getAccessToken: getFreshAccessToken,
             workspaceId,
             agentId: resolvedAgentId,
             // Self-identity for the spawned agent: the tile it is running in.
@@ -766,11 +772,7 @@ async function cmdShare(args: string[]): Promise<number> {
 async function cmdWorkspaces(): Promise<number> {
   const result = await runListWorkspaces({ commonApiBaseUrl: apiUrl() });
   if (!result.ok) {
-    if (result.reason === 'not-logged-in') {
-      process.stderr.write('yolo-bridge workspaces: not logged in — run `yolo-bridge login` first.\n');
-    } else {
-      process.stderr.write(`yolo-bridge workspaces: ${result.message}\n`);
-    }
+    process.stderr.write(`yolo-bridge workspaces: ${result.message}\n`);
     return 1;
   }
   process.stdout.write(`${formatWorkspacesTable(result.workspaces)}\n`);

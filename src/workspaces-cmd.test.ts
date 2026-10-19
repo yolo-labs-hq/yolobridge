@@ -27,6 +27,45 @@ describe('runListWorkspaces', () => {
     if (!result.ok) assert.equal(result.reason, 'not-logged-in');
   });
 
+  it('renews an expired login before listing, instead of failing with a 401', async () => {
+    const io = fakeIO();
+    saveAuth({ accessToken: 'old-at', refreshToken: 'rt-1', tokenType: 'Bearer', expiresAtMs: 1_000 }, ENV, io);
+    const fetchImpl = (async (_url: any, init?: any) => {
+      assert.equal(init?.headers?.Authorization, 'Bearer new-at');
+      return jsonResponse(200, { workspaces: [] });
+    }) as any;
+    const result = await runListWorkspaces({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      fetchImpl,
+      now: () => 2_000,
+      refreshAccessToken: async () => ({
+        status: 'ok',
+        tokens: { accessToken: 'new-at', refreshToken: 'rt-2', expiresInSec: 86_400, expiresAtMs: 2_000 + 86_400_000 },
+      }),
+    });
+    assert.deepEqual(result, { ok: true, workspaces: [] });
+  });
+
+  it('points at `yolo-bridge login` when auth-service refuses the renewal', async () => {
+    const io = fakeIO();
+    saveAuth({ accessToken: 'old-at', refreshToken: 'rt-1', tokenType: 'Bearer', expiresAtMs: 1_000 }, ENV, io);
+    const result = await runListWorkspaces({
+      commonApiBaseUrl: 'https://api.example.com',
+      env: ENV,
+      io,
+      fetchImpl: (async () => { throw new Error('must not list with a dead token'); }) as any,
+      now: () => 2_000,
+      refreshAccessToken: async () => ({ status: 'failed', message: 'Refresh token revoked' }),
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.reason, 'not-logged-in');
+      assert.match(result.message, /yolo-bridge login/);
+    }
+  });
+
   it('returns the selectable workspace list on success', async () => {
     const io = fakeIO();
     saveAuth({ accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: Date.now() + 3600_000 }, ENV, io);

@@ -47,10 +47,18 @@ import {
   INTERACTIVE_ECHO_FLUSH_MS,
 } from './output-stream.js';
 import * as apiClient from './api-client.js';
-import { refreshAccessToken as refreshAccessTokenApi, type RefreshTokenResult } from './device-auth.js';
+import {
+  DEFAULT_REFRESH_BUFFER_MS,
+  defaultAuthBaseUrl,
+  ensureFreshAccountAuth,
+  needsRefresh,
+  refreshFailureAdvice,
+  rotateAccountAuth,
+  sameAccount,
+  type RefreshTokenFn,
+} from './account-auth.js';
 import {
   loadAuth,
-  saveAuth,
   loadAttachment,
   saveAttachment,
   clearAttachment,
@@ -64,19 +72,19 @@ import {
   type ConnectionState,
 } from './connection-state.js';
 
-/** Same shape as device-auth.ts's `refreshAccessToken` — injectable so tests
- * don't hit the network. Defaults to the real auth-service call. */
-export type RefreshTokenFn = (
-  authBaseUrl: string,
-  refreshToken: string,
-  fetchImpl?: apiClient.FetchImpl,
-) => Promise<RefreshTokenResult>;
+export type { RefreshTokenFn } from './account-auth.js';
 
-const DEFAULT_AUTH_URL = 'https://auth.yololabs.ai';
-/** Refresh once the access token has less than this much validity left.
- * Production access tokens live 24h; 5min gives ample margin against a
- * slow/retried refresh call before the old token actually 401s. */
-const DEFAULT_REFRESH_BUFFER_MS = 5 * 60_000;
+/**
+ * After a failed mid-session ACCOUNT rotation, wait this long before calling
+ * auth-service again. Not a permanent latch: the account token is what the
+ * local MCP proxy mints with, so giving up after one failure (a network blip
+ * at the 24h mark, a laptop waking up offline) silently killed MCP access for
+ * the rest of the session. A REFUSED refresh token waits longer — retrying it
+ * cannot help — but `auth.json` is still re-read during either wait, so a
+ * `yolo-bridge login` in another terminal is picked up straight away.
+ */
+const ACCOUNT_REFRESH_RETRY_MS = 60_000;
+const ACCOUNT_REFRESH_REFUSED_RETRY_MS = 15 * 60_000;
 /** How often to re-check `shouldStop()`/a failed-refresh flag while an SSE
  * stream is open and blocked on `for await`. The server holds the stream
  * open indefinitely (keepalive pings only), so without an active poll here
@@ -258,6 +266,12 @@ export interface AttachDaemonDeps {
      *  stale one would 401 on every mint forever once that happens (Codex
      *  review, 2026-08-24). */
     getAccessToken: () => string;
+    /** Like `getAccessToken`, but renews the account token first when it is
+     *  expired or inside the refresh buffer. What the MCP proxy should mint
+     *  with: the heartbeat-driven rotation only runs while the stream is
+     *  connected, so a mint right after a laptop wakes (or during a
+     *  reconnect backoff) would otherwise present an expired token. */
+    getFreshAccessToken: () => Promise<string>;
     /** Clears the terminal (see this file's default `clearScreen` for the
      *  ANSI sequence). Exposed here rather than auto-fired on the SSE
      *  'connected' frame (the original design, reverted — Codex review,
@@ -309,8 +323,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   const timers = deps.timers ?? defaultTimers;
   const now = deps.now ?? Date.now;
   const refreshBufferMs = deps.refreshBufferMs ?? DEFAULT_REFRESH_BUFFER_MS;
-  const authBaseUrl = deps.authBaseUrl ?? process.env.YOLOBRIDGE_AUTH_URL ?? DEFAULT_AUTH_URL;
-  const doRefresh = deps.refreshAccessToken ?? refreshAccessTokenApi;
+  const authBaseUrl = deps.authBaseUrl ?? defaultAuthBaseUrl();
   const subscribeAgentOutput = deps.subscribeAgentOutput ?? onLocalAgentData;
   const takeRawSeed = deps.takeRawSeed ?? takeRawSeedFromAgent;
   const primeRawStream = deps.primeRawStream ?? primeRawStreamFromAgent;
@@ -333,39 +346,6 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * a credential confined to ONE workspace's YoloBridge surface.
    */
   const scopedCredential: { token?: string; expiresAtMs?: number; refreshAtMs?: number } = {};
-
-  /**
-   * Write `auth.json` back, NEVER with the account refresh token (cards 08+09).
-   *
-   * The access token expires on its own; the REFRESH token is the durable key
-   * to the whole account, and this daemon does not need it on disk to do its
-   * job. Once `attach` has exchanged it for a workspace-scoped credential the
-   * daemon's entire YoloBridge traffic runs on that instead, so a leaked
-   * `auth.json` should be worth at worst a self-expiring access token.
-   *
-   * UNCONDITIONAL since 0.7.0. Card 08 made the drop conditional on a scoped
-   * token being in hand, to protect the DEGRADED path — a common-api predating
-   * the mint, where `scopedCfg()` fell back to the account token and the daemon
-   * ran the whole session on it. Boundary B deleted that path: an account token
-   * is now refused on every post-attach route, so there is no session left for
-   * the refresh token to be load-bearing in, and `runAttachDaemon` fails at
-   * attach rather than continuing without a scoped credential.
-   *
-   * ONE CONSEQUENCE, ACCEPTED AND NOT HIDDEN: the pre-attach
-   * `ensureFreshToken()` call also writes through here, so a rotation that
-   * happens moments BEFORE a failed attach drops the refresh token without an
-   * exchange ever completing. The operator keeps a ~24h access token and must
-   * `yolo-bridge login` again after that. Narrow (it needs a near-expiry token
-   * AND a failing attach in the same run) and it errs toward less crown-jewel
-   * material on disk, which is the direction this work exists to push.
-   *
-   * Every `auth.json` write in this file goes through here rather than calling
-   * `saveAuth` directly, so an account rotation cannot quietly re-persist the
-   * very token the attach exchange just dropped.
-   */
-  function persistAccountAuth(): void {
-    saveAuth({ ...currentAuth, refreshToken: undefined }, env, io);
-  }
 
   /**
    * Record a freshly-issued scoped credential and schedule its renewal.
@@ -429,11 +409,8 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    *
    * The credential is persisted so a daemon that dies and is restarted while
    * its scoped token is still renewable resumes THIS attachment rather than
-   * needing a fresh one. That is not a convenience: this card also drops the
-   * account refresh token, so once the account access token expires there is
-   * nothing else left on the machine to authenticate a new `attach` with — the
-   * stored scoped token is the only way a long-lived daemon survives its own
-   * restart without sending the operator back to `yolo-bridge login`.
+   * needing a fresh one — so the operator gets the SAME tile back rather than
+   * a duplicate (D7).
    *
    * Same file, same writer, same 0600 posture as before — no new file and no
    * new mode. Called at attach and again after every renewal, so a restart
@@ -486,77 +463,102 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
    * rotates its access token well before the 24h production expiry
    * instead of degrading into a silent zombie that just starts 401ing.
    * Updates the in-memory `accountCfg`/`currentAuth` used by `attach` AND the
-   * on-disk auth.json (via `saveAuth`) so a later `status`/restart also sees
-   * the fresh token. It must NEVER write the scoped credential — see
-   * `scopedCfg` for why that separation is load-bearing.
+   * on-disk auth.json — rotated refresh token included (account-auth.ts), so
+   * the login outlives this process. It must NEVER write the scoped
+   * credential — see `scopedCfg` for why that separation is load-bearing.
    */
-  async function ensureFreshToken(): Promise<{ ok: true } | { ok: false; message: string }> {
-    if (now() < currentAuth.expiresAtMs - refreshBufferMs) return { ok: true };
-    // No refresh token: either this daemon dropped it after its own scoped
-    // attach exchange (card 08) and is now running from a restart, or the
-    // operator's `auth.json` predates login. Either way there is nothing to
-    // refresh WITH — report it as an outcome rather than handing `undefined`
-    // to auth-service and getting back an unexplained 400.
-    if (!currentAuth.refreshToken) {
-      return {
-        ok: false,
-        message: 'the account access token has expired and no refresh token is stored on this machine',
-      };
-    }
-    const result = await doRefresh(authBaseUrl, currentAuth.refreshToken, fetchImpl);
-    if (result.status !== 'ok') {
-      return { ok: false, message: result.message };
-    }
-    currentAuth = {
-      accessToken: result.tokens.accessToken,
-      refreshToken: result.tokens.refreshToken,
-      tokenType: currentAuth.tokenType,
-      expiresAtMs: result.tokens.expiresAtMs,
-    };
-    accountCfg.accessToken = currentAuth.accessToken;
-    persistAccountAuth();
+  async function ensureFreshToken(): Promise<{ ok: true } | { ok: false; message: string; retryable: boolean }> {
+    if (!needsRefresh(currentAuth, now(), refreshBufferMs)) return { ok: true };
+    if (adoptNewerLoginFromDisk()) return { ok: true };
+    const rotated = await rotateAccountAuth(currentAuth, {
+      authBaseUrl,
+      env,
+      io,
+      fetchImpl,
+      refreshAccessToken: deps.refreshAccessToken,
+    });
+    if (!rotated.ok) return rotated;
+    adoptAccountAuth(rotated.auth);
     // Out-of-band, not `log`: this fires on a ~24h cadence from inside the
     // heartbeat tick, i.e. while the local agent's TUI owns the terminal.
     noteConnection('refreshed');
     return { ok: true };
   }
 
+  function adoptAccountAuth(next: StoredAuth): void {
+    currentAuth = next;
+    accountCfg.accessToken = next.accessToken;
+  }
+
   /**
-   * Latched once the account refresh has failed on the SCOPED path, so the
-   * heartbeat tick doesn't retry a call that cannot start working again.
+   * Another process sharing this config dir (`yolo-bridge login`, a second
+   * daemon, the picker) may already have rotated. Adopt its newer pair rather
+   * than spend our own already-superseded refresh token — but never a login
+   * for a DIFFERENT account, whose token would be refused for this
+   * workspace's MCP mints. Returns true when the adopted pair is fresh.
    */
-  let accountRefreshAbandoned = false;
+  function adoptNewerLoginFromDisk(): boolean {
+    const onDisk = loadAuth(env, io);
+    if (!onDisk || onDisk.expiresAtMs <= currentAuth.expiresAtMs || !sameAccount(onDisk, currentAuth)) return false;
+    adoptAccountAuth(onDisk);
+    return !needsRefresh(currentAuth, now(), refreshBufferMs);
+  }
+
+  /** Earliest time the next mid-session call to auth-service may be made
+   *  after a failure (see `ACCOUNT_REFRESH_RETRY_MS`). */
+  let accountRefreshRetryAtMs = 0;
 
   /**
    * `ensureFreshToken`, downgraded from fatal to best-effort.
    *
    * Nothing in this daemon's YoloBridge traffic uses the account token past
    * attach, so killing a perfectly healthy session because it could not be
-   * rotated would be a self-inflicted brick. The rotation is kept running — it
-   * is not dead code: `onAttached` hands `getAccessToken` to the local MCP
-   * proxy, whose delegated-token mints are still account-authenticated (see
-   * mcp-proxy.ts) — but a failure DEGRADES that one enhancement rather than
-   * ending the session, and latches so the heartbeat tick stops retrying a call
-   * that cannot start working again.
+   * rotated would be a self-inflicted brick. The rotation still matters:
+   * `onAttached` hands the account token to the local MCP proxy, whose
+   * delegated-token mints are account-authenticated (see mcp-proxy.ts). A
+   * failure therefore degrades that one enhancement and is retried after
+   * `ACCOUNT_REFRESH_RETRY_MS` — never latched for the life of the session,
+   * which is what left long-running bridges with dead MCP access.
    *
-   * Card 08 classified this failure by whether a scoped credential existed,
-   * because on the degraded path the account token WAS the daemon's credential
-   * and a failed refresh had to be terminal. Card 09 removed that path
-   * entirely: `runAttachDaemon` never reaches this loop without a scoped
-   * credential, so the classification had exactly one branch left.
-   *
-   * Deliberately silent when it degrades. `noteConnection('degraded')` means
+   * Deliberately silent when it fails. `noteConnection('degraded')` means
    * "the LINK is struggling" and, being the last event recorded, would leave
-   * `yolo-bridge status` reporting a healthy session as degraded for the rest
-   * of its life. The one consumer, MCP minting, already reports its own
-   * failures, and best-effort MCP is its documented contract.
+   * `yolo-bridge status` reporting a healthy session as degraded. The one
+   * consumer, MCP minting, already reports its own failures.
    */
-  async function ensureFreshAccountToken(): Promise<{ ok: true } | { ok: false; message: string }> {
-    if (accountRefreshAbandoned) return { ok: true };
-    const outcome = await ensureFreshToken();
-    if (outcome.ok) return outcome;
-    accountRefreshAbandoned = true;
-    return { ok: true };
+  async function ensureFreshAccountToken(): Promise<void> {
+    if (now() < accountRefreshRetryAtMs) {
+      // Waiting out a failure: no network, but a login written meanwhile
+      // still counts.
+      if (needsRefresh(currentAuth, now(), refreshBufferMs)) {
+        try { adoptNewerLoginFromDisk(); } catch { /* best effort */ }
+      }
+      return;
+    }
+    let retryInMs = 0;
+    try {
+      const outcome = await ensureFreshToken();
+      if (!outcome.ok) retryInMs = outcome.retryable ? ACCOUNT_REFRESH_RETRY_MS : ACCOUNT_REFRESH_REFUSED_RETRY_MS;
+    } catch {
+      // An injected refresh fn or a disk write can still throw; best-effort
+      // means it must not unwind the stream loop either.
+      retryInMs = ACCOUNT_REFRESH_RETRY_MS;
+    }
+    if (retryInMs) accountRefreshRetryAtMs = now() + retryInMs;
+  }
+
+  /**
+   * Single-flight wrapper so concurrent callers (a heartbeat tick and an MCP
+   * mint landing together) share one rotation instead of each spending the
+   * same refresh token.
+   */
+  let accountRefreshInFlight: Promise<void> | undefined;
+  function ensureFreshAccountTokenOnce(): Promise<void> {
+    if (!accountRefreshInFlight) {
+      accountRefreshInFlight = ensureFreshAccountToken().finally(() => {
+        accountRefreshInFlight = undefined;
+      });
+    }
+    return accountRefreshInFlight;
   }
 
   type ScopedRefreshOutcome = { ok: true } | { ok: false; message: string };
@@ -734,8 +736,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     // refresh buffer, rotates before the very first network call.)
     const initialRefresh = await ensureFreshToken();
     if (!initialRefresh.ok) {
-      log(`Token refresh failed: ${initialRefresh.message}`);
-      log('Run `yolo-bridge login` again.');
+      log(refreshFailureAdvice(initialRefresh));
       return { ok: false, reason: 'refresh-failed', message: initialRefresh.message };
     }
     try {
@@ -768,14 +769,6 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   persistAttachment();
-  // THE EXCHANGE IS COMPLETE — drop the durable account credential from disk
-  // (card 08). Ordered after `persistAttachment` so the machine is never
-  // momentarily left with neither credential persisted: a crash between the two
-  // writes would otherwise leave a daemon that can neither resume nor re-attach.
-  // `persistAccountAuth` is what makes this conditional on a scoped token
-  // actually being in hand; see its comment for why unconditional would brick
-  // the degraded path.
-  persistAccountAuth();
   // Safe on stdout: this is still BEFORE `onAttached` spawns the local
   // agent, so nothing owns the screen yet (and the caller's `clearScreen()`
   // wipes it moments later anyway).
@@ -813,6 +806,10 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         tileId, attachmentId, workspaceId,
         accessToken: currentAuth.accessToken,
         getAccessToken: () => currentAuth.accessToken,
+        getFreshAccessToken: async () => {
+          await ensureFreshAccountTokenOnce();
+          return currentAuth.accessToken;
+        },
         clearScreen,
       });
     } catch (err) {
@@ -1005,19 +1002,13 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   let heartbeat: HeartbeatScheduler | undefined;
   let attempt = 0;
-  /** Set when a proactive refresh (see ensureFreshToken) fails while a
-   * stream is open — picked up right after the current for-await unwinds
-   * (forced via the stop-poll below) so the daemon stops instead of
-   * looping forever reconnecting with a dead token. */
-  let refreshFailed: { message: string } | undefined;
-  /** The same, for the WORKSPACE-SCOPED credential: set when its renewal
-   * window has closed (or the server ended the attachment), so the daemon
-   * stops instead of streaming on with a credential that is about to start
-   * 401ing every heartbeat. Kept separate from `refreshFailed` because the
-   * two have different remedies — `yolo-bridge login` vs `yolo-bridge attach`
-   * — and different reporting rules: the account failure is the daemon's exit
-   * message and may use stdout, this one fires mid-session while the local
-   * agent's TUI owns the terminal and must not. */
+  /** Set when the WORKSPACE-SCOPED credential's renewal window has closed
+   * (or the server ended the attachment) — picked up right after the current
+   * for-await unwinds (forced via the stop-poll below) so the daemon stops
+   * instead of streaming on with a credential that is about to start 401ing
+   * every heartbeat. This fires mid-session while the local agent's TUI owns
+   * the terminal, so it is reported out of band. (An ACCOUNT rotation failure
+   * never ends the session — see `ensureFreshAccountToken`.) */
   let scopedRefreshFailed: { message: string } | undefined;
   /**
    * Set when the server PERMANENTLY refuses this daemon's credential — a 403
@@ -1065,11 +1056,10 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
 
   try {
     while (!shouldStop()) {
-      const preStreamRefresh = await ensureFreshAccountToken();
-      if (!preStreamRefresh.ok) {
-        refreshFailed = preStreamRefresh;
-        break;
-      }
+      // Not awaited: nothing on the YoloBridge path uses the account token, so
+      // a slow auth-service must not delay the reconnect. MCP mints that need
+      // it await the same in-flight rotation through `getFreshAccessToken`.
+      void ensureFreshAccountTokenOnce();
       // Also before every (re)connect, not only on the heartbeat tick: a long
       // backoff with no stream open is exactly when a scoped credential can
       // cross its renewal point unnoticed.
@@ -1118,7 +1108,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
         // polled independent of whether/when the next chunk arrives, and
         // acted on by tearing the stream down, or a signal during an
         // active stream is never actually noticed. Same mechanism also
-        // unblocks a mid-stream proactive-refresh failure (`refreshFailed`
+        // unblocks a mid-stream scoped-renewal failure (`scopedRefreshFailed`
         // above) instead of riding out the connection to its next natural
         // event.
         const stopPollHandle = timers.setInterval(() => {
@@ -1129,7 +1119,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
           // this the daemon would sit on a live socket it can no longer
           // heartbeat for, and the tile would age out to `stopped` while the
           // process pretended to be attached.
-          if (shouldStop() || refreshFailed || scopedRefreshFailed || credentialRejected) {
+          if (shouldStop() || scopedRefreshFailed || credentialRejected) {
             nodeStream.destroy();
           }
         }, STOP_POLL_INTERVAL_MS);
@@ -1165,11 +1155,10 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
                   heartbeat?.stop();
                   heartbeat = startHeartbeat(
                     async () => {
-                      const refreshCheck = await ensureFreshAccountToken();
-                      if (!refreshCheck.ok) {
-                        refreshFailed = refreshCheck;
-                        return;
-                      }
+                      // Not awaited, for the same reason as before the
+                      // stream opened: a hung auth-service must never hold up
+                      // the heartbeat that keeps this tile alive.
+                      void ensureFreshAccountTokenOnce();
                       // Renew the scoped credential BEFORE the heartbeat that
                       // would use it, so a tick that crosses the renewal point
                       // heartbeats with the new token rather than spending one
@@ -1331,7 +1320,7 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
       // fatal refusal stops on the FIRST occurrence, so no second attempt is
       // counted, scheduled or slept through.
       if (credentialRejected) break;
-      if (refreshFailed || scopedRefreshFailed) break;
+      if (scopedRefreshFailed) break;
       if (shouldStop()) break;
 
       attempt += 1;
@@ -1361,9 +1350,9 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
   }
 
   if (scopedRefreshFailed) {
-    // OUT-OF-BAND ONLY — no `log()` here, unlike the account-token path below.
-    // That path is reached from the daemon's own pre-attach startup or as its
-    // terminal exit line; this one fires from inside a live session, where the
+    // OUT-OF-BAND ONLY — no `log()` here, unlike the pre-attach account-token
+    // failure above, which is reached before anything owns the terminal. This
+    // one fires from inside a live session, where the
     // local agent's PTY is piped to this process's stdout and any human-
     // readable line lands in the middle of a frame its TUI believes it drew
     // (connection-state.ts's module header). `interrupted` is the honest
@@ -1377,17 +1366,6 @@ export async function runAttachDaemon(deps: AttachDaemonDeps): Promise<AttachDae
     // the best-effort `runDetach()` cleanup that stops a stale attachment being
     // left behind, which is exactly what should happen here too.
     return { ok: false, reason: 'refresh-failed', message: scopedRefreshFailed.message };
-  }
-
-  if (refreshFailed) {
-    noteConnection('interrupted', { detail: `token refresh failed: ${refreshFailed.message}` });
-    // Still on stdout, deliberately: this is the terminal EXIT message for
-    // a daemon that is about to return and let cli.ts kill the local PTY.
-    // Unlike the reconnect narration above, there is no frame left to
-    // corrupt, and the alternative is an unexplained silent exit.
-    log(`Token refresh failed: ${refreshFailed.message}`);
-    log('Run `yolo-bridge login` again.');
-    return { ok: false, reason: 'refresh-failed', message: refreshFailed.message };
   }
 
   return { ok: true, reason: 'stopped' };
@@ -1421,11 +1399,16 @@ export interface PickWorkspaceDeps {
   fetchImpl?: apiClient.FetchImpl;
   log?: (line: string) => void;
   prompt?: (question: string) => Promise<string>;
+  /** Account-token renewal seams (account-auth.ts). */
+  authBaseUrl?: string;
+  now?: () => number;
+  refreshAccessToken?: RefreshTokenFn;
 }
 
 export type PickWorkspaceResult =
   | { ok: true; workspaceId: string }
   | { ok: false; reason: 'not-logged-in' }
+  | { ok: false; reason: 'refresh-failed'; message: string; retryable: boolean }
   | { ok: false; reason: 'list-failed'; message: string }
   | { ok: false; reason: 'no-workspaces' }
   | { ok: false; reason: 'no-selection' };
@@ -1441,8 +1424,9 @@ function defaultPrompt(question: string): Promise<string> {
 }
 
 export async function pickWorkspaceFromDisk(deps: PickWorkspaceDeps): Promise<PickWorkspaceResult> {
-  const auth = loadAuth(deps.env, deps.io);
-  if (!auth) return { ok: false, reason: 'not-logged-in' };
+  const fresh = await ensureFreshAccountAuth(deps);
+  if (!fresh.ok) return fresh;
+  const { auth } = fresh;
 
   const log = deps.log ?? ((line: string) => process.stdout.write(`${line}\n`));
   const prompt = deps.prompt ?? defaultPrompt;

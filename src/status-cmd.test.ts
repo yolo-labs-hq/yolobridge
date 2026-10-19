@@ -68,6 +68,17 @@ describe('getStatus', () => {
     saveAuth({ accessToken: 'at', refreshToken: 'rt', tokenType: 'Bearer', expiresAtMs: 500 }, ENV, io);
     const report = getStatus({ env: ENV, io, now: () => 1_000 });
     assert.equal(report.tokenExpired, true);
+    assert.equal(report.tokenAutoRenews, true);
+    assert.match(formatStatus(report), /renews automatically on next use/);
+    assert.doesNotMatch(formatStatus(report), /log in again/);
+  });
+
+  it('still asks for a new login when an expired token has no refresh token to renew with', () => {
+    const io = fakeIO();
+    saveAuth({ accessToken: 'at', tokenType: 'Bearer', expiresAtMs: 500 }, ENV, io);
+    const report = getStatus({ env: ENV, io, now: () => 1_000 });
+    assert.equal(report.tokenAutoRenews, false);
+    assert.match(formatStatus(report), /log in again/);
   });
 });
 

@@ -141,6 +141,41 @@ describe('startMcpProxy', () => {
     assert.equal(forwardCalls[0].body.params.arguments._delegatedToken, 'tok-1');
   });
 
+  it('awaits an ASYNC account-token getter on every mint, so a renewed token is what reaches the mint endpoint', async () => {
+    // The daemon passes `getFreshAccessToken`, which may rotate the account
+    // token before resolving. A proxy that stringified the promise, or read the
+    // token before the renewal settled, would mint with the expired one.
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    const mintAuths: string[] = [];
+    const baseFetch = makeFetch({ mintToken: () => mintResponse(`tok-${mintAuths.length}`, 1) });
+    const fetchImpl = (async (url: any, init?: any) => {
+      if (String(url).endsWith('/v1/mcp/tokens')) mintAuths.push(String(init?.headers?.Authorization));
+      return baseFetch(url, init);
+    }) as any;
+    let account = 'account-tok-1';
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com',
+      getAccessToken: async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        return account;
+      },
+      workspaceId: 'w1',
+      agentId: 'claude',
+      fetchImpl,
+      log: () => {},
+    });
+    assert.ok(handle);
+    account = 'account-tok-2';
+    // The startup token expires within the refresh buffer, so this call re-mints.
+    const res = await fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(mintAuths, ['Bearer account-tok-1', 'Bearer account-tok-2']);
+  });
+
   it('does not inject a token into a non-tools/call request (e.g. initialize)', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     let forwardedBody: any;
