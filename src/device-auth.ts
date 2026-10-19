@@ -215,6 +215,46 @@ export async function refreshAccessToken(
   };
 }
 
+export type LogoutResult =
+  | { status: 'revoked' }
+  /** 401: auth-service no longer accepts this access token (already signed
+   *  out, or expired). Nothing is left for it to revoke. */
+  | { status: 'unauthorized'; message: string }
+  | { status: 'failed'; message: string };
+
+/**
+ * `POST /api/v1/auth/logout` — ends the sign-in this access token belongs to
+ * (`AuthController.logout`). auth-service revokes the session's whole LINEAGE,
+ * so every refresh token rotated from the original device login dies with it,
+ * including one a running daemon holds in memory. Only that one sign-in: the
+ * browser and workspace pods keep theirs (`/logout-all` is the account-wide
+ * route, deliberately not used here).
+ */
+export async function logoutSession(
+  authBaseUrl: string,
+  accessToken: string,
+  fetchImpl: FetchImpl = fetch,
+  timeoutMs: number = REFRESH_TIMEOUT_MS,
+): Promise<LogoutResult> {
+  let res: Response;
+  let body: any;
+  try {
+    res = await fetchImpl(`${normalizeBase(authBaseUrl)}/api/v1/auth/logout`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: '{}',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    body = await safeJson(res);
+  } catch (err) {
+    return { status: 'failed', message: err instanceof Error ? err.message : String(err) };
+  }
+  if (res.ok) return { status: 'revoked' };
+  const message = extractErrorMessage(body) || `logout failed: ${res.status}`;
+  if (res.status === 401) return { status: 'unauthorized', message };
+  return { status: 'failed', message };
+}
+
 async function safeJson(res: Response): Promise<any> {
   try {
     return await res.json();
