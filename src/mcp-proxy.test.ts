@@ -176,7 +176,7 @@ describe('startMcpProxy', () => {
     assert.deepEqual(mintAuths, ['Bearer account-tok-1', 'Bearer account-tok-2']);
   });
 
-  it('the startup timeout also bounds a HUNG account-token renewal, so the attach still proceeds without MCP', async () => {
+  it('the startup timeout also bounds a HUNG account-token renewal, so the agent is not held up', async () => {
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     const started = Date.now();
     handle = await startMcpProxy({
@@ -188,7 +188,7 @@ describe('startMcpProxy', () => {
       log: () => {},
       mintTimeoutMs: 50,
     });
-    assert.equal(handle, undefined, 'MCP is skipped rather than blocking the agent from starting');
+    assert.ok(handle, 'a timed-out renewal is transient: the proxy starts and mints on a later call');
     assert.ok(Date.now() - started < 2000, 'returned on the startup timeout, not on the hung renewal');
   });
 
@@ -545,7 +545,7 @@ describe('startMcpProxy', () => {
     assert.equal(mintCount, 1, 'a long-lived (300s) token should not be re-minted for every call');
   });
 
-  it('returns undefined (never throws) when the initial mint fails, so attach is not aborted', async () => {
+  it('returns undefined (never throws) when the initial mint is PERMANENTLY refused (400), so attach is not aborted', async () => {
     const fetchImpl = (async (url: any) => {
       const u = String(url);
       if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
@@ -563,7 +563,22 @@ describe('startMcpProxy', () => {
     assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
   });
 
-  it('returns undefined (never throws) when scope discovery itself fails', async () => {
+  it('returns undefined for a 403 (agent not mintable) too — retrying cannot help', async () => {
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) {
+        return new Response(JSON.stringify({ error: 'Agent x cannot be minted via the token API' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'x', fetchImpl, log: () => {},
+    });
+    assert.equal(handle, undefined);
+  });
+
+  it('a TRANSIENT scope-discovery failure (500) still starts the proxy, so the agent is wired for MCP', async () => {
     const fetchImpl = (async (url: any) => {
       const u = String(url);
       if (u.endsWith('/v1/mcp/scopes')) return new Response('nope', { status: 500 });
@@ -574,11 +589,59 @@ describe('startMcpProxy', () => {
     handle = await startMcpProxy({
       apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: (l) => logs.push(l),
     });
-    assert.equal(handle, undefined);
-    assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
+    assert.ok(handle, 'the agent reads MCP config only at launch — skipping the proxy now would disable MCP for the whole session');
+    assert.ok(logs.some((l) => l.includes('not available yet')));
+    assert.ok(!logs.some((l) => l.includes('access ready')), 'must not claim readiness it does not have');
   });
 
-  it('a startup mint that never resolves is aborted by mintTimeoutMs, returning undefined instead of hanging forever (Codex review, 2026-08-24)', async () => {
+  it('RECOVERS: a proxy whose startup mint failed transiently mints on the next tool call once the outage ends', async () => {
+    // The reported case: a laptop attaching offline, or a resumed daemon whose
+    // account token had expired (mint 401 until the daemon renews it).
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let accountToken = 'expired-at';
+    const mintAuths: string[] = [];
+    const forwarded: any[] = [];
+    const fetchImpl = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) {
+        const auth = String(init?.headers?.Authorization);
+        mintAuths.push(auth);
+        if (auth !== 'Bearer good-at') {
+          return new Response(JSON.stringify({ error: 'Authentication required' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        }
+        return mintResponse('tok-after-recovery', 300);
+      }
+      if (u === `${FAKE_UPSTREAM}/mcp`) {
+        forwarded.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => accountToken, workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+    });
+    assert.ok(handle, 'a 401 at startup is transient — the daemon is still renewing the account token');
+
+    const call = () => fetch(handle!.url, {
+      method: 'POST',
+      headers: authedHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+    });
+
+    const during = await call();
+    assert.equal(during.status, 503, 'still failing: a retryable 503, not a dead proxy');
+    assert.equal(((await during.json()) as { code?: string }).code, 'MCP_TOKEN_UNAVAILABLE');
+
+    accountToken = 'good-at'; // the daemon's renewal landed
+    const after = await call();
+    assert.equal(after.status, 200);
+    assert.equal(forwarded.at(-1).params.arguments._delegatedToken, 'tok-after-recovery');
+    assert.equal(mintAuths.at(-1), 'Bearer good-at');
+  });
+
+  it('a startup mint that never resolves is aborted by mintTimeoutMs instead of hanging forever (Codex review, 2026-08-24)', async () => {
     // A real `fetch` rejects with an AbortError once its signal fires --
     // this fetchImpl mirrors that instead of just ignoring the signal, so
     // the test actually proves startMcpProxy's own abort wiring works, not
@@ -595,9 +658,9 @@ describe('startMcpProxy', () => {
       apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude',
       fetchImpl, mintTimeoutMs: 20, log: (l) => logs.push(l),
     });
-    assert.equal(handle, undefined);
+    assert.ok(handle, 'a timed-out startup mint is transient — the proxy still starts');
     assert.ok(Date.now() - start < 2000, 'must resolve promptly via the short mintTimeoutMs, not hang');
-    assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
+    assert.ok(logs.some((l) => l.includes('not available yet')));
   });
 
   it('a startup mint whose HEADERS arrive but whose BODY stalls is also aborted by mintTimeoutMs (Codex review, 2026-08-24, round 14)', async () => {
@@ -631,9 +694,9 @@ describe('startMcpProxy', () => {
       apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude',
       fetchImpl, mintTimeoutMs: 20, log: (l) => logs.push(l),
     });
-    assert.equal(handle, undefined);
+    assert.ok(handle, 'a timed-out startup mint is transient — the proxy still starts');
     assert.ok(Date.now() - start < 2000, 'must resolve promptly via the short mintTimeoutMs, not hang on a stalled body');
-    assert.ok(logs.some((l) => l.includes('local MCP access unavailable')));
+    assert.ok(logs.some((l) => l.includes('not available yet')));
   });
 
   it('stop() aborts an in-flight forwarded request instead of waiting for it to finish (Codex review, 2026-08-24)', async () => {

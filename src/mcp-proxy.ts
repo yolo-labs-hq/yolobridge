@@ -178,7 +178,21 @@ interface MintResult {
   expiresAtMs: number;
 }
 
-class TokenUnavailableError extends Error {}
+class TokenUnavailableError extends Error {
+  /**
+   * True when retrying cannot help: common-api answered 400/403, i.e. this
+   * agent is unregistered, cannot be minted for, or the request is malformed.
+   * Everything else — a network error, a timeout, a 401 while the daemon is
+   * still renewing the account token, 429, 5xx — is transient.
+   */
+  constructor(message: string, readonly permanent = false) {
+    super(message);
+  }
+}
+
+function isPermanentStatus(status: number): boolean {
+  return status === 400 || status === 403;
+}
 
 /**
  * Tracks every outgoing fetch this proxy makes (mint, scope discovery, AND
@@ -227,7 +241,7 @@ class RequestTracker {
 async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl, tracker: RequestTracker): Promise<string[]> {
   return tracker.run(async (signal) => {
     const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/scopes`, { signal });
-    if (!res.ok) throw new TokenUnavailableError(`scope discovery failed: HTTP ${res.status}`);
+    if (!res.ok) throw new TokenUnavailableError(`scope discovery failed: HTTP ${res.status}`, isPermanentStatus(res.status));
     const body = (await res.json()) as any;
     if (!Array.isArray(body?.scopes) || body.scopes.length === 0) {
       throw new TokenUnavailableError('scope discovery returned an unexpected shape');
@@ -287,7 +301,7 @@ function makeTokenCache(
         } catch {
           /* keep the HTTP-status fallback */
         }
-        throw new TokenUnavailableError(`mint failed: ${message}`);
+        throw new TokenUnavailableError(`mint failed: ${message}`, isPermanentStatus(res.status));
       }
       const body = (await res.json()) as any;
       if (typeof body?.token !== 'string' || typeof body?.expiresAt !== 'string') {
@@ -329,11 +343,22 @@ function makeTokenCache(
 }
 
 /**
- * Starts the local proxy. Returns `undefined` (never throws) if the initial
- * mint fails — MCP access is a best-effort enhancement on top of a tile
- * that already works without it (send_to_tile/read_tile_output into the
- * daemon's own PTY are unaffected either way), so a mint failure (e.g. an
- * unregistered --agent binary) must not abort the whole `attach`.
+ * Starts the local proxy. Never throws: MCP access is a best-effort
+ * enhancement on top of a tile that already works without it.
+ *
+ * The startup mint decides only ONE thing — whether this agent can EVER get
+ * MCP access:
+ *
+ * - A PERMANENT refusal (400/403: unregistered agent, not mintable) returns
+ *   `undefined`, and the agent starts without MCP flags.
+ * - A TRANSIENT failure (network, timeout, a 401 while the daemon is still
+ *   renewing the account token, 429, 5xx) still starts the proxy. The agent
+ *   reads its MCP config only at launch, so a proxy started any later could
+ *   never reach it; started now, the first tool call that lands after the
+ *   outage simply mints then (`getToken` retries on every call until one
+ *   succeeds, answering a retryable 503 meanwhile). Before this, a laptop
+ *   that attached while offline, or a resumed daemon whose account token
+ *   had expired, ran the whole session with no MCP at all.
  */
 export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHandle | undefined> {
   const log = opts.log ?? (() => {});
@@ -349,11 +374,17 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
   // settles either way, so it can never fire against the running proxy's
   // later request traffic.
   const startupTimeout = setTimeout(() => tracker.abortAll(), opts.mintTimeoutMs ?? STARTUP_MINT_TIMEOUT_MS);
+  let tokenReady = true;
   try {
     await tokenCache.getToken();
   } catch (err) {
-    log(`yolo-bridge: local MCP access unavailable (${err instanceof Error ? err.message : String(err)}) — continuing without it.`);
-    return undefined;
+    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof TokenUnavailableError && err.permanent) {
+      log(`yolo-bridge: local MCP access unavailable (${message}) — continuing without it.`);
+      return undefined;
+    }
+    tokenReady = false;
+    log(`yolo-bridge: local MCP token not available yet (${message}) — starting the proxy anyway; it retries on the next tool call.`);
   } finally {
     clearTimeout(startupTimeout);
   }
@@ -386,7 +417,7 @@ export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHand
 
   const { port } = server.address() as AddressInfo;
   const url = `http://127.0.0.1:${port}/mcp`;
-  log(`yolo-bridge: local MCP access ready (${url}).`);
+  if (tokenReady) log(`yolo-bridge: local MCP access ready (${url}).`);
 
   return {
     url,
