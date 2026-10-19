@@ -94,7 +94,8 @@ const REFRESH_BUFFER_MS = 15_000;
 // therefore `onAttached` — indefinitely, wedging `startLocalAgent` behind a
 // best-effort enhancement that was supposed to degrade, not hang. Generous
 // for a real round trip (2 sequential requests: scopes, then mint) but
-// bounded; a caller that hits this still gets a working attach without MCP.
+// bounded; a timeout counts as transient, so the proxy still starts and
+// mints on a later tool call.
 const STARTUP_MINT_TIMEOUT_MS = 15_000;
 
 export type FetchImpl = typeof fetch;
@@ -114,7 +115,8 @@ export interface McpProxyOptions {
   workspaceId: string;
   /** The agent binary being spawned (e.g. 'claude', 'codex') — minted as-is;
    *  must be a registered agent with a spawnable binary (`isHttpMintableAgent`
-   *  in common-api/src/services/agent-registry.ts) or the mint 400s. */
+   *  in common-api/src/services/agent-registry.ts) or the mint is refused
+   *  (400 unregistered, 403 not mintable). */
   agentId: string;
   /** The tile this daemon attached (the `tileId` from `attach`) — minted as
    *  the token's `callerTileId` self-identity claim so the spawned agent can
@@ -137,6 +139,8 @@ export interface McpProxyOptions {
   /** Overrides `STARTUP_MINT_TIMEOUT_MS` — for tests only (a real caller
    *  should never need less than the default). */
   mintTimeoutMs?: number;
+  /** Overrides `MINT_FAILURE_BACKOFF_MS` — for tests only. */
+  mintFailureBackoffMs?: number;
 }
 
 export interface McpProxyHandle {
@@ -185,13 +189,38 @@ class TokenUnavailableError extends Error {
    * Everything else — a network error, a timeout, a 401 while the daemon is
    * still renewing the account token, 429, 5xx — is transient.
    */
-  constructor(message: string, readonly permanent = false) {
+  constructor(message: string, readonly permanent = false, readonly retryAfterMs?: number) {
     super(message);
   }
 }
 
+/**
+ * common-api's mint route answers these for conditions retrying cannot
+ * change (`routes/mcp.ts`'s `/tokens` handler and its error-code map): a bad
+ * request or unregistered agent (400), a non-mintable agent or owner mismatch
+ * (403), the workspace gone (404) or terminated (412).
+ */
 function isPermanentStatus(status: number): boolean {
-  return status === 400 || status === 403;
+  return status === 400 || status === 403 || status === 404 || status === 412;
+}
+
+/** After a failed mint, answer from memory for this long instead of hitting
+ *  common-api again on every tool call. */
+const MINT_FAILURE_BACKOFF_MS = 5_000;
+
+/** True when any message in the body is a `tools/call` — the only method that
+ *  carries the delegated token (`injectTokenIntoMessage`). The handshake
+ *  (`initialize`, `notifications/initialized`) and `tools/list` do not, and
+ *  must pass through even while no token can be minted: an agent whose
+ *  handshake fails marks the server dead for the whole session. */
+function needsToken(rawBody: string): boolean {
+  try {
+    const parsed = JSON.parse(rawBody);
+    const msgs = Array.isArray(parsed) ? parsed : [parsed];
+    return msgs.some((m) => m?.method === 'tools/call' && typeof m.params === 'object' && m.params !== null);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -271,6 +300,7 @@ function makeTokenCache(
   callerTileId: string | undefined,
   fetchImpl: FetchImpl,
   tracker: RequestTracker,
+  mintFailureBackoffMs: number,
 ) {
   let cached: MintResult | undefined;
 
@@ -329,11 +359,27 @@ function makeTokenCache(
     return pendingMint;
   }
 
+  // A failed mint is remembered briefly, so a session whose token cannot be
+  // minted (an outage, a login being renewed) costs common-api one scope
+  // fetch + mint per backoff window rather than one per tool call.
+  let failure: { until: number; message: string } | undefined;
+
   return {
     async getToken(): Promise<string> {
       if (cached && Date.now() < cached.expiresAtMs - REFRESH_BUFFER_MS) return cached.token;
-      cached = await mintOnce();
-      return cached.token;
+      if (failure && Date.now() < failure.until) {
+        throw new TokenUnavailableError(failure.message, false, failure.until - Date.now());
+      }
+      try {
+        cached = await mintOnce();
+        failure = undefined;
+        return cached.token;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failure = { until: Date.now() + mintFailureBackoffMs, message };
+        if (err instanceof TokenUnavailableError && err.permanent) throw err;
+        throw new TokenUnavailableError(message, false, mintFailureBackoffMs);
+      }
     },
     async forceRefresh(): Promise<string> {
       cached = await mintOnce();
@@ -349,23 +395,31 @@ function makeTokenCache(
  * The startup mint decides only ONE thing — whether this agent can EVER get
  * MCP access:
  *
- * - A PERMANENT refusal (400/403: unregistered agent, not mintable) returns
+ * - A PERMANENT refusal (400/403/404/412: unregistered or non-mintable agent,
+ *   workspace gone or terminated — see `isPermanentStatus`) returns
  *   `undefined`, and the agent starts without MCP flags.
  * - A TRANSIENT failure (network, timeout, a 401 while the daemon is still
  *   renewing the account token, 429, 5xx) still starts the proxy. The agent
  *   reads its MCP config only at launch, so a proxy started any later could
- *   never reach it; started now, the first tool call that lands after the
- *   outage simply mints then (`getToken` retries on every call until one
- *   succeeds, answering a retryable 503 meanwhile). Before this, a laptop
- *   that attached while offline, or a resumed daemon whose account token
- *   had expired, ran the whole session with no MCP at all.
+ *   never reach it. Started now, the handshake and `tools/list` pass straight
+ *   through (they carry no token — see `needsToken`), and `tools/call` gets a
+ *   retryable 503 until a mint succeeds (retried at most once per
+ *   `MINT_FAILURE_BACKOFF_MS`). Before this, a resumed daemon whose account
+ *   token had expired ran the whole session with no MCP at all.
+ *
+ *   An agent attached while fully OFFLINE is only helped if its MCP client
+ *   retries a failed first connect: the upstream is unreachable too, so the
+ *   handshake fails there rather than here.
  */
 export async function startMcpProxy(opts: McpProxyOptions): Promise<McpProxyHandle | undefined> {
   const log = opts.log ?? (() => {});
   const fetchImpl = opts.fetchImpl ?? fetch;
   const tracker = new RequestTracker();
 
-  const tokenCache = makeTokenCache(opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, opts.callerTileId, fetchImpl, tracker);
+  const tokenCache = makeTokenCache(
+    opts.apiUrl, opts.getAccessToken, opts.workspaceId, opts.agentId, opts.callerTileId, fetchImpl, tracker,
+    opts.mintFailureBackoffMs ?? MINT_FAILURE_BACKOFF_MS,
+  );
 
   // Bounded (STARTUP_MINT_TIMEOUT_MS): a stalled scope-discovery/mint fetch
   // must not block `onAttached` from ever reaching `startLocalAgent`
@@ -789,7 +843,7 @@ async function handleRequest(
   // `parseRpcEnvelope`.
 
   let forwardedBody = forwardedAfterLocal;
-  if (method === 'POST' && forwardedAfterLocal) {
+  if (method === 'POST' && forwardedAfterLocal && needsToken(forwardedAfterLocal)) {
     try {
       const token = await getToken();
       forwardedBody = injectToken(forwardedAfterLocal, token);
@@ -805,8 +859,14 @@ async function handleRequest(
         res.end(mergeLocalWithRemoteFailure(localResponseText, forwardedAfterLocal, 'MCP token unavailable'));
         return;
       }
+      const retryAfterMs = err instanceof TokenUnavailableError ? err.retryAfterMs : undefined;
       res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'MCP token unavailable', code: 'MCP_TOKEN_UNAVAILABLE', retryable: true }));
+      res.end(JSON.stringify({
+        error: 'MCP token unavailable',
+        code: 'MCP_TOKEN_UNAVAILABLE',
+        retryable: true,
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      }));
       return;
     }
   }

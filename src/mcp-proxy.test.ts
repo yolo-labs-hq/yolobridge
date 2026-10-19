@@ -594,9 +594,11 @@ describe('startMcpProxy', () => {
     assert.ok(!logs.some((l) => l.includes('access ready')), 'must not claim readiness it does not have');
   });
 
-  it('RECOVERS: a proxy whose startup mint failed transiently mints on the next tool call once the outage ends', async () => {
-    // The reported case: a laptop attaching offline, or a resumed daemon whose
-    // account token had expired (mint 401 until the daemon renews it).
+  it('RECOVERS: during a token outage the handshake and tools/list still pass, tools/call gets a retryable 503, then works', async () => {
+    // The reported case: a resumed daemon whose account token had expired
+    // (mint 401 until the daemon renews it). A real MCP client handshakes
+    // first; if `initialize` failed it would mark the server dead for the
+    // whole session, so the outage must only ever touch `tools/call`.
     process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
     let accountToken = 'expired-at';
     const mintAuths: string[] = [];
@@ -613,33 +615,83 @@ describe('startMcpProxy', () => {
         return mintResponse('tok-after-recovery', 300);
       }
       if (u === `${FAKE_UPSTREAM}/mcp`) {
-        forwarded.push(JSON.parse(init.body));
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        const body = JSON.parse(init.body);
+        forwarded.push(body);
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? null, result: { ok: true } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       throw new Error(`unexpected fetch: ${u}`);
     }) as any;
 
     handle = await startMcpProxy({
       apiUrl: 'https://api.example.com', getAccessToken: () => accountToken, workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      mintFailureBackoffMs: 0,
     });
     assert.ok(handle, 'a 401 at startup is transient — the daemon is still renewing the account token');
 
-    const call = () => fetch(handle!.url, {
+    const send = (msg: object) => fetch(handle!.url, {
       method: 'POST',
       headers: authedHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+      body: JSON.stringify(msg),
     });
+    const toolCall = { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } };
 
-    const during = await call();
+    // The agent's launch sequence, mid-outage.
+    assert.equal((await send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })).status, 200, 'initialize must not need a token');
+    assert.equal((await send({ jsonrpc: '2.0', method: 'notifications/initialized' })).status, 200);
+    assert.equal((await send({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).status, 200, 'tools/list must not need a token');
+    const during = await send(toolCall);
     assert.equal(during.status, 503, 'still failing: a retryable 503, not a dead proxy');
     assert.equal(((await during.json()) as { code?: string }).code, 'MCP_TOKEN_UNAVAILABLE');
+    assert.deepEqual(forwarded.map((m) => m.method), ['initialize', 'notifications/initialized', 'tools/list']);
 
     accountToken = 'good-at'; // the daemon's renewal landed
-    const after = await call();
+    const after = await send(toolCall);
     assert.equal(after.status, 200);
     assert.equal(forwarded.at(-1).params.arguments._delegatedToken, 'tok-after-recovery');
     assert.equal(mintAuths.at(-1), 'Bearer good-at');
   });
+
+  it('backs off after a failed mint instead of hitting common-api on every tool call', async () => {
+    process.env.YOLOBRIDGE_MCP_URL = FAKE_UPSTREAM;
+    let mints = 0;
+    const fetchImpl = (async (url: any) => {
+      const u = String(url);
+      if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+      if (u.endsWith('/v1/mcp/tokens')) { mints += 1; return new Response('{}', { status: 503 }); }
+      throw new Error(`unexpected fetch: ${u}`);
+    }) as any;
+    handle = await startMcpProxy({
+      apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      mintFailureBackoffMs: 60_000,
+    });
+    assert.ok(handle);
+    for (let i = 0; i < 5; i++) {
+      const res = await fetch(handle!.url, {
+        method: 'POST',
+        headers: authedHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ jsonrpc: '2.0', id: i, method: 'tools/call', params: { name: 'list_tiles', arguments: {} } }),
+      });
+      assert.equal(res.status, 503);
+      const body = (await res.json()) as { retryAfterMs?: number };
+      assert.ok(typeof body.retryAfterMs === 'number' && body.retryAfterMs > 0, 'tells the client when to retry');
+    }
+    assert.equal(mints, 1, 'only the startup mint — every call since was answered from the backoff');
+  });
+
+  for (const status of [404, 412]) {
+    it(`treats a ${status} mint (workspace gone / terminated) as PERMANENT`, async () => {
+      const fetchImpl = (async (url: any) => {
+        const u = String(url);
+        if (u.endsWith('/v1/mcp/scopes')) return scopesResponse();
+        if (u.endsWith('/v1/mcp/tokens')) return new Response(JSON.stringify({ error: 'Workspace not found' }), { status });
+        throw new Error(`unexpected fetch: ${u}`);
+      }) as any;
+      handle = await startMcpProxy({
+        apiUrl: 'https://api.example.com', getAccessToken: () => 'at', workspaceId: 'w1', agentId: 'claude', fetchImpl, log: () => {},
+      });
+      assert.equal(handle, undefined);
+    });
+  }
 
   it('a startup mint that never resolves is aborted by mintTimeoutMs instead of hanging forever (Codex review, 2026-08-24)', async () => {
     // A real `fetch` rejects with an AbortError once its signal fires --
