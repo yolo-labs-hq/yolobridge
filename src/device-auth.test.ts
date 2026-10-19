@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { requestDeviceCode, pollDeviceToken, DeviceAuthError, type FetchImpl } from './device-auth.js';
+import { requestDeviceCode, pollDeviceToken, refreshAccessToken, DeviceAuthError, type FetchImpl } from './device-auth.js';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -112,5 +112,47 @@ describe('pollDeviceToken', () => {
     const fetchImpl = fetchStub(() => jsonResponse(404, { error: { message: 'Invalid device code', statusCode: 404 } }));
     const result = await pollDeviceToken('https://auth.example.com', 'dc-1', fetchImpl);
     assert.deepEqual(result, { status: 'error', message: 'Invalid device code' });
+  });
+});
+
+describe('refreshAccessToken', () => {
+  it('reports a network failure as a RETRYABLE outcome instead of throwing', async () => {
+    const fetchImpl = (async () => { throw new TypeError('fetch failed'); }) as unknown as FetchImpl;
+    const result = await refreshAccessToken('https://auth.example.com', 'rt', fetchImpl);
+    assert.deepEqual(result, { status: 'failed', message: 'fetch failed', retryable: true });
+  });
+
+  it('gives up on an auth-service that never answers, as a RETRYABLE failure', async () => {
+    const fetchImpl = ((_url: any, init?: any) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason));
+      })) as unknown as FetchImpl;
+    // AbortSignal.timeout's timer is unref'd; a real hung request keeps the
+    // process alive through its open socket, so stand in for that here.
+    const keepAlive = setInterval(() => {}, 1000);
+    const result = await refreshAccessToken('https://auth.example.com', 'rt', fetchImpl, 20).finally(() => clearInterval(keepAlive));
+    assert.equal(result.status, 'failed');
+    if (result.status === 'failed') assert.equal(result.retryable, true);
+  });
+
+  it('treats a 5xx as retryable and a 401 as a refusal', async () => {
+    const down = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(503, { error: { message: 'unavailable' } })));
+    assert.deepEqual(down, { status: 'failed', message: 'unavailable', retryable: true });
+    const refused = await refreshAccessToken('https://auth.example.com', 'rt', fetchStub(() => jsonResponse(401, { error: { message: 'Refresh token revoked' } })));
+    assert.deepEqual(refused, { status: 'failed', message: 'Refresh token revoked', retryable: false });
+  });
+
+  it('parses the rotated pair', async () => {
+    const fetchImpl = fetchStub((url, init) => {
+      assert.equal(url, 'https://auth.example.com/api/v1/auth/refresh');
+      assert.deepEqual(JSON.parse(String(init?.body)), { refresh_token: 'rt-1' });
+      return jsonResponse(200, { tokens: { accessToken: 'at-2', refreshToken: 'rt-2', expiresIn: 86_400 } });
+    });
+    const result = await refreshAccessToken('https://auth.example.com/', 'rt-1', fetchImpl);
+    assert.equal(result.status, 'ok');
+    if (result.status === 'ok') {
+      assert.equal(result.tokens.refreshToken, 'rt-2');
+      assert.equal(result.tokens.expiresInSec, 86_400);
+    }
   });
 });

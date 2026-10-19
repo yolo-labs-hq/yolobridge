@@ -103,12 +103,14 @@ export interface McpProxyOptions {
   /** common-api base URL (yolobridge's own apiUrl()) — where tokens are minted. */
   apiUrl: string;
   /** Live getter for the account access token (NOT a one-time snapshot) —
-   *  the attach daemon proactively refreshes this roughly every 24h
-   *  (Bug 2 in attach-cmd.ts's `ensureFreshToken`), and this proxy can
-   *  outlive many of those refreshes over a long-running attachment.
+   *  the attach daemon rotates this roughly every 24h, and this proxy can
+   *  outlive many of those rotations over a long-running attachment.
    *  Called fresh on every mint; closing over a static token instead would
-   *  401 forever once the original one expired (Codex review, 2026-08-24). */
-  getAccessToken: () => string;
+   *  401 forever once the original one expired (Codex review, 2026-08-24).
+   *  May be async: the daemon passes `getFreshAccessToken`, which renews an
+   *  expired account token BEFORE handing it over, so a mint right after a
+   *  laptop wakes doesn't present yesterday's token. */
+  getAccessToken: () => string | Promise<string>;
   workspaceId: string;
   /** The agent binary being spawned (e.g. 'claude', 'codex') — minted as-is;
    *  must be a registered agent with a spawnable binary (`isHttpMintableAgent`
@@ -234,12 +236,22 @@ async function fetchAllScopes(apiUrl: string, fetchImpl: FetchImpl, tracker: Req
   });
 }
 
+/** Settles with `promise`, or rejects as soon as `signal` aborts. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 /** One cached, self-refreshing, workspace-wide token — scoped to whatever
  *  `agentId`'s registry entry actually allows out of the full scope
  *  universe (see this file's header comment). */
 function makeTokenCache(
   apiUrl: string,
-  getAccessToken: () => string,
+  getAccessToken: () => string | Promise<string>,
   workspaceId: string,
   agentId: string,
   callerTileId: string | undefined,
@@ -251,9 +263,13 @@ function makeTokenCache(
   async function mint(): Promise<MintResult> {
     const scopes = await fetchAllScopes(apiUrl, fetchImpl, tracker);
     return tracker.run(async (signal) => {
+      // Inside the tracked call, and abortable: the getter may be renewing the
+      // account token, and the startup timeout's `abortAll()` must be able to
+      // cut that wait short like any other request.
+      const accessToken = await untilAborted(Promise.resolve(getAccessToken()), signal);
       const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}/v1/mcp/tokens`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${getAccessToken()}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           workspaceId,
           agentId,

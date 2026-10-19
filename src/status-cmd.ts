@@ -23,6 +23,7 @@
  */
 
 import { loadAuth, loadAttachment, type ConfigStoreIO } from './config-store.js';
+import { canAutoRenew } from './account-auth.js';
 import { listApprovals } from './approved-paths.js';
 import { loadConnectionState, formatConnectionEvent, type ConnectionEvent } from './connection-state.js';
 
@@ -43,6 +44,9 @@ export interface StatusReport {
   loggedIn: boolean;
   tokenExpiresAtMs?: number;
   tokenExpired?: boolean;
+  /** A refresh token is stored, so an expired access token is renewed on the
+   *  next command that needs it rather than requiring a new login. */
+  tokenAutoRenews?: boolean;
   attached: boolean;
   workspaceId?: string;
   tileId?: string;
@@ -77,6 +81,7 @@ export function getStatus(deps: StatusDeps = {}): StatusReport {
   if (auth) {
     report.tokenExpiresAtMs = auth.expiresAtMs;
     report.tokenExpired = auth.expiresAtMs <= now();
+    report.tokenAutoRenews = canAutoRenew(auth, now());
   }
   if (attachment) {
     report.workspaceId = attachment.workspaceId;
@@ -101,9 +106,16 @@ export function formatStatus(report: StatusReport): string {
   if (!report.loggedIn) {
     lines.push('Logged in: no (run `yolo-bridge login`)');
   } else {
-    lines.push(
-      `Logged in: yes${report.tokenExpired ? ' (access token expired — log in again)' : ` (token expires ${new Date(report.tokenExpiresAtMs!).toISOString()})`}`,
-    );
+    const expiry = new Date(report.tokenExpiresAtMs!).toISOString();
+    let detail: string;
+    if (report.tokenAutoRenews) {
+      detail = report.tokenExpired
+        ? ' (access token expired — renews automatically on next use)'
+        : ` (token expires ${expiry}, renews automatically)`;
+    } else {
+      detail = report.tokenExpired ? ' (access token expired — log in again)' : ` (token expires ${expiry})`;
+    }
+    lines.push(`Logged in: yes${detail}`);
   }
   if (!report.attached) {
     lines.push('Attached: no');

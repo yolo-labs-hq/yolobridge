@@ -60,11 +60,16 @@ export interface RefreshedTokens {
 
 export type RefreshTokenResult =
   | { status: 'ok'; tokens: RefreshedTokens }
-  | { status: 'failed'; message: string };
+  /** `retryable`: the call never got a verdict (network error, 5xx, 429), so
+   *  the refresh token may still be good and a later attempt can succeed.
+   *  Absent/false means auth-service refused it. */
+  | { status: 'failed'; message: string; retryable?: boolean };
 
 export type FetchImpl = typeof fetch;
 
 export class DeviceAuthError extends Error {}
+
+const REFRESH_TIMEOUT_MS = 15_000;
 
 function normalizeBase(authBaseUrl: string): string {
   return authBaseUrl.replace(/\/+$/, '');
@@ -141,8 +146,8 @@ export async function pollDeviceToken(
 }
 
 /**
- * `POST /api/v1/auth/refresh` — used to proactively rotate the daemon's
- * access token before it expires (see attach-cmd.ts). Field names read
+ * `POST /api/v1/auth/refresh` — used to rotate the stored account token
+ * before it expires (see account-auth.ts). Field names read
  * directly off `auth/src/controllers/AuthController.ts:995` (`refreshToken`)
  * and `auth/src/services/TokenService.ts`'s `TokenPair` interface — NOTE
  * this is a *different* shape from the device-flow endpoints above:
@@ -163,15 +168,33 @@ export async function refreshAccessToken(
   authBaseUrl: string,
   refreshToken: string,
   fetchImpl: FetchImpl = fetch,
+  timeoutMs: number = REFRESH_TIMEOUT_MS,
 ): Promise<RefreshTokenResult> {
-  const res = await fetchImpl(`${normalizeBase(authBaseUrl)}/api/v1/auth/refresh`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  });
-  const body = await safeJson(res);
+  let res: Response;
+  let body: any;
+  try {
+    res = await fetchImpl(`${normalizeBase(authBaseUrl)}/api/v1/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+      // Bounded: the daemon renews from inside a live session, and an
+      // auth-service that accepts the connection but never answers must not
+      // pin that renewal (and the MCP mints waiting on it) for minutes.
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    body = await safeJson(res);
+  } catch (err) {
+    // A network failure is not a verdict on the token. Reported as an outcome
+    // rather than thrown so callers on the daemon's heartbeat path can retry
+    // instead of unwinding the whole attach loop.
+    return { status: 'failed', message: err instanceof Error ? err.message : String(err), retryable: true };
+  }
   if (!res.ok) {
-    return { status: 'failed', message: extractErrorMessage(body) || `refresh failed: ${res.status}` };
+    return {
+      status: 'failed',
+      message: extractErrorMessage(body) || `refresh failed: ${res.status}`,
+      retryable: res.status >= 500 || res.status === 429,
+    };
   }
   const tokens = body?.tokens;
   if (
