@@ -33,6 +33,8 @@ export interface BinaryProbeFs {
   constants: { X_OK: number };
   /** First line of a file, or null if it cannot be read. Used for the shebang. */
   readFirstLine(p: string): string | null;
+  /** Whose exec rules apply. Defaults to `process.platform`; tests pin it. */
+  platform?: NodeJS.Platform;
 }
 
 export type AgentBinaryResolution =
@@ -273,6 +275,8 @@ export function resolveAgentBinary(
   io: BinaryProbeFs = DEFAULT_FS,
   depth = 0,
 ): AgentBinaryResolution {
+  if ((io.platform ?? process.platform) === 'win32') return resolveWindowsBinary(bin, env, io);
+
   const escapeHatch =
     `Point yolo-bridge at it explicitly with \`--agent /full/path/to/${bin}\` `
     + `(or set YOLOBRIDGE_AGENT_BIN).`;
@@ -328,6 +332,94 @@ export function resolveAgentBinary(
       + `${dirs.length === 1 ? 'directory' : 'directories'}).\n`
       + `  ⚠️ If \`${bin}\` works when you type it, it may be a shell alias or function rather than\n`
       + `     a real binary — those cannot be spawned. Check with: type -a ${bin}\n`
+      + `  ${escapeHatch}`,
+  };
+}
+
+/**
+ * Extensions CreateProcess will actually run. PATHEXT can also list `.PS1`,
+ * `.JS`, `.VBS` and so on, but those only run through cmd.exe's file
+ * associations, and node-pty does not go through cmd.exe.
+ */
+const WINDOWS_RUNNABLE = ['.COM', '.EXE', '.BAT', '.CMD'];
+
+/** `env.PATH`, whatever case the key is in. Windows env names are case-insensitive. */
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === name);
+  return key === undefined ? undefined : env[key];
+}
+
+/**
+ * The Windows version of the search: try PATHEXT extensions, and skip X_OK
+ * and the shebang check.
+ *
+ * ⚠️ THE NPM SHIM TRAP. `npm install -g` puts THREE files in
+ * `%AppData%\npm`: `claude` (a POSIX `#!/bin/sh` script for Git Bash/Cygwin),
+ * `claude.cmd`, and `claude.ps1`. The POSIX search finds the extensionless
+ * one first, sees `#!/bin/sh`, and reports a missing interpreter. That
+ * message is accurate about the file and useless to the operator, because
+ * Windows would never run that file. Windows ignores shebangs and has no
+ * exec bit: it chooses a file by EXTENSION. So this tries `claude.exe`,
+ * `claude.cmd`, and so on in PATHEXT order, and never the bare name.
+ */
+function resolveWindowsBinary(bin: string, env: NodeJS.ProcessEnv, io: BinaryProbeFs): AgentBinaryResolution {
+  const p = path.win32;
+  const exts = (envValue(env, 'PATHEXT') ?? WINDOWS_RUNNABLE.join(';'))
+    .split(';')
+    .map((e) => e.trim().toUpperCase())
+    .filter((e) => WINDOWS_RUNNABLE.includes(e));
+  if (exts.length === 0) exts.push(...WINDOWS_RUNNABLE);
+
+  const hasRunnableExt = exts.includes(p.extname(bin).toUpperCase());
+  const candidatesFor = (base: string) => (hasRunnableExt ? [base] : exts.map((e) => base + e.toLowerCase()));
+  const isFile = (f: string) => {
+    try { return io.statSync(f).isFile(); } catch { return false; }
+  };
+  const posixShimNote = (f: string) =>
+    `  Found ${f}, but it has no extension. That is the POSIX shell shim npm installs for\n`
+    + `  Git Bash, and Windows cannot run it. Use the \`.cmd\` or \`.exe\` next to it.\n`;
+  const escapeHatch =
+    `Point yolo-bridge at it explicitly with \`--agent C:\\full\\path\\to\\${bin}.exe\` (or .cmd), `
+    + `or set YOLOBRIDGE_AGENT_BIN.`;
+
+  if (bin.includes('\\') || bin.includes('/')) {
+    const abs = p.resolve(bin);
+    const hit = candidatesFor(abs).find(isFile);
+    if (hit) return { ok: true, path: hit };
+    return {
+      ok: false,
+      reason: 'not-found',
+      message: `No runnable agent at ${abs} (tried ${exts.join(', ')}).\n`
+        + (!hasRunnableExt && isFile(abs) ? posixShimNote(abs) : '')
+        + `  ${escapeHatch}`,
+    };
+  }
+
+  const rawPath = envValue(env, 'PATH') ?? '';
+  if (!rawPath.trim()) {
+    return {
+      ok: false,
+      reason: 'no-path',
+      message: `Cannot look for \`${bin}\`: PATH is empty in this process. ${escapeHatch}`,
+    };
+  }
+
+  const dirs = rawPath.split(';').map((d) => d.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean);
+  let sawShim: string | undefined;
+  for (const dir of dirs) {
+    const base = p.join(dir, bin);
+    const hit = candidatesFor(base).find(isFile);
+    if (hit) return { ok: true, path: hit };
+    if (!sawShim && !hasRunnableExt && isFile(base)) sawShim = base;
+  }
+
+  return {
+    ok: false,
+    reason: 'not-found',
+    message:
+      `\`${bin}\` is not on this process's PATH as a Windows executable (searched ${dirs.length} `
+      + `${dirs.length === 1 ? 'directory' : 'directories'} for ${exts.join(', ')}).\n`
+      + (sawShim ? posixShimNote(sawShim) : `  Check where it is with: where.exe ${bin}\n`)
       + `  ${escapeHatch}`,
   };
 }

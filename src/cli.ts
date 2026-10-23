@@ -576,7 +576,11 @@ async function cmdAttach(args: string[]): Promise<number> {
 
           process.stdout.write('yolo-bridge: Ctrl+C goes to the agent · Ctrl-P Ctrl-Q to detach\n');
           startLocalAgent({
-            agentBin,
+            // The RESOLVED path, not the bare name. On Windows the bare name
+            // gets node-pty to pick npm's extensionless sh shim, which cannot
+            // run. On POSIX the resolver follows posix_spawnp, so this is the
+            // same file either way.
+            agentBin: resolvedBinary.path,
             // Empty unless the MCP block above successfully resolved argv
             // for THIS agent binary — a probe that came back without the
             // flags leaves the MCP portion empty. User arguments follow it

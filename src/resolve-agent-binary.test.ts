@@ -334,3 +334,47 @@ describe('things that must not be mistaken for a binary', () => {
     assert.equal(r.ok, false);
   });
 });
+
+describe('on Windows', () => {
+  const NPM = 'C:\\Users\\j\\AppData\\Roaming\\npm';
+  const WIN_ENV = { Path: `C:\\Windows\\system32;${NPM}`, PATHEXT: '.COM;.EXE;.BAT;.CMD;.VBS;.JS' };
+  // Windows has no exec bit, and the npm sh shim starts with `#!/bin/sh`.
+  const winFs = (files: string[]) => ({
+    ...fakeFs(Object.fromEntries(files.map((f) => [f, 'noexec' as const])),
+      Object.fromEntries(files.map((f) => [f, '#!/bin/sh']))),
+    platform: 'win32' as const,
+  });
+
+  it('picks claude.cmd over the extensionless npm sh shim', () => {
+    // The reported failure: the POSIX search found `npm\claude`, read
+    // `#!/bin/sh`, and said the interpreter was missing.
+    const io = winFs([`${NPM}\\claude`, `${NPM}\\claude.cmd`, `${NPM}\\claude.ps1`]);
+    const r = resolveAgentBinary('claude', WIN_ENV, io);
+    assert.deepEqual(r, { ok: true, path: `${NPM}\\claude.cmd` });
+  });
+
+  it('prefers .exe to .cmd in the same directory, following PATHEXT order', () => {
+    const io = winFs([`${NPM}\\claude.cmd`, `${NPM}\\claude.exe`]);
+    const r = resolveAgentBinary('claude', WIN_ENV, io);
+    assert.equal(r.ok && r.path, `${NPM}\\claude.exe`);
+  });
+
+  it('names the shim when it is the only thing on PATH', () => {
+    const r = resolveAgentBinary('claude', WIN_ENV, winFs([`${NPM}\\claude`]));
+    assert.equal(r.ok === false && r.reason, 'not-found');
+    assert.match(r.ok === false ? r.message : '', /POSIX shell shim/);
+    assert.doesNotMatch(r.ok === false ? r.message : '', /interpreter/);
+  });
+
+  it('upgrades an explicit extensionless path to its .cmd sibling', () => {
+    const io = winFs([`${NPM}\\claude`, `${NPM}\\claude.cmd`]);
+    const r = resolveAgentBinary(`${NPM}\\claude`, { Path: '' }, io);
+    assert.equal(r.ok && r.path, `${NPM}\\claude.cmd`);
+  });
+
+  it('never resolves to an extension CreateProcess cannot run', () => {
+    const r = resolveAgentBinary('claude', WIN_ENV, winFs([`${NPM}\\claude.js`, `${NPM}\\claude.ps1`]));
+    assert.equal(r.ok, false);
+    assert.match(r.ok === false ? r.message : '', /where\.exe claude/);
+  });
+});
